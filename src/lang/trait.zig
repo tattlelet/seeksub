@@ -20,11 +20,11 @@ test "fetch trait type" {
     try std.testing.expectEqual(C.Table, traitTableType(@TypeOf(&c)));
 }
 
-pub inline fn destroyTraits(allocator: *Allocator, concrete: anytype) void {
-    return innerDeinitTraits(allocator, traitTableType(@TypeOf(concrete)), concrete);
+pub inline fn destroyTraits(allocator: *const Allocator, concrete: anytype) void {
+    innerDeinitTraits(allocator, traitTableType(@TypeOf(concrete)), concrete);
 }
 
-inline fn innerDeinitTraits(allocator: *Allocator, comptime Ttrait: type, concrete: anytype) void {
+inline fn innerDeinitTraits(allocator: *const Allocator, comptime Ttrait: type, concrete: anytype) void {
     // trait is sanitized in destroyTraits
     const trait = concrete.traits;
     inline for (comptime std.meta.fieldNames(Ttrait)) |name| {
@@ -49,7 +49,7 @@ test "deinit trait" {
             ix: *const I,
         },
 
-        pub fn init(allc: *Allocator) !*@This() {
+        pub fn init(allc: *const Allocator) !*@This() {
             const self = try allocator.create(@This());
             self.traits = try newTraitTable(allocator, self, .{
                 try extend(allc, I, self),
@@ -156,11 +156,11 @@ test "as trait" {
     try std.testing.expectEqual(*const I2, @TypeOf(asTrait(I2, &c)));
 }
 
-pub fn extend(allocator: *Allocator, comptime Interface: type, concretePtr: anytype) !*Interface {
+pub fn extend(allocator: *const Allocator, comptime Interface: type, concretePtr: anytype) !*Interface {
     return extendInternal(allocator, Interface, concretePtr, true);
 }
 
-inline fn extendInternal(allocator: *Allocator, comptime Interface: type, concretePtr: anytype, comptime checkTrait: bool) !*Interface {
+inline fn extendInternal(allocator: *const Allocator, comptime Interface: type, concretePtr: anytype, comptime checkTrait: bool) !*Interface {
     const iTypeName = @typeName(Interface);
 
     const Concrete = meta.ptrToChild(concretePtr);
@@ -303,7 +303,7 @@ inline fn extendInternal(allocator: *Allocator, comptime Interface: type, concre
     return interfacePtr;
 }
 
-pub inline fn newTraitTable(allocator: *Allocator, concrete: anytype, interfaces: anytype) !*traitTableType(@TypeOf(concrete)) {
+pub inline fn newTraitTable(allocator: *const Allocator, concrete: anytype, interfaces: anytype) !*traitTableType(@TypeOf(concrete)) {
     const Concrete = @TypeOf(concrete);
     const cName = @typeName(Concrete);
     const traits = try allocator.create(traitTableType(Concrete));
@@ -352,7 +352,7 @@ test "autowire interface" {
             next: *const fn (*anyopaque) ?([:0]const u8) = undefined,
         };
 
-        pub fn init(allocator: *Allocator, concrete: anytype, value: u8) !*@This() {
+        pub fn init(allocator: *const Allocator, concrete: anytype, value: u8) !*@This() {
             var self = try extend(allocator, @This(), concrete);
             self.value = value;
             return self;
@@ -377,7 +377,7 @@ test "autowire interface" {
             iterator: *Iterator,
         };
 
-        pub fn init(allocator: *Allocator, data: []const [:0]const u8) !*Self {
+        pub fn init(allocator: *const Allocator, data: []const [:0]const u8) !*Self {
             var self = try allocator.create(@This());
             self.traits = try newTraitTable(allocator, self, .{
                 try Iterator.init(allocator, self, 2),
@@ -441,7 +441,7 @@ test "autowire interface for generics" {
             adder: *const Interface,
         },
 
-        pub fn init(allocator: *Allocator) !*@This() {
+        pub fn init(allocator: *const Allocator) !*@This() {
             const self = try allocator.create(@This());
             self.traits = try newTraitTable(allocator, self, .{
                 try extend(allocator, Interface, self),
@@ -470,12 +470,12 @@ test "autowire multiple interfaces" {
     const Greeter = struct {
         concrete: *anyopaque,
         vtable: *const struct {
-            greet: *const fn (*const anyopaque, *Allocator) anyerror![]const u8 = undefined,
+            greet: *const fn (*const anyopaque, *const Allocator) anyerror![]const u8 = undefined,
         },
 
         const greeting = "Greeting: {s}\n";
 
-        pub fn greet(self: *const @This(), allocator: *Allocator) ![]const u8 {
+        pub fn greet(self: *const @This(), allocator: *const Allocator) ![]const u8 {
             const baseGreting = try self.vtable.greet(self.concrete, allocator);
             defer allocator.free(baseGreting);
 
@@ -514,7 +514,7 @@ test "autowire multiple interfaces" {
         },
         name: []const u8,
 
-        pub fn init(allocator: *Allocator, name: []const u8) !*@This() {
+        pub fn init(allocator: *const Allocator, name: []const u8) !*@This() {
             var self = try allocator.create(@This());
             self.traits = try newTraitTable(allocator, self, .{
                 try extend(allocator, Level, self),
@@ -534,7 +534,7 @@ test "autowire multiple interfaces" {
             return self.name;
         }
 
-        pub fn greet(self: *const @This(), allocator: *Allocator) anyerror![]const u8 {
+        pub fn greet(self: *const @This(), allocator: *const Allocator) anyerror![]const u8 {
             return try std.fmt.allocPrint(
                 allocator.*,
                 "Hello, my name is {s}{c}",
@@ -573,7 +573,7 @@ test "autowire multiple interfaces" {
 
 // Extend without concrete-side wiring
 // this is dangerous because Concrete never agreed to the contract
-pub fn quackLike(allocator: *Allocator, comptime Interface: type, concretePtr: anytype) !*Interface {
+pub fn quackLike(allocator: *const Allocator, comptime Interface: type, concretePtr: anytype) !*Interface {
     return extendInternal(allocator, Interface, concretePtr, false);
 }
 
@@ -581,7 +581,7 @@ test "quackLike counting" {
     const Person = struct {
         name: []const u8,
 
-        pub fn init(allocator: *Allocator, name: []const u8) !*@This() {
+        pub fn init(allocator: *const Allocator, name: []const u8) !*@This() {
             var self = try allocator.create(@This());
             self.name = name;
             return self;
@@ -594,7 +594,7 @@ test "quackLike counting" {
     const Stone = struct {
         weight: u8,
 
-        pub fn init(allocator: *Allocator, weight: u8) !*@This() {
+        pub fn init(allocator: *const Allocator, weight: u8) !*@This() {
             var self = try allocator.create(@This());
             self.weight = weight;
             return self;

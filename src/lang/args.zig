@@ -3,71 +3,42 @@ const trait = @import("trait.zig");
 const shared = @import("shared.zig");
 const duck = @import("ducktape.zig");
 const meta = @import("meta.zig");
+const coll = @import("collections.zig");
 const Allocator = std.mem.Allocator;
 const FieldEnum = std.meta.FieldEnum;
 
-// TODO: rename this, it's no longer an iterator
-// Deque?
-const ArgIterator = struct {
+const OwnedArgIterator = struct {
     destroyable: *duck.AnyDestroyable,
     concrete: *anyopaque,
-    vtable: *const struct {
-        next: *const fn (*anyopaque) ?[:0]const u8 = undefined,
-    },
-    peekR: ?[:0]const u8 = null,
+    vtable: *const coll.Iterator([:0]const u8).VTable,
 
-    pub fn new(self: *@This()) *@This() {
-        self.peekR = null;
-        return self;
-    }
-
-    pub fn deinit(self: *@This(), allocator: *Allocator) void {
-        self.peekR = undefined;
+    pub fn deinit(self: *@This(), allocator: *const Allocator) void {
         self.destroyable.destroy(allocator);
         allocator.destroy(self);
     }
 
-    // NOTE: Original ArgIterator does a lot of sanitization
-    // This interface will have no responsability over sanitization
     pub fn next(self: *@This()) ?[:0]const u8 {
-        if (self.peekR) |v| {
-            defer self.peekR = null;
-            return v;
-        }
         return self.vtable.next(self.concrete);
-    }
-
-    pub fn peek(self: *@This()) ?[:0]const u8 {
-        if (self.peekR) |v| return v;
-        self.peekR = self.vtable.next(self.concrete);
-        return self.peekR;
-    }
-
-    pub fn consume(self: *@This()) void {
-        _ = self.next();
-    }
-
-    // NOTE: Iterator will not own this bit of memory
-    // This interface wont sanitize anything fed back to it
-    pub fn buffer(self: *@This(), buf: [:0]const u8) void {
-        self.peekR = buf;
     }
 };
 
-fn createArgIterator(allocator: *const Allocator, data: [:0]const u8) !*ArgIterator {
-    const GIter = std.process.ArgIteratorGeneral(.{});
-    const tIter = try allocator.create(GIter);
-    errdefer allocator.destroy(tIter);
-    tIter.* = try GIter.init(allocator.*, data);
-    errdefer tIter.deinit();
+fn tstBaseArgIterator(allocator: *const Allocator, data: [:0]const u8) !*OwnedArgIterator {
+    const ArgIteratorConcrete = std.process.ArgIteratorGeneral(.{});
+    const cIt = try allocator.create(ArgIteratorConcrete);
+    errdefer allocator.destroy(cIt);
+    cIt.* = try ArgIteratorConcrete.init(allocator.*, data);
+    errdefer cIt.deinit();
 
-    var it = try duck.quackLikeOwned(@constCast(allocator), ArgIterator, tIter);
-    return it.new();
+    return try duck.quackLikeOwned(
+        allocator,
+        OwnedArgIterator,
+        cIt,
+    );
 }
 
-test "arg iterator shim" {
-    var allocator = std.testing.allocator;
-    const iterator = try createArgIterator(&allocator,
+test "owned arg iter shim test" {
+    const allocator = std.testing.allocator;
+    const iterator = try tstBaseArgIterator(&allocator,
         \\Hello
         \\World
     );
@@ -78,66 +49,139 @@ test "arg iterator shim" {
     try std.testing.expectEqual(null, iterator.next());
 }
 
-test "argIter peek" {
-    var allocator = std.testing.allocator;
-    const iterator = try createArgIterator(&allocator,
+pub const ArgCursor = struct {
+    iterator: *OwnedArgIterator,
+    traits: *const struct {
+        cursor: *coll.Cursor([:0]const u8),
+    },
+
+    pub fn init(allocator: *const Allocator, iterator: *OwnedArgIterator) Allocator.Error!*@This() {
+        var self = try allocator.create(@This());
+        self.traits = try trait.newTraitTable(allocator, self, .{
+            (try trait.extend(
+                allocator,
+                coll.Cursor([:0]const u8),
+                self,
+            )).new(),
+        });
+        self.iterator = iterator;
+        return self;
+    }
+
+    pub fn destroy(self: *@This(), allocator: *const Allocator) void {
+        self.iterator.deinit(allocator);
+        trait.destroyTraits(allocator, self);
+    }
+
+    pub fn next(self: *@This()) ?[:0]const u8 {
+        return self.iterator.next();
+    }
+
+    pub fn peek(self: *@This()) ?[:0]const u8 {
+        return self.iterator.next();
+    }
+
+    pub fn consume(self: *@This()) void {
+        _ = self.traits.cursor.next();
+    }
+
+    pub fn stackItem(self: *@This(), item: [:0]const u8) void {
+        self.traits.cursor.curr = item;
+    }
+};
+
+fn tstArgCursor(allocator: *const Allocator, data: [:0]const u8) !*coll.Cursor([:0]const u8) {
+    var ownedIter = try tstBaseArgIterator(allocator, data);
+    errdefer ownedIter.deinit(allocator);
+    const concrete = try ArgCursor.init(allocator, ownedIter);
+    return trait.asTrait(coll.Cursor([:0]const u8), concrete);
+}
+
+test "arg cursor peek" {
+    const allocator = std.testing.allocator;
+    const cursor = try tstArgCursor(&allocator,
         \\Hello
         \\World
     );
-    defer iterator.deinit(&allocator);
+    defer cursor.destroy(&allocator);
 
-    try std.testing.expectEqualStrings("Hello", iterator.peek().?);
-    try std.testing.expectEqualStrings("Hello", iterator.next().?);
-    try std.testing.expectEqualStrings("World", iterator.peek().?);
-    try std.testing.expectEqualStrings("World", iterator.peek().?);
-    try std.testing.expectEqualStrings("World", iterator.next().?);
-    try std.testing.expectEqual(null, iterator.peek());
+    try std.testing.expectEqualStrings("Hello", cursor.peek().?);
+    try std.testing.expectEqualStrings("Hello", cursor.next().?);
+    try std.testing.expectEqualStrings("World", cursor.peek().?);
+    try std.testing.expectEqualStrings("World", cursor.peek().?);
+    try std.testing.expectEqualStrings("World", cursor.next().?);
+    try std.testing.expectEqual(null, cursor.peek());
 }
 
-test "argIter buffer" {
-    var allocator = std.testing.allocator;
-    const iterator = try createArgIterator(&allocator, "");
-    defer iterator.deinit(&allocator);
+test "arg cursor peek with stackItem" {
+    const allocator = std.testing.allocator;
+    const cursor = try tstArgCursor(&allocator, "");
+    defer cursor.destroy(&allocator);
 
-    iterator.buffer("Hello");
-    try std.testing.expectEqualStrings("Hello", iterator.peek().?);
+    cursor.stackItem("Hello");
+    try std.testing.expectEqualStrings("Hello", cursor.peek().?);
 }
 
-// TODO: split error sets (check @errorCast)
+// TODO: split error per operation, glue them together later recursively
 const CodecError = error{
-    ParseFloatEndOfIterator,
     ParseIntEndOfIterator,
+    ParseFloatEndOfIterator,
     ParseStringEndOfIterator,
-} || std.fmt.ParseIntError || std.mem.Allocator.Error;
+    ParseArrayEndOfIterator,
+    TypeNotSupported,
+    BadInternalArrayArgStacking,
+} ||
+    std.fmt.ParseIntError ||
+    std.fmt.ParseFloatError ||
+    std.mem.Allocator.Error;
 
-// NOTE: default codec is really dumb and wont use tagged names, however if a tagged named
-// was passed to a specific vtable function, the type for said tag was already matched
-// It's the responsability of the codec to consume the iterator, use peek for opportunistic parsers
 pub fn Codec(Spec: type) type {
     return struct {
         pub fn init() @This() {
             return .{};
         }
 
-        const 
+        const CursorT = coll.Cursor([:0]const u8);
+        const SpecFieldEnum = std.meta.FieldEnum(Spec);
 
-        pub fn parseWith(comptime name: []const u8) []const u8 {
-            const FieldType = @FieldType(Spec, name);
-            const fName = comptime refeed: switch (@typeInfo(FieldType)) {
-                .bool => "parseBool",
-                .int => "parseInt",
-                .float => "parseFloat",
-                // .array => {},
-                // .@"enum" => {},
+        pub fn CodecOf(tag: SpecFieldEnum, tTag: @Type(.enum_literal)) type {
+            comptime if (tTag != .pointer) {
+                const T = meta.LeafTypeOfTag(Spec, @tagName(tag));
+                return if (@typeInfo(T) == tTag) T else @compileError(std.fmt.comptimePrint(
+                    "Codec: {s}, Field: {s} - codec choice of {s} doesnt match field type",
+                    .{ @typeName(@This()), @tagName(tag), @typeName(T) },
+                ));
+            } else {
+                const T = meta.LeafArrayTypeOfTag(Spec, @tagName(tag));
+                return if (@typeInfo(T) == tTag) T else @compileError(std.fmt.comptimePrint(
+                    "Codec: {s}, Field: {s} - codec choice of {s} doesnt match field type",
+                    .{ @typeName(@This()), @tagName(tag), @typeName(T) },
+                ));
+            };
+        }
+
+        /// This is not an instance method and that's on purpose, this needs evaluation 100% at comptime
+        pub fn parseWith(comptime tag: SpecFieldEnum) std.meta.DeclEnum(@This()) {
+            const name = @tagName(tag);
+            const FieldType = @FieldType(Spec, @tagName(tag));
+            return refeed: switch (@typeInfo(FieldType)) {
+                .bool => .parseBool,
+                .int => .parseInt,
+                .float => .parseFloat,
+                .@"enum" => @compileError("Enum not supported yet"),
                 .pointer => |ptr| ptrReturn: {
-                    // TODO: add other array type support through tokenization
                     // TODO: add meta tag to treat u8 as any other numberic array for parsing
-                    if (ptr.child == u8) {
-                        break :ptrReturn "parseString";
-                    } else @compileError(std.fmt.comptimePrint(
-                        "Field: {s}, Type: []{s} - unsupported array type",
-                        .{ name, @typeName(ptr.child) },
-                    ));
+                    if (ptr.child == u8) break :ptrReturn .parseString;
+                    // if (ptr.child == []const u8) break :ptrReturn .parseArray;
+
+                    break :ptrReturn arrayRefeed: switch (@typeInfo(ptr.child)) {
+                        .bool, .int, .float, .@"enum", .pointer => .parseArray,
+                        .optional => |opt| continue :arrayRefeed @typeInfo(opt.chid),
+                        else => @compileError(std.fmt.comptimePrint(
+                            "Field: {s}, Type: []{s} - unsupported array type",
+                            .{ name, @typeName(ptr.child) },
+                        )),
+                    };
                 },
                 .optional => |opt| continue :refeed @typeInfo(opt.child),
                 else => @compileError(std.fmt.comptimePrint(
@@ -145,26 +189,195 @@ pub fn Codec(Spec: type) type {
                     .{ name, @typeName(FieldType) },
                 )),
             };
+        }
 
-            if (@hasDecl(@This(), fName)) {
-                return fName;
-            } else @compileError(std.fmt.comptimePrint(
-                "Codec: {s}, Declare: {s} - function not found",
-                .{ @typeName(@This()), fName },
-            ));
+        /// Parses comma separated values into an array of types
+        /// the only special case are strings where we will parse [][]u8
+        /// The type-switch matcher looks awfully similar to the one in parseWith, and thats because
+        /// the default codec's parseWith is agnostic to the Spec, but that may not always be the case
+        /// and should not be enforced
+        pub fn parseArray(
+            self: *const @This(),
+            comptime tag: SpecFieldEnum,
+            allocator: *const Allocator,
+            cursor: *CursorT,
+        ) CodecError!meta.OptTypeOf(@FieldType(Spec, @tagName(tag))) {
+            const token = if (cursor.next()) |t| t else return ParseSpecError.ParseArrayEndOfIterator;
+
+            const Q = coll.SinglyLinkedQueue([:0]const u8);
+            var stackQ = coll.SinglyLinkedStack(*Q){};
+            const virtualCursor = try coll.DFSCursor([:0]const u8).init(allocator, &stackQ);
+            defer virtualCursor.destroy(allocator);
+
+            var arena = std.heap.ArenaAllocator.init(allocator.*);
+            const scrapAllocator = &arena.allocator();
+            defer arena.deinit();
+
+            var queue = Q{};
+            try queue.append(scrapAllocator, token);
+            try virtualCursor.prependQueue(scrapAllocator, &queue);
+
+            return self.parseArrayInner(tag, 0, allocator, scrapAllocator, virtualCursor);
+        }
+
+        pub fn parseArrayInner(
+            self: *const @This(),
+            comptime tag: SpecFieldEnum,
+            comptime depth: usize,
+            allocator: *const Allocator,
+            scrapAllocator: *const Allocator,
+            dfsCursor: *coll.DFSCursor([:0]const u8),
+        ) CodecError!meta.TypeAtDepthN(Spec, @tagName(tag), depth) {
+            // Array generic is always one layer lower
+            const ArrayT = meta.TypeAtDepthN(Spec, @tagName(tag), depth + 1);
+            const codecFTag = comptime switch (@typeInfo(ArrayT)) {
+                .bool => .parseBool,
+                .int => .parseInt,
+                .float => .parseFloat,
+                .pointer => |ptr| if (ptr.child == u8) .parseString else .parseArrayInner,
+                // TODO: add a check for opt and return null on catch if that's the type we are dealing with
+                // .optional
+                // .@"enum"
+                else => @compileError(std.fmt.comptimePrint(
+                    "Spec: {s}, Codec: {s}, Field: {s} - type {s} not supported by codec",
+                    .{
+                        @typeName(Spec),
+                        @typeName(@This()),
+                        @tagName(tag),
+                        @TypeOf(@FieldType(Spec, @tagName(tag))),
+                    },
+                )),
+            };
+
+            const cursor = trait.asTrait(CursorT, dfsCursor);
+
+            // Main allocator is used here to move the results outside of stack
+            // and since scrap is an arena, to be owned by the original allocator
+            var array = try std.ArrayList(ArrayT).initCapacity(allocator.*, 6);
+            errdefer array.deinit();
+
+            const s = cursor.next() orelse return CodecError.ParseArrayEndOfIterator;
+
+            // Q lives in the stack and dies in the stack
+            const Q = coll.SinglyLinkedQueue([:0]const u8);
+            var queue = Q{};
+
+            // TODO: move all logic related to a subarg parser
+            var i: usize = 0;
+            var wordMatching: bool = false;
+            var start: usize = 0;
+            var end: usize = 0;
+            // TODO: mutually exclude quotes/brackets based on type literal
+            var inQuotes: bool = false;
+            var brackets: usize = 0;
+
+            while (true) : (i += 1) {
+                // We do one over to create a token at the end
+                if (i > s.len) break;
+                const c = if (i < s.len) s[i] else rfd: {
+                    end = s.len;
+                    if (wordMatching) break :rfd 0 else break;
+                };
+                rfd: switch (c) {
+                    0 => {
+                        const token = try scrapAllocator.dupeZ(u8, s[start..end]);
+                        try queue.append(scrapAllocator, token);
+                        start = 0;
+                        end = 0;
+                        wordMatching = false;
+                        inQuotes = false;
+                    },
+                    '[' => {
+                        brackets += 1;
+                        if (brackets == 2 and !wordMatching and start == 0) {
+                            start = i;
+                            wordMatching = true;
+                        }
+                    },
+                    ']' => {
+                        brackets -= 1;
+                        if (brackets == 0 and wordMatching) {
+                            // Dont add at level bracket
+                            end = i;
+                            continue :rfd 0;
+                        }
+                    },
+                    ' ', '\t', '\r', '\n' => {
+                        // Starting in-quotes match
+                        if (inQuotes and !wordMatching) {
+                            start = i;
+                            wordMatching = true;
+                            // Not in quotes, not matching, no need to collect
+                            // or start a match
+                        } else if (!wordMatching or brackets > 1) {
+                            continue;
+                            // still matching and consuming empty chars due to quotes
+                        } else if (wordMatching and inQuotes) {
+                            end = i;
+                            // not inside quotes, so quotes mean stop
+                        } else {
+                            end = i;
+                            continue :rfd 0;
+                        }
+                    },
+                    '\'' => {
+                        inQuotes = !inQuotes;
+                        if (!inQuotes and wordMatching) {
+                            // end is always 1 char behind for refeeds
+                            end = i;
+                            continue :rfd 0;
+                        }
+                    },
+                    ',' => {
+                        if (wordMatching and brackets <= 1) {
+                            // end is always 1 char behind for refeeds
+                            end = i;
+                            continue :rfd 0;
+                        }
+                    },
+                    else => {
+                        end = i;
+                        if (!wordMatching) {
+                            start = i;
+                            wordMatching = true;
+                        }
+                    },
+                }
+            }
+
+            try dfsCursor.prependQueue(allocator, &queue);
+            while (queue.len > 0) {
+                const args = if (comptime codecFTag == .parseArrayInner) .{
+                    self,
+                    tag,
+                    depth + 1,
+                    allocator,
+                    scrapAllocator,
+                    dfsCursor,
+                } else .{
+                    self,
+                    tag,
+                    allocator,
+                    cursor,
+                };
+                try array.append(
+                    try @call(.auto, @field(@This(), @tagName(codecFTag)), args),
+                );
+            }
+
+            return array.toOwnedSlice();
         }
 
         pub fn parseString(
             self: *const @This(),
-            comptime name: []const u8,
-            allocator: *Allocator,
-            it: *ArgIterator,
-        ) CodecError!meta.OptTypeOf(@FieldType(Spec, name)) {
+            comptime tag: std.meta.FieldEnum(Spec),
+            allocator: *const Allocator,
+            cursor: *CursorT,
+        ) CodecError!CodecOf(tag, .pointer) {
             _ = self;
-            const s = it.next() orelse return CodecError.ParseIntEndOfIterator;
+            const s = cursor.next() orelse return CodecError.ParseIntEndOfIterator;
 
-            const ArrType = meta.OptTypeOf(@FieldType(Spec, name));
-            const PtrType = @typeInfo(ArrType).pointer;
+            const PtrType = @typeInfo(meta.LeafArrayTypeOfTag(Spec, @tagName(tag))).pointer;
 
             const newPtr = try alloc: {
                 if (PtrType.sentinel()) |sentinel| {
@@ -179,53 +392,53 @@ pub fn Codec(Spec: type) type {
 
         pub fn parseFloat(
             self: *const @This(),
-            comptime name: []const u8,
-            allocator: *Allocator,
-            it: *ArgIterator,
-        ) CodecError!meta.OptTypeOf(@FieldType(Spec, name)) {
+            comptime tag: std.meta.FieldEnum(Spec),
+            allocator: *const Allocator,
+            cursor: *CursorT,
+        ) CodecError!CodecOf(tag, .float) {
             _ = self;
             _ = allocator;
-            const value = it.next() orelse return CodecError.ParseFloatEndOfIterator;
-            return try std.fmt.parseFloat(meta.OptTypeOf(
-                @FieldType(Spec, name),
+            const value = cursor.next() orelse return CodecError.ParseFloatEndOfIterator;
+            return try std.fmt.parseFloat(CodecOf(
+                tag,
+                .float,
             ), value);
         }
 
         pub fn parseInt(
             self: *const @This(),
-            comptime name: []const u8,
-            allocator: *Allocator,
-            it: *ArgIterator,
-        ) CodecError!meta.OptTypeOf(@FieldType(Spec, name)) {
+            comptime tag: SpecFieldEnum,
+            allocator: *const Allocator,
+            cursor: *CursorT,
+        ) CodecError!CodecOf(tag, .int) {
             _ = self;
             _ = allocator;
-            const value = it.next() orelse return CodecError.ParseIntEndOfIterator;
-            return try std.fmt.parseInt(meta.OptTypeOf(
-                @FieldType(Spec, name),
-            ), value, 10);
+            const value = cursor.next() orelse return CodecError.ParseIntEndOfIterator;
+            return try std.fmt.parseInt(meta.LeafTypeOfTag(Spec, @tagName(tag)), value, 10);
         }
 
         // The only way you can change a flag is by explicitly saying false
         // all other values are oportunistic trues
+        // TODO: write a require check if it's for arrays
         pub fn parseBool(
             self: *const @This(),
-            comptime name: []const u8,
-            allocator: *Allocator,
-            it: *ArgIterator,
+            comptime tag: SpecFieldEnum,
+            allocator: *const Allocator,
+            cursor: *CursorT,
         ) CodecError!bool {
             _ = self;
             _ = allocator;
-            _ = name;
-            const value = it.peek() orelse return true;
+            _ = tag;
+            const value = cursor.peek() orelse return true;
             return switch (value.len) {
                 4 => if (std.mem.eql(u8, "true", value)) consume: {
-                    it.consume();
+                    cursor.consume();
                     break :consume true;
                     // INFO: this looks dumb, but the purpose is not to consume the iterator
                     // only when it was explicitly said to be true
                 } else true,
                 5 => if (std.mem.eql(u8, "false", value)) consume: {
-                    _ = it.next();
+                    cursor.consume();
                     break :consume false;
                 } else true,
                 else => true,
@@ -234,62 +447,38 @@ pub fn Codec(Spec: type) type {
     };
 }
 
-const SimpleIt = struct {
-    data: []const [:0]const u8,
-    i: usize = 0,
-    pub fn init(allocator: *Allocator, data: []const [:0]const u8) !*@This() {
-        const self = try allocator.create(@This());
-        self.* = .{ .data = data };
-        return self;
-    }
-    pub fn next(self: *@This()) ?[:0]const u8 {
-        if (self.i >= self.data.len) return null;
-        defer self.i += 1;
-        return self.data[self.i];
-    }
-};
+test "Codec parseBool" {
+    const allocator = &std.testing.allocator;
+    const cursor = try tstArgCursor(allocator,
+        \\true
+        \\false
+        \\"something else"
+    );
+    defer cursor.destroy(allocator);
 
-test "parseBool" {
-    var allocator = @constCast(&std.testing.allocator);
-    _ = &allocator;
-    var it = (try duck.quackLikeOwned(
-        allocator,
-        ArgIterator,
-        try SimpleIt.init(allocator, &.{
-            "true",
-            "false",
-            "something else",
-        }),
-    )).new();
-    defer it.deinit(allocator);
     const codec = Codec(struct { @"test": bool }).init();
-    try std.testing.expect(try codec.parseBool("test", allocator, it));
-    try std.testing.expectEqual(null, it.peekR);
+    try std.testing.expect(try codec.parseBool(.@"test", allocator, cursor));
+    try std.testing.expectEqualDeep(null, cursor.curr);
 
-    try std.testing.expect(!try codec.parseBool("test", allocator, it));
-    try std.testing.expectEqual(null, it.peekR);
+    try std.testing.expect(!try codec.parseBool(.@"test", allocator, cursor));
+    try std.testing.expectEqual(null, cursor.curr);
 
-    try std.testing.expect(try codec.parseBool("test", allocator, it));
-    try std.testing.expectEqualStrings("something else", it.peekR.?);
+    try std.testing.expect(try codec.parseBool(.@"test", allocator, cursor));
+    try std.testing.expectEqualStrings("something else", cursor.curr.?);
 }
 
-test "parseInt" {
-    var allocator = @constCast(&std.testing.allocator);
-    _ = &allocator;
-    var it = (try duck.quackLikeOwned(
-        allocator,
-        ArgIterator,
-        try SimpleIt.init(allocator, &.{
-            "44",
-            "-1",
-            "25",
-        }),
-    )).new();
-    defer it.deinit(allocator);
+test "Codec parseInt" {
+    const allocator = &std.testing.allocator;
+    const cursor = try tstArgCursor(allocator,
+        \\44
+        \\-1
+        \\25
+    );
+    defer cursor.destroy(allocator);
     const codec = Codec(struct { n1: u6, n2: i2, n3: u88 }).init();
-    try std.testing.expectEqual(44, try codec.parseInt("n1", allocator, it));
-    try std.testing.expectEqual(-1, try codec.parseInt("n2", allocator, it));
-    try std.testing.expectEqual(25, try codec.parseInt("n3", allocator, it));
+    try std.testing.expectEqual(44, try codec.parseInt(.n1, allocator, cursor));
+    try std.testing.expectEqual(-1, try codec.parseInt(.n2, allocator, cursor));
+    try std.testing.expectEqual(25, try codec.parseInt(.n3, allocator, cursor));
 }
 
 // TODO: construct errorset based on codec
@@ -311,6 +500,7 @@ pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
     const Options = Spec;
 
+    const CursorT = coll.Cursor([:0]const u8);
     const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else Codec(Spec);
     return struct {
         arena: std.heap.ArenaAllocator,
@@ -334,86 +524,82 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         // TODO: test all error returns
-        pub fn parse(self: *@This(), it: *ArgIterator) ParseSpecError!void {
+        pub fn parse(self: *@This(), cursor: *CursorT) ParseSpecError!void {
             const allocator = self.arena.allocator();
-            self.program = if (it.next()) |program| blk: {
+            self.program = if (cursor.next()) |program| blk: {
                 break :blk try allocator.dupeZ(u8, program);
             } else return;
 
             var positionals = try std.ArrayList([:0]const u8).initCapacity(allocator, 32);
 
-            while (it.next()) |arg|
+            while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
                     // single -
-                    @branchHint(.unlikely);
                     try positionals.append("-");
                     continue;
                 } else if (arg.len == 2 and std.mem.eql(u8, "--", arg)) {
                     // -- positional skip
-                    @branchHint(.cold);
                     break;
                 } else if (arg.len >= 1 and arg[0] != '-') {
                     // word, feed to positional
-                    @branchHint(.likely);
-                    it.buffer(arg);
+                    cursor.stackItem(arg);
                     break;
                 } else if (arg.len == 0) {
                     // This is technically not possible with ArgIterator
-                    @branchHint(.cold);
                     continue;
                 } else {
-                    @branchHint(.likely);
                     var offset: usize = 1;
                     if (arg[1] == '-') offset += 1;
-                    try self.namedToken(offset, arg, it);
+                    try self.namedToken(offset, arg, cursor);
                 };
 
             // drain remaining args
             // TODO: parse tuple
-            while (it.next()) |item| {
+            while (cursor.next()) |item| {
                 try positionals.append(try allocator.dupeZ(u8, item));
             }
             self.positionals = try positionals.toOwnedSlice();
         }
 
-        fn namedToken(self: *@This(), offset: usize, arg: [:0]const u8, it: *ArgIterator) ParseSpecError!void {
+        fn namedToken(self: *@This(), offset: usize, arg: [:0]const u8, cursor: *CursorT) ParseSpecError!void {
             var splitValue: ?[:0]u8 = null;
             var slice: []const u8 = arg[offset..];
-            const needSplit = std.mem.indexOf(u8, slice, "=");
+            const optValueIdx = std.mem.indexOf(u8, slice, "=");
 
             // Feed split arg to buffer
-            if (needSplit) |i| {
+            if (optValueIdx) |i| {
                 // TODO: should this sanitize the sliced arg?
                 if (i + 1 >= arg.len) return ParseSpecError.ArgEqualSplitMissingValue;
-                splitValue = try self.arena.allocator().allocSentinel(u8, slice.len - i - 1, 0);
-                @memcpy(splitValue.?, slice[i + 1 ..]);
-                it.buffer(splitValue.?);
+                const newValue = try self.arena.allocator().allocSentinel(u8, slice.len - i - 1, 0);
+                @memcpy(newValue, slice[i + 1 ..]);
+                cursor.stackItem(newValue);
+                splitValue = newValue;
                 slice = slice[0..i];
             }
             errdefer if (splitValue) |v| self.arena.allocator().free(v);
 
             try switch (offset) {
-                2 => self.namedArg(slice, it),
-                1 => self.shortArg(slice, it),
+                2 => self.namedArg(slice, cursor),
+                1 => self.shortArg(slice, cursor),
                 else => ParseSpecError.InvalidArgumentToken,
             };
 
             // if split not consumed, it's not sane to progress
             if (splitValue) |v| {
-                const peekR: [*]const u8 = @ptrCast(it.peek() orelse return);
+                const peekR: [*]const u8 = @ptrCast(cursor.peek() orelse return);
                 if (peekR == @as([*]u8, @ptrCast(v))) return ParseSpecError.ArgEqualSplitNotConsumed;
             }
         }
 
         // TODO: re-feed chain of flags, enforce max n chars for shorthand
-        fn shortArg(self: *@This(), arg: []const u8, it: *ArgIterator) ParseSpecError!void {
+        fn shortArg(self: *@This(), arg: []const u8, cursor: *CursorT) ParseSpecError!void {
             if (@typeInfo(FieldEnum(Spec)).@"enum".fields.len == 0) return ParseSpecError.UnknownArgumentName;
             if (!@hasDecl(Spec, "Short")) return ParseSpecError.MissingShorthandMetadata;
 
             inline for (std.meta.fields(@TypeOf(Spec.Short))) |s| {
                 if (std.mem.eql(u8, s.name, arg)) {
                     const tag = s.defaultValue() orelse return ParseSpecError.MissingShorthandLink;
-                    try self.namedArg(tag, it);
+                    try self.namedArg(tag, cursor);
                     return;
                 }
             } else {
@@ -421,18 +607,24 @@ pub fn SpecResponse(comptime Spec: type) type {
             }
         }
 
-        fn namedArg(self: *@This(), arg: []const u8, it: *ArgIterator) ParseSpecError!void {
-            if (@typeInfo(FieldEnum(Spec)).@"enum".fields.len == 0) return ParseSpecError.UnknownArgumentName;
+        fn namedArg(self: *@This(), arg: []const u8, cursor: *CursorT) ParseSpecError!void {
+            @setEvalBranchQuota(10000);
+            const SpecEnum = FieldEnum(Spec);
+            const fields = @typeInfo(SpecEnum).@"enum".fields;
+            if (fields.len == 0) return ParseSpecError.UnknownArgumentName;
 
-            inline for (std.meta.fields(Spec)) |f| {
+            inline for (fields) |f| {
                 // This gives me a comptime-value for name
                 if (std.mem.eql(u8, f.name, arg)) {
-                    const codecFTag = comptime SpecCodec.parseWith(f.name);
+                    const spectag = comptime (std.meta.stringToEnum(SpecEnum, f.name) orelse @compileError(std.fmt.comptimePrint(
+                        "Spec: {s}, Field: {s} - could no translate field to tag",
+                        .{ @typeName(Spec), f.name },
+                    )));
+                    const codecFTag = comptime SpecCodec.parseWith(spectag);
+
                     var allocator = self.arena.allocator();
-
                     // TODO: handle required and optional
-
-                    const r = try @call(.auto, @field(SpecCodec, codecFTag), .{ &self.codec, f.name, &allocator, it });
+                    const r = try @call(.auto, @field(SpecCodec, @tagName(codecFTag)), .{ &self.codec, spectag, &allocator, cursor });
 
                     // TODO: append if array?
                     @field(self.options, f.name) = r;
@@ -449,20 +641,18 @@ pub fn SpecResponse(comptime Spec: type) type {
     };
 }
 
-// NOTE: this method wont own the ArgIterator lifecycle
-pub fn parseSpec(allocator: *Allocator, it: *ArgIterator, Spec: type) ParseSpecError!*const SpecResponse(Spec) {
+pub fn tstParseSpec(allocator: *const Allocator, cursor: *coll.Cursor([:0]const u8), Spec: type) ParseSpecError!*const SpecResponse(Spec) {
     var response = try SpecResponse(Spec).init(allocator, Codec(Spec).init());
     errdefer response.deinit();
-    try response.parse(it);
+    try response.parse(cursor);
     return response;
 }
 
 fn tstParse(data: [:0]const u8, Spec: type) !*const SpecResponse(Spec) {
-    var allocator = @constCast(&std.testing.allocator);
-    _ = &allocator;
-    const it = try createArgIterator(allocator, data);
-    defer it.deinit(allocator);
-    return try parseSpec(allocator, it, Spec);
+    const allocator = &std.testing.allocator;
+    const cursor = try tstArgCursor(allocator, data);
+    defer cursor.destroy(allocator);
+    return try tstParseSpec(allocator, cursor, Spec);
 }
 
 test "empty args with default" {
@@ -536,10 +726,35 @@ test "parse different types" {
         b: ?bool = null,
         s1: ?[]const u8 = null,
         s2: ?[:0]const u8 = null,
+        au1: ?[]const u1 = null,
+        au32: ?[]const u32 = null,
+        ai32: ?[]const i32 = null,
+        af32: ?[]const f32 = null,
+        // // // TODO: missing enum, []enum, []bool
+        as1: ?[]const []const u8 = null,
+        as2: ?[]const [:0]const u8 = null,
+        aau32: ?[]const []const u32 = null,
+        aaf32: ?[]const []const f32 = null,
+        aai32: ?[]const []const i32 = null,
     };
 
     const r1 = try tstParse(
-        "program --u1=0 --f1 1.1 --b false --s1 Hello --s2 \"Hello World\"",
+        \\program
+        \\--u1=0
+        \\--f1 1.1
+        \\--b false
+        \\--s1 Hello
+        \\--s2 "Hello World"
+        \\--au1 1,0,1,0
+        \\--au32=32,23,133,99,10
+        \\--ai32 "-1, -44, 22222   ,   -1"
+        \\--af32="    3.4   , 58,   3.1  "
+        \\--as1 "'Hello', ' World ', '!'"
+        \\--as2="  'Im'  ,  'Losing it'  "
+        \\--aau32 "[[1,3], [3300, 222, 333, 33], [1]]"
+        \\--aaf32 "[  [  1.1,  3.2,-1] ,   [3.1  ,2,5], [ 1.2 ], [7.1]   ]"
+        \\--aai32 "[  [  -1] ,   [2, -2] ]"
+    ,
         Spec,
     );
     defer r1.deinit();
@@ -549,6 +764,19 @@ test "parse different types" {
     try std.testing.expect(!r1.options.b.?);
     try std.testing.expectEqualStrings("Hello", r1.options.s1.?);
     try std.testing.expectEqualStrings("Hello World", r1.options.s2.?);
+    try std.testing.expectEqualDeep(&[_]u1{ 1, 0, 1, 0 }, r1.options.au1.?);
+    try std.testing.expectEqualDeep(&[_]u32{ 32, 23, 133, 99, 10 }, r1.options.au32.?);
+    try std.testing.expectEqualDeep(&[_]i32{ -1, -44, 22222, -1 }, r1.options.ai32.?);
+    const expectedAs1: []const []const u8 = &.{ "Hello", " World ", "!" };
+    try std.testing.expectEqualDeep(expectedAs1, r1.options.as1.?);
+    const expectedAs2: []const [:0]const u8 = &.{ "Im", "Losing it" };
+    try std.testing.expectEqualDeep(expectedAs2, r1.options.as2.?);
+    const expectedAau32: []const [:0]const u32 = &.{ &.{ 1, 3 }, &.{ 3300, 222, 333, 33 }, &.{1} };
+    try std.testing.expectEqualDeep(expectedAau32, r1.options.aau32.?);
+    const expectedAaf32: []const [:0]const f32 = &.{ &.{ 1.1, 3.2, -1 }, &.{ 3.1, 2, 5 }, &.{1.2}, &.{7.1} };
+    try std.testing.expectEqualDeep(expectedAaf32, r1.options.aaf32.?);
+    const expectedAai32: []const [:0]const i32 = &.{ &.{-1}, &.{ 2, -2 } };
+    try std.testing.expectEqualDeep(expectedAai32, r1.options.aai32.?);
 }
 
 test "parse kvargs" {

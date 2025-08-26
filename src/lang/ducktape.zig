@@ -10,14 +10,14 @@ const Allocator = std.mem.Allocator;
 pub const AnyDestroyable = struct {
     concrete: *anyopaque,
     vtable: *const struct {
-        destroy: *const fn (*anyopaque, *std.mem.Allocator) void = undefined,
+        destroy: *const fn (*anyopaque, *const Allocator) void = undefined,
     },
 
     pub inline fn deinit(self: *AnyDestroyable) void {
         self.* = undefined;
     }
 
-    pub inline fn destroy(self: *AnyDestroyable, allocator: *std.mem.Allocator) void {
+    pub inline fn destroy(self: *AnyDestroyable, allocator: *const Allocator) void {
         self.vtable.destroy(self.concrete, allocator);
     }
 };
@@ -32,7 +32,7 @@ pub fn Destroyable(comptime T: type) type {
 
         const Self = @This();
 
-        pub fn init(allocator: *std.mem.Allocator, value: *T) !*Self {
+        pub fn init(allocator: *const Allocator, value: *T) !*Self {
             const self = try allocator.create(Self);
             self.traits = try trait.newTraitTable(allocator, self, .{
                 try trait.extend(allocator, AnyDestroyable, self),
@@ -45,8 +45,7 @@ pub fn Destroyable(comptime T: type) type {
             self.* = undefined;
         }
 
-        // TODO: can this be inlined?
-        pub fn destroy(self: *Self, allocator: *std.mem.Allocator) void {
+        pub fn destroy(self: *Self, allocator: *const Allocator) void {
             meta.destroy(allocator, self.value);
             trait.destroyTraits(allocator, self);
         }
@@ -57,7 +56,7 @@ pub fn Destroyable(comptime T: type) type {
     };
 }
 
-pub fn quackLikeOwned(allocator: *Allocator, comptime Interface: type, concretePtr: anytype) !*Interface {
+pub fn quackLikeOwned(allocator: *const Allocator, comptime Interface: type, concretePtr: anytype) !*Interface {
     comptime if (!@hasField(Interface, "destroyable"))
         @compileError(std.fmt.comptimePrint(
             "Interface: {s} - no field destroyable found",
@@ -73,7 +72,7 @@ pub fn quackLikeOwned(allocator: *Allocator, comptime Interface: type, concreteP
     return innerQuackLikeOwned(allocator, Interface, meta.ptrToChild(concretePtr), concretePtr);
 }
 
-inline fn innerQuackLikeOwned(allocator: *Allocator, comptime Interface: type, Concrete: type, concretePtr: *Concrete) !*Interface {
+inline fn innerQuackLikeOwned(allocator: *const Allocator, comptime Interface: type, Concrete: type, concretePtr: *Concrete) !*Interface {
     const destroyable = try Destroyable(Concrete).init(allocator, concretePtr);
     errdefer destroyable.destroy(allocator);
 
@@ -121,7 +120,7 @@ test "destroy generic" {
             return self.vtable.do(self.concrete);
         }
 
-        pub fn deinit(self: *@This(), allocator: *Allocator) void {
+        pub fn deinit(self: *@This(), allocator: *const Allocator) void {
             self.destroyable.destroy(allocator);
             allocator.destroy(self);
         }

@@ -4,7 +4,7 @@ const BltType = std.builtin.Type;
 const Allocator = std.mem.Allocator;
 
 // NOTE: self.* undefined can only be done from the inside
-pub inline fn destroy(allocator: *Allocator, concrete: anytype) void {
+pub inline fn destroy(allocator: *const Allocator, concrete: anytype) void {
     const Concrete = @TypeOf(concrete);
     const ptrChild = ptrToChild(Concrete);
     const ptrChildType = @typeInfo(ptrChild);
@@ -28,7 +28,7 @@ pub inline fn destroy(allocator: *Allocator, concrete: anytype) void {
                     2 => {
                         switch (params[1].type.?) {
                             Allocator => concrete.deinit(allocator.*),
-                            *Allocator => concrete.deinit(allocator),
+                            *const Allocator => concrete.deinit(allocator),
                             else => @compileError(compPrint(
                                 "Concrete: {} - Invalid type of param for 2nd param",
                                 .{ptrChild},
@@ -78,7 +78,7 @@ test "destroy 2 param" {
     var allocator = @constCast(&std.testing.allocator);
     const c = try allocator.create(struct {
         called: *bool,
-        pub fn deinit(self: *@This(), allc: *Allocator) void {
+        pub fn deinit(self: *@This(), allc: *const Allocator) void {
             _ = allc;
             self.called.* = true;
         }
@@ -123,5 +123,60 @@ pub fn OptTypeOf(T: type) type {
     return comptime switch (@typeInfo(T)) {
         .optional => |opt| opt.child,
         else => T,
+    };
+}
+
+pub fn LeafTypeOfTag(T: type, comptime tag: []const u8) type {
+    return TypeAtDepth(T, tag, .concrete);
+}
+
+pub fn LeafArrayTypeOfTag(T: type, comptime tag: []const u8) type {
+    return TypeAtDepth(T, tag, .lastPtr);
+}
+
+// This is annoyingly strict on purpose
+pub const AtDepthArgs = enum(usize) {
+    @"0" = 0,
+    @"1" = 1,
+    @"2" = 2,
+    @"3" = 3,
+    concrete = 20,
+    lastPtr,
+};
+
+pub fn TypeAtDepthN(T: type, comptime tag: []const u8, comptime n: usize) type {
+    return comptime switch (n) {
+        0...3 => TypeAtDepth(T, tag, @enumFromInt(n)),
+        else => @compileError(std.fmt.comptimePrint("Depth of {d} is unsupported", .{n})),
+    };
+}
+
+pub fn TypeAtDepth(T: type, comptime tag: []const u8, comptime depth: AtDepthArgs) type {
+    // + 1 at the end because depth is usize :)
+    comptime var maxDepth: usize = switch (depth) {
+        .concrete => 3,
+        .lastPtr => 2,
+        else => |en| @intFromEnum(en),
+    };
+
+    return T: {
+        comptime var Tt = OptTypeOf(@FieldType(T, tag));
+        comptime while (maxDepth > 0) : (maxDepth -= 1) {
+            switch (@typeInfo(Tt)) {
+                // TODO: add array, optional and vector
+                .pointer => |ptr| {
+                    if (@typeInfo(ptr.child) != .pointer and depth == .lastPtr) break :T Tt else Tt = ptr.child;
+                },
+                else => break :T Tt,
+            }
+        } else {
+            switch (@intFromEnum(depth)) {
+                0...3 => break :T Tt,
+                else => @compileError(std.fmt.comptimePrint(
+                    "Pointer chain for {s} is longer than max depth supported by {s}",
+                    .{ tag, @tagName(depth) },
+                )),
+            }
+        };
     };
 }

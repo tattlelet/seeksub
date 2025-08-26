@@ -9,20 +9,20 @@ pub fn Uniq(T: type) type {
     return struct {
         value: T,
 
-        pub fn init(allocator: *Allocator, value: T) !*Uniq(T) {
+        pub fn init(allocator: *const Allocator, value: T) !*Uniq(T) {
             var self = try allocator.create(Uniq(T));
             self.value = value;
             return self;
         }
 
-        pub fn move(self: *Uniq(T), allocator: *Allocator) !*Uniq(T) {
+        pub fn move(self: *Uniq(T), allocator: *const Allocator) !*Uniq(T) {
             const other = try Uniq(T).init(allocator, self.value);
             allocator.destroy(self);
             self.* = undefined;
             return other;
         }
 
-        pub fn deinit(self: *Uniq(T), allocator: *Allocator) void {
+        pub fn deinit(self: *Uniq(T), allocator: *const Allocator) void {
             meta.destroy(allocator, self.value);
             allocator.destroy(self);
         }
@@ -54,7 +54,7 @@ pub fn Shared(T: type) type {
         count: usize,
         value: T,
 
-        pub fn init(allocator: *Allocator, value: T) !*Shared(T) {
+        pub fn init(allocator: *const Allocator, value: T) !*Shared(T) {
             var self = try allocator.create(Shared(T));
             self.count = 1;
             self.value = value;
@@ -62,7 +62,7 @@ pub fn Shared(T: type) type {
             return self;
         }
 
-        pub fn deinit(self: *Shared(T), allocator: *Allocator) void {
+        pub fn deinit(self: *Shared(T), allocator: *const Allocator) void {
             if (self.count > 1) {
                 self.count = self.count - 1;
             } else {
