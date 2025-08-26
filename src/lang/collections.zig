@@ -119,7 +119,6 @@ pub fn Iterator(T: type) type {
     };
 }
 
-// NOTE: should this guy transition into iterator? sounds unecessary
 pub fn Cursor(T: type) type {
     return struct {
         concrete: *anyopaque,
@@ -129,9 +128,6 @@ pub fn Cursor(T: type) type {
         pub const VTable = struct {
             destroy: *const fn (*anyopaque, *const Allocator) void = undefined,
             next: *const fn (*anyopaque) ?T = undefined,
-            peek: *const fn (*anyopaque) ?T = undefined,
-            consume: *const fn (*anyopaque) void = undefined,
-            stackItem: *const fn (*anyopaque, item: T) void = undefined,
         };
 
         pub fn new(self: *@This()) *@This() {
@@ -153,16 +149,46 @@ pub fn Cursor(T: type) type {
 
         pub fn peek(self: *@This()) ?T {
             if (self.curr) |item| return item;
-            self.curr = self.vtable.peek(self.concrete);
+            self.curr = self.vtable.next(self.concrete);
             return self.curr;
         }
 
         pub fn consume(self: *@This()) void {
-            self.vtable.consume(self.concrete);
+            _ = self.next();
         }
 
         pub fn stackItem(self: *@This(), item: T) void {
-            self.vtable.stackItem(self.concrete, item);
+            self.curr = item;
+        }
+    };
+}
+
+pub fn UnitCursor(T: type) type {
+    return struct {
+        traits: *const struct {
+            cursor: *Cursor(T),
+        },
+
+        pub fn init(allocator: *const Allocator, item: T) !*@This() {
+            var self = try allocator.create(@This());
+            self.traits = try trait.newTraitTable(allocator, self, .{
+                (try trait.extend(
+                    allocator,
+                    Cursor(T),
+                    self,
+                )).new(),
+            });
+            self.traits.cursor.curr = item;
+            return self;
+        }
+
+        pub fn destroy(self: *@This(), allocator: *const Allocator) void {
+            trait.destroyTraits(allocator, self);
+        }
+
+        pub fn next(self: *@This()) ?[:0]const u8 {
+            _ = self;
+            return null;
         }
     };
 }
@@ -191,7 +217,7 @@ pub fn DFSCursor(T: type) type {
             trait.destroyTraits(allocator, self);
         }
 
-        fn dfsNext(self: *@This()) ?[:0]const u8 {
+        pub fn next(self: *@This()) ?[:0]const u8 {
             const stack = self.stackQ;
             while (stack.peek() != null) : (_ = stack.pop()) {
                 if (stack.peek()) |q| {
@@ -205,24 +231,46 @@ pub fn DFSCursor(T: type) type {
             } else return null;
         }
 
-        pub fn next(self: *@This()) ?[:0]const u8 {
-            return self.dfsNext();
-        }
-
-        pub fn peek(self: *@This()) ?[:0]const u8 {
-            return self.dfsNext();
-        }
-
-        pub fn consume(self: *@This()) void {
-            _ = self.traits.cursor.next();
-        }
-
-        pub fn stackItem(self: *@This(), item: T) void {
-            self.traits.cursor.curr = item;
-        }
-
         pub fn prependQueue(self: *@This(), allocator: *const Allocator, queue: *SinglyLinkedQueue(T)) Allocator.Error!void {
             try self.stackQ.prepend(allocator, queue);
+        }
+    };
+}
+
+pub fn QueueCursor(T: type) type {
+    return struct {
+        queue: *SinglyLinkedQueue(T),
+        traits: *const struct {
+            cursor: *Cursor(T),
+        },
+
+        pub fn init(allocator: *const Allocator, queue: *SinglyLinkedQueue(T)) !*@This() {
+            var self = try allocator.create(@This());
+            self.traits = try trait.newTraitTable(allocator, self, .{
+                (try trait.extend(
+                    allocator,
+                    Cursor(T),
+                    self,
+                )).new(),
+            });
+            self.queue = queue;
+            return self;
+        }
+
+        pub fn destroy(self: *@This(), allocator: *const Allocator) void {
+            trait.destroyTraits(allocator, self);
+        }
+
+        pub fn next(self: *@This()) ?[:0]const u8 {
+            return self.queue.pop();
+        }
+
+        pub fn queueItem(self: *@This(), allocator: *const Allocator, item: T) Allocator.Error!void {
+            try self.queue.append(allocator, item);
+        }
+
+        pub fn len(self: *@This()) usize {
+            return self.queue.len;
         }
     };
 }

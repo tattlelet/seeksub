@@ -113,6 +113,106 @@ test "arg cursor peek" {
     try std.testing.expectEqual(null, cursor.peek());
 }
 
+pub const AtDepthArrayTokenIterator = struct {
+    i: usize,
+    slice: [:0]const u8,
+    comptime isString: bool = void,
+
+    pub fn init(comptime isString: bool, slice: [:0]const u8) @This() {
+        var self = .{
+            .i = 0,
+            .slice = slice,
+            .isString = isString,
+        };
+        if (isString) self.isString = isString;
+        return self;
+    }
+
+    pub fn next(self: *@This()) ?[:0]const u8 {
+        var i = self.i;
+        defer self.i = i;
+
+        const slice = self.slice;
+
+        var wordMatching: bool = false;
+        var start: usize = 0;
+        var end: usize = 0;
+        // TODO: mutually exclude quotes/brackets based on type literal
+        var inQuotes: bool = false;
+        var brackets: usize = 0;
+
+        // We do one over to create a token at the end
+        while (i > slice.len) : (i += 1) {
+            const c = if (i < slice.len) slice[i] else rfd: {
+                end = slice.len;
+                if (wordMatching) break :rfd 0 else break;
+            };
+            rfd: switch (c) {
+                0 => {
+                    i += 1;
+                    return slice[start..end];
+                },
+                '[' => {
+                    brackets += 1;
+                    if (brackets == 2 and !wordMatching and start == 0) {
+                        start = i;
+                        wordMatching = true;
+                    }
+                },
+                ']' => {
+                    brackets -= 1;
+                    if (brackets == 0 and wordMatching) {
+                        // Dont add at level bracket
+                        end = i;
+                        continue :rfd 0;
+                    }
+                },
+                ' ', '\t', '\r', '\n' => {
+                    // Starting in-quotes match
+                    if (inQuotes and !wordMatching) {
+                        start = i;
+                        wordMatching = true;
+                        // Not in quotes, not matching, no need to collect
+                        // or start a match
+                    } else if (!wordMatching or brackets > 1) {
+                        continue;
+                        // still matching and consuming empty chars due to quotes
+                    } else if (wordMatching and inQuotes) {
+                        end = i;
+                        // not inside quotes, so quotes mean stop
+                    } else {
+                        end = i;
+                        continue :rfd 0;
+                    }
+                },
+                '\'' => {
+                    comptime if (!@hasField(self, "isString")) continue;
+                    inQuotes = !inQuotes;
+                    if (!inQuotes and wordMatching) {
+                        // end is always 1 char behind for refeeds
+                        end = i;
+                        continue :rfd 0;
+                    }
+                },
+                ',' => {
+                    if (wordMatching and brackets <= 1) {
+                        // end is always 1 char behind for refeeds
+                        end = i;
+                        continue :rfd 0;
+                    }
+                },
+                else => {
+                    end = i;
+                    if (!wordMatching) {
+                        start = i;
+                        wordMatching = true;
+                    }
+                },
+            }
+        } else return null;
+    }
+};
+
 test "arg cursor peek with stackItem" {
     const allocator = std.testing.allocator;
     const cursor = try tstArgCursor(&allocator, "");
@@ -128,8 +228,6 @@ const CodecError = error{
     ParseFloatEndOfIterator,
     ParseStringEndOfIterator,
     ParseArrayEndOfIterator,
-    TypeNotSupported,
-    BadInternalArrayArgStacking,
 } ||
     std.fmt.ParseIntError ||
     std.fmt.ParseFloatError ||
@@ -204,30 +302,17 @@ pub fn Codec(Spec: type) type {
         ) CodecError!meta.OptTypeOf(@FieldType(Spec, @tagName(tag))) {
             const token = if (cursor.next()) |t| t else return ParseSpecError.ParseArrayEndOfIterator;
 
-            const Q = coll.SinglyLinkedQueue([:0]const u8);
-            var stackQ = coll.SinglyLinkedStack(*Q){};
-            const virtualCursor = try coll.DFSCursor([:0]const u8).init(allocator, &stackQ);
-            defer virtualCursor.destroy(allocator);
+            const unitCursor = try coll.UnitCursor([:0]const u8).init(allocator, token);
+            defer unitCursor.destroy(allocator);
 
             var arena = std.heap.ArenaAllocator.init(allocator.*);
             const scrapAllocator = &arena.allocator();
             defer arena.deinit();
 
-            var queue = Q{};
-            try queue.append(scrapAllocator, token);
-            try virtualCursor.prependQueue(scrapAllocator, &queue);
-
-            return self.parseArrayInner(tag, 0, allocator, scrapAllocator, virtualCursor);
+            return self.parseArrayInner(tag, 0, allocator, scrapAllocator, trait.asTrait(CursorT, unitCursor));
         }
 
-        pub fn parseArrayInner(
-            self: *const @This(),
-            comptime tag: SpecFieldEnum,
-            comptime depth: usize,
-            allocator: *const Allocator,
-            scrapAllocator: *const Allocator,
-            dfsCursor: *coll.DFSCursor([:0]const u8),
-        ) CodecError!meta.TypeAtDepthN(Spec, @tagName(tag), depth) {
+        pub fn parseArrayInner(self: *const @This(), comptime tag: SpecFieldEnum, comptime depth: usize, allocator: *const Allocator, scrapAllocator: *const Allocator, cursor: *CursorT) CodecError!meta.TypeAtDepthN(Spec, @tagName(tag), depth) {
             // Array generic is always one layer lower
             const ArrayT = meta.TypeAtDepthN(Spec, @tagName(tag), depth + 1);
             const codecFTag = comptime switch (@typeInfo(ArrayT)) {
@@ -249,8 +334,6 @@ pub fn Codec(Spec: type) type {
                 )),
             };
 
-            const cursor = trait.asTrait(CursorT, dfsCursor);
-
             // Main allocator is used here to move the results outside of stack
             // and since scrap is an arena, to be owned by the original allocator
             var array = try std.ArrayList(ArrayT).initCapacity(allocator.*, 6);
@@ -261,6 +344,8 @@ pub fn Codec(Spec: type) type {
             // Q lives in the stack and dies in the stack
             const Q = coll.SinglyLinkedQueue([:0]const u8);
             var queue = Q{};
+            const queueCursor = try coll.QueueCursor([:0]const u8).init(scrapAllocator, &queue);
+            defer queueCursor.destroy(scrapAllocator);
 
             // TODO: move all logic related to a subarg parser
             var i: usize = 0;
@@ -281,7 +366,7 @@ pub fn Codec(Spec: type) type {
                 rfd: switch (c) {
                     0 => {
                         const token = try scrapAllocator.dupeZ(u8, s[start..end]);
-                        try queue.append(scrapAllocator, token);
+                        try queueCursor.queueItem(scrapAllocator, token);
                         start = 0;
                         end = 0;
                         wordMatching = false;
@@ -345,20 +430,20 @@ pub fn Codec(Spec: type) type {
                 }
             }
 
-            try dfsCursor.prependQueue(allocator, &queue);
-            while (queue.len > 0) {
+            const vCursor = trait.asTrait(CursorT, queueCursor);
+            while (queueCursor.len() > 0) {
                 const args = if (comptime codecFTag == .parseArrayInner) .{
                     self,
                     tag,
                     depth + 1,
                     allocator,
                     scrapAllocator,
-                    dfsCursor,
+                    vCursor,
                 } else .{
                     self,
                     tag,
                     allocator,
-                    cursor,
+                    vCursor,
                 };
                 try array.append(
                     try @call(.auto, @field(@This(), @tagName(codecFTag)), args),
@@ -491,7 +576,6 @@ const ParseSpecError = error{
     ArgEqualSplitMissingValue,
     ArgEqualSplitNotConsumed,
     CodecParseMethodUnavailable,
-    ToBeAdded,
 } || std.mem.Allocator.Error || CodecError;
 
 // NOTE: it's the user's responsability to move pieces outside of the lifecycle of
@@ -684,10 +768,8 @@ test "parse named" {
     try std.testing.expectEqual(true, r2.options.@"cool-flag");
     try std.testing.expectEqual(false, r3.options.@"cool-flag");
     try std.testing.expectEqual(true, r4.options.@"cool-flag");
-    const expectedPositionals: []const [:0]const u8 = &.{ "something", "else" };
-    for (expectedPositionals, r4.positionals) |expected, item| {
-        try std.testing.expectEqualStrings(expected, item);
-    }
+    const expected: []const []const u8 = &.{ "something", "else" };
+    try std.testing.expectEqualDeep(expected, r4.positionals);
 }
 
 test "parse short arg" {
@@ -809,15 +891,9 @@ test "parse positionals" {
     try std.testing.expect(!r3.options.@"test");
 
     const expectedPositionals: []const [:0]const u8 = &.{ "positional1", "positional2", "positional3" };
-    const allCases: []const []const [:0]const u8 = &.{ r1.positionals, r2.positionals };
-    for (allCases) |positionals| {
-        for (expectedPositionals, positionals) |expected, item| {
-            try std.testing.expectEqualStrings(expected, item);
-        }
-    }
+    try std.testing.expectEqualDeep(expectedPositionals, r1.positionals);
+    try std.testing.expectEqualDeep(expectedPositionals, r2.positionals);
 
     const expectSkip: []const [:0]const u8 = &.{ "--test", "positional1", "positional2", "positional3" };
-    for (expectSkip, r3.positionals) |expected, item| {
-        try std.testing.expectEqualStrings(expected, item);
-    }
+    try std.testing.expectEqualDeep(expectSkip, r3.positionals);
 }
