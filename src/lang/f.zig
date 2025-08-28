@@ -1,6 +1,7 @@
 const std = @import("std");
 const meta = @import("meta.zig");
 
+// NOTE: Redo this, it's probably only working with comptime due to function boundary
 pub inline fn bind(origF: anytype, currentArg: anytype) type {
     return bindInternal(origF, currentArg, .{}, 0);
 }

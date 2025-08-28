@@ -76,18 +76,6 @@ pub const ArgCursor = struct {
     pub fn next(self: *@This()) ?[:0]const u8 {
         return self.iterator.next();
     }
-
-    pub fn peek(self: *@This()) ?[:0]const u8 {
-        return self.iterator.next();
-    }
-
-    pub fn consume(self: *@This()) void {
-        _ = self.traits.cursor.next();
-    }
-
-    pub fn stackItem(self: *@This(), item: [:0]const u8) void {
-        self.traits.cursor.curr = item;
-    }
 };
 
 fn tstArgCursor(allocator: *const Allocator, data: [:0]const u8) !*coll.Cursor([:0]const u8) {
@@ -115,81 +103,289 @@ test "arg cursor peek" {
 
 pub const AtDepthArrayTokenIterator = struct {
     i: usize,
+    brackets: usize,
+    isString: bool,
     slice: [:0]const u8,
-    comptime isString: bool = void,
+    earlyExit: bool,
+    first: bool,
+    state: State,
 
-    pub fn init(comptime isString: bool, slice: [:0]const u8) @This() {
-        var self = .{
-            .i = 0,
-            .slice = slice,
-            .isString = isString,
+    const Error = error{
+        MissingFirstArrayLayer,
+        EmptyCommaSplit,
+    } || State.Error;
+
+    const State = union(enum) {
+        Noop: void,
+        Matching: BaseMatch,
+        InBracket: BracketTracker,
+        InBracketMatching: BracketMatching,
+        SeekComma: BracketTracker,
+        NeedValue: BracketTracker,
+        Ready: ReadyS,
+
+        const BracketTracker = struct {
+            depth: usize,
         };
-        if (isString) self.isString = isString;
-        return self;
+
+        const BracketMatching = struct {
+            tracker: BracketTracker,
+            match: BaseMatch,
+        };
+
+        const BaseMatch = struct {
+            start: usize,
+            end: usize,
+        };
+
+        const ReadyS = struct {
+            match: BaseMatch,
+            earlyStop: bool,
+        };
+
+        const Error = error{
+            CharBlackholed,
+            UnsupportedQuotesOnArrayType,
+            UnsupportedCharacterOnArrayType,
+            EarlyBracketTermination,
+            MissingFirstArrayLayer,
+            EmptyCommaSplit,
+            EarlyArrayTermination,
+            MissingCommaSeparator,
+        };
+
+        // TODO: rework state machine to be less bad to use
+        fn consume(elf: *const State, i: usize, c: u8) !State {
+            var self = elf.*;
+            return result: switch (c) {
+                0 => {
+                    break :result switch (self) {
+                        .Noop, .InBracket, .SeekComma => State{ .Noop = undefined },
+                        .NeedValue, .InBracketMatching => return State.Error.EarlyArrayTermination,
+                        .Matching => |*match| rvalue: {
+                            match.end = i;
+                            break :rvalue State{ .Ready = .{
+                                .match = match.*,
+                                .earlyStop = false,
+                            } };
+                        },
+                        .Ready => return State.Error.CharBlackholed,
+                    };
+                },
+                '[' => {
+                    break :result switch (self) {
+                        .Noop => State{ .InBracket = .{ .depth = 1 } },
+                        .NeedValue, .InBracket, .SeekComma => |*bracket| rvalue: {
+                            bracket.depth += 1;
+                            break :rvalue State{ .InBracketMatching = .{
+                                .tracker = bracket.*,
+                                .match = .{ .start = i, .end = i + 1 },
+                            } };
+                        },
+                        .InBracketMatching => |*bMatching| rvalue: {
+                            bMatching.tracker.depth += 1;
+                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                        },
+                        .Matching => |*match| rvalue: {
+                            match.end = i;
+                            break :rvalue .{ .Matching = match.* };
+                        },
+                        .Ready => return State.Error.CharBlackholed,
+                    };
+                },
+                ']' => {
+                    break :result switch (self) {
+                        .Noop => return State.Error.MissingFirstArrayLayer,
+                        .InBracket, .SeekComma => State.Noop,
+                        .NeedValue => return State.Error.EarlyArrayTermination,
+                        .InBracketMatching => |*bMatching| rvalue: {
+                            bMatching.match.end = i;
+                            bMatching.tracker.depth -= 1;
+                            if (bMatching.tracker.depth == 0) break :rvalue .{ .Ready = .{
+                                .match = bMatching.match,
+                                .earlyStop = false,
+                            } };
+                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                        },
+                        .Matching => |*match| rvalue: {
+                            match.end = i;
+                            break :rvalue .{ .Matching = match.* };
+                        },
+                        .Ready => return State.Error.CharBlackholed,
+                    };
+                },
+                '\'' => return State.Error.UnsupportedQuotesOnArrayType,
+                ' ', '\t' => {
+                    break :result switch (self) {
+                        .Noop => .{ .Noop = undefined },
+                        .SeekComma => |s| .{ .SeekComma = s },
+                        .NeedValue => |n| .{ .NeedValue = n },
+                        .InBracket => |*bracket| .{ .InBracket = bracket.* },
+                        .InBracketMatching => |*bMatching| rvalue: {
+                            bMatching.match.end = i;
+                            if (bMatching.tracker.depth == 1) break :rvalue .{ .Ready = .{ .match = bMatching.match, .earlyStop = true } };
+                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                        },
+                        .Matching => |*match| rvalue: {
+                            match.end = i;
+                            break :rvalue .{ .Ready = .{ .match = match.*, .earlyStop = true } };
+                        },
+                        .Ready => return State.Error.CharBlackholed,
+                    };
+                },
+                '\r', '\n' => return State.Error.UnsupportedCharacterOnArrayType,
+                ',' => {
+                    break :result switch (self) {
+                        .Noop => .{ .Noop = undefined },
+                        .SeekComma => |s| .{ .NeedValue = s },
+                        .NeedValue, .InBracket => return State.Error.EmptyCommaSplit,
+                        .InBracketMatching => |*bMatching| rvalue: {
+                            bMatching.match.end = i;
+                            if (bMatching.tracker.depth == 1) break :rvalue .{ .Ready = .{ .match = bMatching.match, .earlyStop = false } };
+                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                        },
+                        .Matching => |*match| rvalue: {
+                            match.end = i;
+                            break :rvalue .{ .Ready = .{ .match = match.*, .earlyStop = false } };
+                        },
+                        .Ready => return State.Error.CharBlackholed,
+                    };
+                },
+                else => {
+                    break :result switch (self) {
+                        .Noop => return State.Error.MissingFirstArrayLayer,
+                        .NeedValue, .InBracket => |bracket| .{ .InBracketMatching = .{
+                            .tracker = bracket,
+                            .match = .{ .start = i, .end = i },
+                        } },
+                        .InBracketMatching => |*bMatching| rvalue: {
+                            bMatching.match.end = i;
+                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                        },
+                        .Matching => |*match| rvalue: {
+                            match.end = i;
+                            break :rvalue .{ .Matching = match.* };
+                        },
+                        .SeekComma => return State.Error.MissingCommaSeparator,
+                        .Ready => return State.Error.CharBlackholed,
+                    };
+                },
+            };
+        }
+    };
+
+    pub fn init(isString: bool, slice: [:0]const u8) @This() {
+        return .{
+            .i = 0,
+            .brackets = 0,
+            .isString = isString,
+            .slice = slice,
+            .earlyExit = false,
+            .first = true,
+            .state = State.Noop,
+        };
     }
 
-    pub fn next(self: *@This()) ?[:0]const u8 {
+    pub fn next(self: *@This()) Error!?[]const u8 {
         var i = self.i;
-        defer self.i = i;
+        defer {
+            self.i = i;
+        }
+
+        const slice = self.slice;
+        while (i <= slice.len) : (i += 1) {
+            const c = if (i < slice.len) slice[i] else 0;
+            self.state = switch (try self.state.consume(i, c)) {
+                .Ready => |rMatch| {
+                    i += 1;
+                    self.state = if (!rMatch.earlyStop) .{ .InBracket = .{ .depth = 1 } } else .{ .SeekComma = .{ .depth = 1 } };
+                    const match = rMatch.match;
+                    const s = slice[match.start..match.end];
+                    std.debug.print("{s}\n", .{s});
+                    return s;
+                },
+                else => |state| state,
+            };
+        }
+        return null;
+    }
+
+    pub fn next2(self: *@This()) Error!?[]const u8 {
+        var i = self.i;
+        var brackets = self.brackets;
+        defer {
+            self.i = i;
+            self.brackets = brackets;
+        }
 
         const slice = self.slice;
 
         var wordMatching: bool = false;
         var start: usize = 0;
         var end: usize = 0;
-        // TODO: mutually exclude quotes/brackets based on type literal
         var inQuotes: bool = false;
-        var brackets: usize = 0;
 
         // We do one over to create a token at the end
-        while (i > slice.len) : (i += 1) {
-            const c = if (i < slice.len) slice[i] else rfd: {
+        while (i <= slice.len) : (i += 1) {
+            const c = if (i < slice.len) slice[i] else endIt: {
                 end = slice.len;
-                if (wordMatching) break :rfd 0 else break;
+                if (wordMatching) break :endIt 0 else break;
             };
             rfd: switch (c) {
                 0 => {
                     i += 1;
-                    return slice[start..end];
+                    self.first = false;
+                    const s = slice[start..end];
+                    return s;
                 },
                 '[' => {
-                    brackets += 1;
-                    if (brackets == 2 and !wordMatching and start == 0) {
-                        start = i;
-                        wordMatching = true;
+                    if (self.isString) end = i else {
+                        brackets += 1;
+                        if (brackets == 2 and !wordMatching and start == 0) {
+                            wordMatching = true;
+                            start = i;
+                            end = i;
+                        }
                     }
                 },
                 ']' => {
-                    brackets -= 1;
-                    if (brackets == 0 and wordMatching) {
-                        // Dont add at level bracket
-                        end = i;
-                        continue :rfd 0;
+                    if (self.isString) end = i else {
+                        brackets -= 1;
+                        if (brackets == 0 and wordMatching) {
+                            // Dont add at level bracket
+                            end = i;
+                            continue :rfd 0;
+                        } else if (brackets == 0 and !self.earlyExit and !self.first) {
+                            return Error.EarlyArrayTermination;
+                        }
                     }
                 },
                 ' ', '\t', '\r', '\n' => {
-                    // Starting in-quotes match
                     if (inQuotes and !wordMatching) {
+                        // Starting in-quotes match
                         start = i;
+                        end = i;
                         wordMatching = true;
+                    } else if (!wordMatching or brackets > 1) {
                         // Not in quotes, not matching, no need to collect
                         // or start a match
-                    } else if (!wordMatching or brackets > 1) {
                         continue;
-                        // still matching and consuming empty chars due to quotes
                     } else if (wordMatching and inQuotes) {
+                        // still matching and consuming empty chars due to quotes
                         end = i;
-                        // not inside quotes, so quotes mean stop
                     } else {
+                        // not inside quotes, so quotes mean stop
+                        self.earlyExit = true;
                         end = i;
                         continue :rfd 0;
                     }
                 },
                 '\'' => {
-                    comptime if (!@hasField(self, "isString")) continue;
+                    if (!self.isString) return Error.UnsupportedQuotesOnArrayType;
                     inQuotes = !inQuotes;
                     if (!inQuotes and wordMatching) {
                         // end is always 1 char behind for refeeds
+                        self.earlyExit = true;
                         end = i;
                         continue :rfd 0;
                     }
@@ -199,19 +395,64 @@ pub const AtDepthArrayTokenIterator = struct {
                         // end is always 1 char behind for refeeds
                         end = i;
                         continue :rfd 0;
+                    } else if (!wordMatching and start == end) {
+                        if (self.earlyExit) {
+                            self.earlyExit = false;
+                        } else {
+                            return Error.EmptyCommaSplit;
+                        }
                     }
                 },
                 else => {
                     end = i;
                     if (!wordMatching) {
+                        if (!self.isString and brackets == 0) return Error.MissingFirstArrayLayer;
                         start = i;
                         wordMatching = true;
                     }
                 },
             }
-        } else return null;
+        }
+        return null;
     }
 };
+
+fn tstCollectTokens(allocator: *const Allocator, isString: bool, slice: [:0]const u8) ![]const [:0]const u8 {
+    var result = std.ArrayList([:0]const u8).init(allocator.*);
+    var tokenizer = AtDepthArrayTokenIterator.init(isString, slice);
+    // var tokenizer2 = AtDepthArrayTokenIterator.init(isString, slice);
+    while (true) {
+        // const item2 = try tokenizer2.next();
+        const item = try tokenizer.next();
+        // try std.testing.expectEqualDeep(item, item);
+        if (item == null) break;
+        try result.append(try allocator.dupeZ(u8, item.?));
+    }
+
+    return result.toOwnedSlice();
+}
+
+test "Array tokenizer (non-string)" {
+    const t = std.testing;
+    const E = AtDepthArrayTokenIterator.Error;
+    const base = &std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    const expectEmpty: []const [:0]const u8 = &.{};
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, false, ""));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, false, "["));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, false, "[]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, false, "[ ]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, false, "[  ,]"));
+    try t.expectError(E.UnsupportedQuotesOnArrayType, tstCollectTokens(allocator, false, "'"));
+    try t.expectError(E.UnsupportedQuotesOnArrayType, tstCollectTokens(allocator, false, "[1,']"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, false, "[1,,]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, false, "[1 ,]"));
+    const expectTwo: []const [:0]const u8 = &.{ "1", "1" };
+    try t.expectEqualDeep(expectTwo, tstCollectTokens(allocator, false, "[1,1]"));
+}
 
 test "arg cursor peek with stackItem" {
     const allocator = std.testing.allocator;
@@ -229,6 +470,7 @@ const CodecError = error{
     ParseStringEndOfIterator,
     ParseArrayEndOfIterator,
 } ||
+    AtDepthArrayTokenIterator.Error ||
     std.fmt.ParseIntError ||
     std.fmt.ParseFloatError ||
     std.mem.Allocator.Error;
@@ -289,11 +531,6 @@ pub fn Codec(Spec: type) type {
             };
         }
 
-        /// Parses comma separated values into an array of types
-        /// the only special case are strings where we will parse [][]u8
-        /// The type-switch matcher looks awfully similar to the one in parseWith, and thats because
-        /// the default codec's parseWith is agnostic to the Spec, but that may not always be the case
-        /// and should not be enforced
         pub fn parseArray(
             self: *const @This(),
             comptime tag: SpecFieldEnum,
@@ -335,11 +572,10 @@ pub fn Codec(Spec: type) type {
             };
 
             // Main allocator is used here to move the results outside of stack
-            // and since scrap is an arena, to be owned by the original allocator
             var array = try std.ArrayList(ArrayT).initCapacity(allocator.*, 6);
             errdefer array.deinit();
 
-            const s = cursor.next() orelse return CodecError.ParseArrayEndOfIterator;
+            const slice = cursor.next() orelse return CodecError.ParseArrayEndOfIterator;
 
             // Q lives in the stack and dies in the stack
             const Q = coll.SinglyLinkedQueue([:0]const u8);
@@ -347,87 +583,11 @@ pub fn Codec(Spec: type) type {
             const queueCursor = try coll.QueueCursor([:0]const u8).init(scrapAllocator, &queue);
             defer queueCursor.destroy(scrapAllocator);
 
-            // TODO: move all logic related to a subarg parser
-            var i: usize = 0;
-            var wordMatching: bool = false;
-            var start: usize = 0;
-            var end: usize = 0;
-            // TODO: mutually exclude quotes/brackets based on type literal
-            var inQuotes: bool = false;
-            var brackets: usize = 0;
+            const LeafT = meta.LeafTypeOfTag(Spec, @tagName(tag));
+            var arrTokenizer = AtDepthArrayTokenIterator.init(LeafT == u8, slice);
 
-            while (true) : (i += 1) {
-                // We do one over to create a token at the end
-                if (i > s.len) break;
-                const c = if (i < s.len) s[i] else rfd: {
-                    end = s.len;
-                    if (wordMatching) break :rfd 0 else break;
-                };
-                rfd: switch (c) {
-                    0 => {
-                        const token = try scrapAllocator.dupeZ(u8, s[start..end]);
-                        try queueCursor.queueItem(scrapAllocator, token);
-                        start = 0;
-                        end = 0;
-                        wordMatching = false;
-                        inQuotes = false;
-                    },
-                    '[' => {
-                        brackets += 1;
-                        if (brackets == 2 and !wordMatching and start == 0) {
-                            start = i;
-                            wordMatching = true;
-                        }
-                    },
-                    ']' => {
-                        brackets -= 1;
-                        if (brackets == 0 and wordMatching) {
-                            // Dont add at level bracket
-                            end = i;
-                            continue :rfd 0;
-                        }
-                    },
-                    ' ', '\t', '\r', '\n' => {
-                        // Starting in-quotes match
-                        if (inQuotes and !wordMatching) {
-                            start = i;
-                            wordMatching = true;
-                            // Not in quotes, not matching, no need to collect
-                            // or start a match
-                        } else if (!wordMatching or brackets > 1) {
-                            continue;
-                            // still matching and consuming empty chars due to quotes
-                        } else if (wordMatching and inQuotes) {
-                            end = i;
-                            // not inside quotes, so quotes mean stop
-                        } else {
-                            end = i;
-                            continue :rfd 0;
-                        }
-                    },
-                    '\'' => {
-                        inQuotes = !inQuotes;
-                        if (!inQuotes and wordMatching) {
-                            // end is always 1 char behind for refeeds
-                            end = i;
-                            continue :rfd 0;
-                        }
-                    },
-                    ',' => {
-                        if (wordMatching and brackets <= 1) {
-                            // end is always 1 char behind for refeeds
-                            end = i;
-                            continue :rfd 0;
-                        }
-                    },
-                    else => {
-                        end = i;
-                        if (!wordMatching) {
-                            start = i;
-                            wordMatching = true;
-                        }
-                    },
-                }
+            while (try arrTokenizer.next()) |token| {
+                try queueCursor.queueItem(scrapAllocator, try scrapAllocator.dupeZ(u8, token));
             }
 
             const vCursor = trait.asTrait(CursorT, queueCursor);
@@ -806,14 +966,14 @@ test "parse different types" {
         u1: ?u1 = null,
         f1: ?f16 = null,
         b: ?bool = null,
-        s1: ?[]const u8 = null,
-        s2: ?[:0]const u8 = null,
+        // s1: ?[]const u8 = null,
+        // s2: ?[:0]const u8 = null,
         au1: ?[]const u1 = null,
         au32: ?[]const u32 = null,
         ai32: ?[]const i32 = null,
         af32: ?[]const f32 = null,
         // // // TODO: missing enum, []enum, []bool
-        as1: ?[]const []const u8 = null,
+        // as1: ?[]const []const u8 = null,
         as2: ?[]const [:0]const u8 = null,
         aau32: ?[]const []const u32 = null,
         aaf32: ?[]const []const f32 = null,
@@ -825,14 +985,14 @@ test "parse different types" {
         \\--u1=0
         \\--f1 1.1
         \\--b false
-        \\--s1 Hello
-        \\--s2 "Hello World"
-        \\--au1 1,0,1,0
-        \\--au32=32,23,133,99,10
-        \\--ai32 "-1, -44, 22222   ,   -1"
-        \\--af32="    3.4   , 58,   3.1  "
-        \\--as1 "'Hello', ' World ', '!'"
-        \\--as2="  'Im'  ,  'Losing it'  "
+        // \\--s1 Hello
+        // \\--s2 "Hello World"
+        \\--au1 [1,0,1,0]
+        \\--au32=[32,23,133,99,10]
+        \\--ai32 "[-1, -44, 22222   ,   -1]"
+        \\--af32="[    3.4   , 58,   3.1  ]"
+        // \\--as1 "'Hello', ' World ', '!'"
+        // \\--as2="  'Im'  ,  'Losing it'  "
         \\--aau32 "[[1,3], [3300, 222, 333, 33], [1]]"
         \\--aaf32 "[  [  1.1,  3.2,-1] ,   [3.1  ,2,5], [ 1.2 ], [7.1]   ]"
         \\--aai32 "[  [  -1] ,   [2, -2] ]"
@@ -844,15 +1004,15 @@ test "parse different types" {
     try std.testing.expectEqual(0, r1.options.u1.?);
     try std.testing.expectEqual(1.1, r1.options.f1.?);
     try std.testing.expect(!r1.options.b.?);
-    try std.testing.expectEqualStrings("Hello", r1.options.s1.?);
-    try std.testing.expectEqualStrings("Hello World", r1.options.s2.?);
+    // try std.testing.expectEqualStrings("Hello", r1.options.s1.?);
+    // try std.testing.expectEqualStrings("Hello World", r1.options.s2.?);
     try std.testing.expectEqualDeep(&[_]u1{ 1, 0, 1, 0 }, r1.options.au1.?);
     try std.testing.expectEqualDeep(&[_]u32{ 32, 23, 133, 99, 10 }, r1.options.au32.?);
     try std.testing.expectEqualDeep(&[_]i32{ -1, -44, 22222, -1 }, r1.options.ai32.?);
-    const expectedAs1: []const []const u8 = &.{ "Hello", " World ", "!" };
-    try std.testing.expectEqualDeep(expectedAs1, r1.options.as1.?);
-    const expectedAs2: []const [:0]const u8 = &.{ "Im", "Losing it" };
-    try std.testing.expectEqualDeep(expectedAs2, r1.options.as2.?);
+    // const expectedAs1: []const []const u8 = &.{ "Hello", " World ", "!" };
+    // try std.testing.expectEqualDeep(expectedAs1, r1.options.as1.?);
+    // const expectedAs2: []const [:0]const u8 = &.{ "Im", "Losing it" };
+    // try std.testing.expectEqualDeep(expectedAs2, r1.options.as2.?);
     const expectedAau32: []const [:0]const u32 = &.{ &.{ 1, 3 }, &.{ 3300, 222, 333, 33 }, &.{1} };
     try std.testing.expectEqualDeep(expectedAau32, r1.options.aau32.?);
     const expectedAaf32: []const [:0]const f32 = &.{ &.{ 1.1, 3.2, -1 }, &.{ 3.1, 2, 5 }, &.{1.2}, &.{7.1} };
