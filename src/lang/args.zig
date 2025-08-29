@@ -103,185 +103,236 @@ test "arg cursor peek" {
 
 pub const AtDepthArrayTokenIterator = struct {
     i: usize,
-    brackets: usize,
-    isString: bool,
     slice: [:0]const u8,
-    earlyExit: bool,
-    first: bool,
     state: State,
 
-    const Error = error{
-        MissingFirstArrayLayer,
-        EmptyCommaSplit,
-    } || State.Error;
+    const Error = error{} || State.Error;
 
-    const State = union(enum) {
-        Noop: void,
-        Matching: BaseMatch,
-        InBracket: BracketTracker,
-        InBracketMatching: BracketMatching,
-        SeekComma: BracketTracker,
-        NeedValue: BracketTracker,
-        Ready: ReadyS,
+    const StateTag = enum {
+        noop,
+        inQuotes,
+        inBrackets,
+        inBracketsMatching,
+        seekComma,
+        seekCommaQuotes,
+        needValue,
+        ready,
+    };
 
-        const BracketTracker = struct {
-            depth: usize,
-        };
-
-        const BracketMatching = struct {
-            tracker: BracketTracker,
-            match: BaseMatch,
-        };
-
-        const BaseMatch = struct {
-            start: usize,
-            end: usize,
-        };
-
-        const ReadyS = struct {
-            match: BaseMatch,
-            earlyStop: bool,
-        };
+    const State = struct {
+        tag: StateTag,
+        depth: usize,
+        start: usize,
+        end: usize,
+        earlyStop: bool,
 
         const Error = error{
             CharBlackholed,
             UnsupportedQuotesOnArrayType,
             UnsupportedCharacterOnArrayType,
             EarlyBracketTermination,
-            MissingFirstArrayLayer,
+            MissingArrayLayer,
             EmptyCommaSplit,
             EarlyArrayTermination,
             MissingCommaSeparator,
+            ResultBlackholed,
+            EarlyQuoteTermination,
+            MissingTypeToken,
         };
 
-        // TODO: rework state machine to be less bad to use
-        fn consume(elf: *const State, i: usize, c: u8) !State {
-            var self = elf.*;
-            return result: switch (c) {
+        const Noop: State = .{
+            .tag = .noop,
+            .depth = 0,
+            .start = 0,
+            .end = 0,
+            .earlyStop = false,
+        };
+
+        fn noop(self: *State) void {
+            self.* = Noop;
+        }
+
+        fn ready(self: *State, i: usize, earlyStop: bool) void {
+            self.end = i;
+            self.earlyStop = earlyStop;
+            self.tag = .ready;
+        }
+
+        fn inBrackets(self: *State, depth: usize) void {
+            self.* = .{
+                .tag = .inBrackets,
+                .depth = depth,
+                .start = 0,
+                .end = 0,
+                .earlyStop = false,
+            };
+        }
+
+        fn seekComma(self: *State, depth: usize) void {
+            self.* = .{
+                .tag = .seekComma,
+                .depth = depth,
+                .start = 0,
+                .end = 0,
+                .earlyStop = false,
+            };
+        }
+
+        fn seekCommaQuotes(self: *State) void {
+            self.* = .{
+                .tag = .seekCommaQuotes,
+                .depth = self.depth,
+                .start = 0,
+                .end = 0,
+                .earlyStop = false,
+            };
+        }
+
+        fn inBracketsMatching(self: *State, i: usize) void {
+            self.* = .{
+                .tag = .inBracketsMatching,
+                .depth = 2,
+                .start = i,
+                .end = i + 1,
+                .earlyStop = false,
+            };
+        }
+
+        fn inQuotes(self: *State, i: usize) void {
+            self.* = .{
+                .tag = .inQuotes,
+                .depth = self.depth,
+                .start = i + 1,
+                .end = i + 1,
+                .earlyStop = false,
+            };
+        }
+
+        fn needValue(self: *State) void {
+            self.* = .{
+                .tag = .needValue,
+                .depth = 1,
+                .start = 0,
+                .end = 0,
+                .earlyStop = false,
+            };
+        }
+
+        fn resetReady(self: *State) void {
+            if (self.earlyStop == true) {
+                self.seekComma(self.depth);
+            } else if (self.depth == 0) {
+                self.noop();
+            } else if (self.depth == 1) {
+                self.needValue();
+            } else {
+                self.inBrackets(self.depth);
+            }
+        }
+
+        fn consume(self: *State, i: usize, c: u8) State.Error!void {
+            const tag = self.tag;
+            switch (c) {
                 0 => {
-                    break :result switch (self) {
-                        .Noop, .InBracket, .SeekComma => State{ .Noop = undefined },
-                        .NeedValue, .InBracketMatching => return State.Error.EarlyArrayTermination,
-                        .Matching => |*match| rvalue: {
-                            match.end = i;
-                            break :rvalue State{ .Ready = .{
-                                .match = match.*,
-                                .earlyStop = false,
-                            } };
+                    switch (tag) {
+                        .noop, .seekComma, .seekCommaQuotes => {
+                            if (self.depth > 0) return State.Error.EarlyArrayTermination;
                         },
-                        .Ready => return State.Error.CharBlackholed,
-                    };
+                        .needValue, .inBrackets, .inBracketsMatching => return State.Error.EarlyArrayTermination,
+                        .inQuotes => return State.Error.EarlyQuoteTermination,
+                        .ready => return State.Error.ResultBlackholed,
+                    }
                 },
                 '[' => {
-                    break :result switch (self) {
-                        .Noop => State{ .InBracket = .{ .depth = 1 } },
-                        .NeedValue, .InBracket, .SeekComma => |*bracket| rvalue: {
-                            bracket.depth += 1;
-                            break :rvalue State{ .InBracketMatching = .{
-                                .tracker = bracket.*,
-                                .match = .{ .start = i, .end = i + 1 },
-                            } };
-                        },
-                        .InBracketMatching => |*bMatching| rvalue: {
-                            bMatching.tracker.depth += 1;
-                            break :rvalue .{ .InBracketMatching = bMatching.* };
-                        },
-                        .Matching => |*match| rvalue: {
-                            match.end = i;
-                            break :rvalue .{ .Matching = match.* };
-                        },
-                        .Ready => return State.Error.CharBlackholed,
-                    };
+                    switch (tag) {
+                        .noop => self.inBrackets(1),
+                        .needValue, .inBrackets, .seekComma => self.inBracketsMatching(i),
+                        .seekCommaQuotes => return State.Error.MissingCommaSeparator,
+                        .inBracketsMatching => self.depth += 1,
+                        .inQuotes => self.end = i,
+                        .ready => return State.Error.CharBlackholed,
+                    }
                 },
                 ']' => {
-                    break :result switch (self) {
-                        .Noop => return State.Error.MissingFirstArrayLayer,
-                        .InBracket, .SeekComma => State.Noop,
-                        .NeedValue => return State.Error.EarlyArrayTermination,
-                        .InBracketMatching => |*bMatching| rvalue: {
-                            bMatching.match.end = i;
-                            bMatching.tracker.depth -= 1;
-                            if (bMatching.tracker.depth == 0) break :rvalue .{ .Ready = .{
-                                .match = bMatching.match,
-                                .earlyStop = false,
-                            } };
-                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                    switch (tag) {
+                        .noop => return State.Error.MissingArrayLayer,
+                        .inBrackets, .seekComma => {
+                            self.depth -= 1;
+                            self.noop();
                         },
-                        .Matching => |*match| rvalue: {
-                            match.end = i;
-                            break :rvalue .{ .Matching = match.* };
+                        .seekCommaQuotes => {
+                            if (self.depth == 0) return State.Error.MissingArrayLayer;
+                            self.depth -= 1;
                         },
-                        .Ready => return State.Error.CharBlackholed,
-                    };
+                        .needValue => return State.Error.EarlyArrayTermination,
+                        .inBracketsMatching => {
+                            self.depth -= 1;
+                            if (self.depth == 0) self.ready(i, false) else self.end = i;
+                        },
+                        .inQuotes => self.end = i,
+                        .ready => return State.Error.CharBlackholed,
+                    }
                 },
-                '\'' => return State.Error.UnsupportedQuotesOnArrayType,
+                '\'' => {
+                    switch (tag) {
+                        .noop => return State.Error.MissingArrayLayer,
+                        .inBrackets => {
+                            if (self.depth == 1) self.inQuotes(i) else self.end = i;
+                        },
+                        .seekComma, .seekCommaQuotes => return State.Error.MissingCommaSeparator,
+                        .needValue => self.inQuotes(i),
+                        .inBracketsMatching => self.end = i,
+                        .inQuotes => self.ready(i, true),
+                        .ready => return State.Error.CharBlackholed,
+                    }
+                },
                 ' ', '\t' => {
-                    break :result switch (self) {
-                        .Noop => .{ .Noop = undefined },
-                        .SeekComma => |s| .{ .SeekComma = s },
-                        .NeedValue => |n| .{ .NeedValue = n },
-                        .InBracket => |*bracket| .{ .InBracket = bracket.* },
-                        .InBracketMatching => |*bMatching| rvalue: {
-                            bMatching.match.end = i;
-                            if (bMatching.tracker.depth == 1) break :rvalue .{ .Ready = .{ .match = bMatching.match, .earlyStop = true } };
-                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                    switch (tag) {
+                        .noop => self.noop(),
+                        .seekComma, .needValue, .inBrackets, .seekCommaQuotes => {},
+                        .inBracketsMatching => {
+                            if (self.depth == 1) self.ready(i, true) else self.end = i;
                         },
-                        .Matching => |*match| rvalue: {
-                            match.end = i;
-                            break :rvalue .{ .Ready = .{ .match = match.*, .earlyStop = true } };
-                        },
-                        .Ready => return State.Error.CharBlackholed,
-                    };
+                        .inQuotes => self.end = i,
+                        .ready => return State.Error.CharBlackholed,
+                    }
                 },
                 '\r', '\n' => return State.Error.UnsupportedCharacterOnArrayType,
                 ',' => {
-                    break :result switch (self) {
-                        .Noop => .{ .Noop = undefined },
-                        .SeekComma => |s| .{ .NeedValue = s },
-                        .NeedValue, .InBracket => return State.Error.EmptyCommaSplit,
-                        .InBracketMatching => |*bMatching| rvalue: {
-                            bMatching.match.end = i;
-                            if (bMatching.tracker.depth == 1) break :rvalue .{ .Ready = .{ .match = bMatching.match, .earlyStop = false } };
-                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                    switch (tag) {
+                        .noop => return State.Error.MissingTypeToken,
+                        .seekComma => self.tag = .needValue,
+                        .seekCommaQuotes => self.inBrackets(self.depth),
+                        .needValue, .inBrackets => return State.Error.EmptyCommaSplit,
+                        .inBracketsMatching => {
+                            if (self.depth == 1) self.ready(i, false) else self.end = i;
                         },
-                        .Matching => |*match| rvalue: {
-                            match.end = i;
-                            break :rvalue .{ .Ready = .{ .match = match.*, .earlyStop = false } };
-                        },
-                        .Ready => return State.Error.CharBlackholed,
-                    };
+                        .inQuotes => self.end = i,
+                        .ready => return State.Error.CharBlackholed,
+                    }
                 },
                 else => {
-                    break :result switch (self) {
-                        .Noop => return State.Error.MissingFirstArrayLayer,
-                        .NeedValue, .InBracket => |bracket| .{ .InBracketMatching = .{
-                            .tracker = bracket,
-                            .match = .{ .start = i, .end = i },
-                        } },
-                        .InBracketMatching => |*bMatching| rvalue: {
-                            bMatching.match.end = i;
-                            break :rvalue .{ .InBracketMatching = bMatching.* };
+                    switch (tag) {
+                        .noop => return State.Error.MissingArrayLayer,
+                        .needValue, .inBrackets => {
+                            self.tag = .inBracketsMatching;
+                            self.start = i;
+                            self.end = i;
                         },
-                        .Matching => |*match| rvalue: {
-                            match.end = i;
-                            break :rvalue .{ .Matching = match.* };
-                        },
-                        .SeekComma => return State.Error.MissingCommaSeparator,
-                        .Ready => return State.Error.CharBlackholed,
-                    };
+                        .inBracketsMatching => self.end = i,
+                        .inQuotes => self.end = i,
+                        .seekComma, .seekCommaQuotes => return State.Error.MissingCommaSeparator,
+                        .ready => return State.Error.CharBlackholed,
+                    }
                 },
-            };
+            }
         }
     };
 
-    pub fn init(isString: bool, slice: [:0]const u8) @This() {
+    pub fn init(slice: [:0]const u8) @This() {
         return .{
             .i = 0,
-            .brackets = 0,
-            .isString = isString,
             .slice = slice,
-            .earlyExit = false,
-            .first = true,
             .state = State.Noop,
         };
     }
@@ -295,144 +346,33 @@ pub const AtDepthArrayTokenIterator = struct {
         const slice = self.slice;
         while (i <= slice.len) : (i += 1) {
             const c = if (i < slice.len) slice[i] else 0;
-            self.state = switch (try self.state.consume(i, c)) {
-                .Ready => |rMatch| {
-                    i += 1;
-                    self.state = if (!rMatch.earlyStop) .{ .InBracket = .{ .depth = 1 } } else .{ .SeekComma = .{ .depth = 1 } };
-                    const match = rMatch.match;
-                    const s = slice[match.start..match.end];
-                    std.debug.print("{s}\n", .{s});
-                    return s;
-                },
-                else => |state| state,
-            };
-        }
-        return null;
-    }
+            try self.state.consume(i, c);
+            var state = &self.state;
+            if (state.tag == .ready) {
+                i += 1;
 
-    pub fn next2(self: *@This()) Error!?[]const u8 {
-        var i = self.i;
-        var brackets = self.brackets;
-        defer {
-            self.i = i;
-            self.brackets = brackets;
-        }
+                const s = slice[state.start..state.end];
+                state.resetReady();
 
-        const slice = self.slice;
-
-        var wordMatching: bool = false;
-        var start: usize = 0;
-        var end: usize = 0;
-        var inQuotes: bool = false;
-
-        // We do one over to create a token at the end
-        while (i <= slice.len) : (i += 1) {
-            const c = if (i < slice.len) slice[i] else endIt: {
-                end = slice.len;
-                if (wordMatching) break :endIt 0 else break;
-            };
-            rfd: switch (c) {
-                0 => {
-                    i += 1;
-                    self.first = false;
-                    const s = slice[start..end];
-                    return s;
-                },
-                '[' => {
-                    if (self.isString) end = i else {
-                        brackets += 1;
-                        if (brackets == 2 and !wordMatching and start == 0) {
-                            wordMatching = true;
-                            start = i;
-                            end = i;
-                        }
-                    }
-                },
-                ']' => {
-                    if (self.isString) end = i else {
-                        brackets -= 1;
-                        if (brackets == 0 and wordMatching) {
-                            // Dont add at level bracket
-                            end = i;
-                            continue :rfd 0;
-                        } else if (brackets == 0 and !self.earlyExit and !self.first) {
-                            return Error.EarlyArrayTermination;
-                        }
-                    }
-                },
-                ' ', '\t', '\r', '\n' => {
-                    if (inQuotes and !wordMatching) {
-                        // Starting in-quotes match
-                        start = i;
-                        end = i;
-                        wordMatching = true;
-                    } else if (!wordMatching or brackets > 1) {
-                        // Not in quotes, not matching, no need to collect
-                        // or start a match
-                        continue;
-                    } else if (wordMatching and inQuotes) {
-                        // still matching and consuming empty chars due to quotes
-                        end = i;
-                    } else {
-                        // not inside quotes, so quotes mean stop
-                        self.earlyExit = true;
-                        end = i;
-                        continue :rfd 0;
-                    }
-                },
-                '\'' => {
-                    if (!self.isString) return Error.UnsupportedQuotesOnArrayType;
-                    inQuotes = !inQuotes;
-                    if (!inQuotes and wordMatching) {
-                        // end is always 1 char behind for refeeds
-                        self.earlyExit = true;
-                        end = i;
-                        continue :rfd 0;
-                    }
-                },
-                ',' => {
-                    if (wordMatching and brackets <= 1) {
-                        // end is always 1 char behind for refeeds
-                        end = i;
-                        continue :rfd 0;
-                    } else if (!wordMatching and start == end) {
-                        if (self.earlyExit) {
-                            self.earlyExit = false;
-                        } else {
-                            return Error.EmptyCommaSplit;
-                        }
-                    }
-                },
-                else => {
-                    end = i;
-                    if (!wordMatching) {
-                        if (!self.isString and brackets == 0) return Error.MissingFirstArrayLayer;
-                        start = i;
-                        wordMatching = true;
-                    }
-                },
+                return s;
             }
         }
         return null;
     }
 };
 
-fn tstCollectTokens(allocator: *const Allocator, isString: bool, slice: [:0]const u8) ![]const [:0]const u8 {
+fn tstCollectTokens(allocator: *const Allocator, slice: [:0]const u8) ![]const [:0]const u8 {
     var result = std.ArrayList([:0]const u8).init(allocator.*);
-    var tokenizer = AtDepthArrayTokenIterator.init(isString, slice);
-    // var tokenizer2 = AtDepthArrayTokenIterator.init(isString, slice);
-    while (true) {
-        // const item2 = try tokenizer2.next();
-        const item = try tokenizer.next();
-        // try std.testing.expectEqualDeep(item, item);
-        if (item == null) break;
-        try result.append(try allocator.dupeZ(u8, item.?));
+    var tokenizer = AtDepthArrayTokenIterator.init(slice);
+
+    while (try tokenizer.next()) |item| {
+        try result.append(try allocator.dupeZ(u8, item));
     }
 
     return result.toOwnedSlice();
 }
 
-test "Array tokenizer (non-string)" {
+test "Depth 1 Array tokenizer (non-string)" {
     const t = std.testing;
     const E = AtDepthArrayTokenIterator.Error;
     const base = &std.testing.allocator;
@@ -440,18 +380,389 @@ test "Array tokenizer (non-string)" {
     defer arena.deinit();
     const allocator = &arena.allocator();
 
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, " ]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "] "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, " ] "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "\t]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "]\t"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "\t]\t"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, " \t] \t "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "1"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, " 1 "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "\t1\t"));
+
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "1,2"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "1, 2"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, " 1 , 2 "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "\t1,\t2\t"));
+
+    try t.expectError(E.MissingTypeToken, tstCollectTokens(allocator, ","));
+    try t.expectError(E.MissingTypeToken, tstCollectTokens(allocator, " ,"));
+    try t.expectError(E.MissingTypeToken, tstCollectTokens(allocator, ", "));
+    try t.expectError(E.MissingTypeToken, tstCollectTokens(allocator, " , "));
+    try t.expectError(E.MissingTypeToken, tstCollectTokens(allocator, "\t,\t"));
+    try t.expectError(E.MissingTypeToken, tstCollectTokens(allocator, " \t,"));
+    try t.expectError(E.MissingTypeToken, tstCollectTokens(allocator, ",\t "));
+    try t.expectError(E.MissingTypeToken, tstCollectTokens(allocator, " \t, \t "));
+
     const expectEmpty: []const [:0]const u8 = &.{};
-    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, false, ""));
-    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, false, "["));
-    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, false, "[]"));
-    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, false, "[ ]"));
-    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, false, "[  ,]"));
-    try t.expectError(E.UnsupportedQuotesOnArrayType, tstCollectTokens(allocator, false, "'"));
-    try t.expectError(E.UnsupportedQuotesOnArrayType, tstCollectTokens(allocator, false, "[1,']"));
-    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, false, "[1,,]"));
-    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, false, "[1 ,]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, ""));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, " "));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "  "));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "\t"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "\t "));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, " \t"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "\t\t"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, " \t "));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[ ]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[  ]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[\t]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[ \t]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[\t ]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[\t\t]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[ \t\t ]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, " []"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[] "));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, " [ ] "));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "\t[ ]\t"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, " \t[ \t ] \t"));
+
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "["));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, " ["));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[ "));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "\t["));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[\t"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "\t[ \t"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, " \t[ \t "));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1,"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1, ]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1,  ]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1,\t]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1,\t\t]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1, \t]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1\t,]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1 \t,]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1\t,\t]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, " [1,"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1, "));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, " [1, ] "));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "\t[1,"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1,\t"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "\t[1,\t]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, " \t[1, ]\t "));
+
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[ ,]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[  ,]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[\t,]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[,\t]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[ \t,\t ]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[ ,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[  ,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[\t,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[\t ,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[ ,\t1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[ \t,\t1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,,]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1, ,]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,\t,]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1, ,\t]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,\t,\t]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1, ,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,\t,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1, ,\t1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,\t,\t1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,\t, 1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, " [1,,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,,1] "));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, " [1,,1] "));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "\t[1,,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,,1]\t"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "\t[1,,1]\t"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, " \t[1,,1]\t "));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[ ,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, " [ ,1] "));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "\t[ ,1]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[ ,1]\t"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, " \t[ ,1]\t "));
+
+    const expectOne: []const [:0]const u8 = &.{"1"};
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[1]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[ 1]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[1 ]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[ 1 ]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[\t1]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[1\t]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[\t1\t]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[ \t1\t ]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, " [1]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[1] "));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, " [1] "));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "\t[1]"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "[1]\t"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, "\t[1]\t"));
+    try t.expectEqualDeep(expectOne, try tstCollectTokens(allocator, " \t[1]\t "));
+
     const expectTwo: []const [:0]const u8 = &.{ "1", "1" };
-    try t.expectEqualDeep(expectTwo, tstCollectTokens(allocator, false, "[1,1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1,1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1, 1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1 ,1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1 , 1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[ 1,1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1,1 ]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[ 1,1 ]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[ 1 ,1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1 , 1 ]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[ 1 , 1 ]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[\t1,1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1,\t1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1,1\t]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[\t1,\t1\t]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[ \t1\t , \t1\t ]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, " [1,1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1,1] "));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, " [1,1] "));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "\t[1,1]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[1,1]\t"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "\t[1,1]\t"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, " \t[1,1]\t "));
+}
+
+test "Depth 2+ Array tokenizer (non-string)" {
+    const t = std.testing;
+    const E = AtDepthArrayTokenIterator.Error;
+    const base = &std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    const expectOneEmpty: []const []const u8 = &.{"[]"};
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, "[[]]"));
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, " [[]]"));
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, "[[]] "));
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, " [[]] "));
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, "\t[[]]\t"));
+
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, "[ [] ]"));
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, " [ [] ]"));
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, "[ [] ] "));
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, " [ [] ] "));
+    try t.expectEqualDeep(expectOneEmpty, try tstCollectTokens(allocator, "\t[ [] ]\t"));
+
+    const expectOneSpace: []const []const u8 = &.{"[ ]"};
+    try t.expectEqualDeep(expectOneSpace, try tstCollectTokens(allocator, "[ [ ] ]"));
+    try t.expectEqualDeep(expectOneSpace, try tstCollectTokens(allocator, " [ [ ] ]"));
+    try t.expectEqualDeep(expectOneSpace, try tstCollectTokens(allocator, "[ [ ] ] "));
+    try t.expectEqualDeep(expectOneSpace, try tstCollectTokens(allocator, " [ [ ] ] "));
+    try t.expectEqualDeep(expectOneSpace, try tstCollectTokens(allocator, "\t[ [ ] ]\t"));
+
+    const expectOneRaw1: []const []const u8 = &.{"[1,]"};
+    const expectOneRaw1Space: []const []const u8 = &.{"[1, ]"};
+    const expectMultipleRaw: []const []const u8 = &.{ "[]", "[1]", "[2,3]" };
+
+    try t.expectEqualDeep(expectOneRaw1, try tstCollectTokens(allocator, "[[1,]]"));
+    try t.expectEqualDeep(expectOneRaw1, try tstCollectTokens(allocator, " [[1,]] "));
+    try t.expectEqualDeep(expectOneRaw1, try tstCollectTokens(allocator, "\t[[1,]]\t"));
+    try t.expectEqualDeep(expectOneRaw1Space, try tstCollectTokens(allocator, "[[1, ]]"));
+    try t.expectEqualDeep(expectOneRaw1Space, try tstCollectTokens(allocator, " [[1, ]] "));
+    try t.expectEqualDeep(expectOneRaw1Space, try tstCollectTokens(allocator, "\t[[1, ]]\t"));
+    try t.expectEqualDeep(expectMultipleRaw, try tstCollectTokens(allocator, "[[],[1],[2,3]]"));
+    try t.expectEqualDeep(expectMultipleRaw, try tstCollectTokens(allocator, " [[],[1],[2,3]] "));
+    try t.expectEqualDeep(expectMultipleRaw, try tstCollectTokens(allocator, "\t[[],[1],[2,3]]\t"));
+    try t.expectEqualDeep(expectMultipleRaw, try tstCollectTokens(allocator, "[ [], [1], [2,3] ]"));
+    try t.expectEqualDeep(expectMultipleRaw, try tstCollectTokens(allocator, " [ [], [1], [2,3] ] "));
+    try t.expectEqualDeep(expectMultipleRaw, try tstCollectTokens(allocator, "\t[ [], [1], [2,3] ]\t"));
+
+    const expectOneRawNested: []const []const u8 = &.{"[[]]"};
+    try t.expectEqualDeep(expectOneRawNested, try tstCollectTokens(allocator, "[[[]]]"));
+    try t.expectEqualDeep(expectOneRawNested, try tstCollectTokens(allocator, " [[[]]] "));
+    try t.expectEqualDeep(expectOneRawNested, try tstCollectTokens(allocator, "\t[[[]]]\t"));
+
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[["));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[[]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[[[]]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[[1,]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[[], [1], [2,3]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[[1, 2], ]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[[1, 2], [3],]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, " [ [ ]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[[1], [2,]"));
+
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[], , [1]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[1, 2], , [3]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[], , [1]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[],  , [1]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[], \t, [1]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[], ,\t[1]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[], , [1]] "));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, " [[], , [1]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[1, 2], , [3]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[1, 2],  , [3]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[1, 2], \t, [3]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[1, 2], ,\t[3]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[[1, 2], , [3]] "));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, " [[1, 2], , [3]]"));
+
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[[]] ]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[[]]]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[[]] ]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[[]]] "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, " [ []]]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[ [ ] ] ]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[ [ ] ] ] "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "\t[[]]]\t"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[1]]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[1] ]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[1]] "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, " [1]]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[ 1 ] ]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[ 1 ] ] "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "\t[1]]\t"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[1, 2]]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[1, 2] ]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[1, 2]] "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, " [1, 2]]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[ 1, 2 ] ]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[ 1, 2 ] ] "));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "\t[1, 2]]\t"));
+
+    const expectMixedDepth: []const []const u8 = &.{ "1", "[3, 4]", "2", "[[4], 4]" };
+    try t.expectEqualDeep(expectMixedDepth, try tstCollectTokens(allocator, "[1, [3, 4], 2, [[4], 4]]"));
+
+    const expectMixedDepthSpaces: []const []const u8 = &.{ "1", "[ 3 , 4 ]", "2", "[[4], 4]" };
+    try t.expectEqualDeep(expectMixedDepthSpaces, try tstCollectTokens(allocator, "[ 1 , [ 3 , 4 ] , 2 , [[4], 4] ]"));
+
+    const expectMixedDepthTabs: []const []const u8 = &.{ "1", "[3,\t4]", "2", "[[4],\t4]" };
+    try t.expectEqualDeep(expectMixedDepthTabs, try tstCollectTokens(allocator, "[1,\t[3,\t4],2,[[4],\t4]]"));
+
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1, [3, 4], 2, [[4], 4]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1, [3, 4], 2, [[4], 4"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[1, [3, 4], 2, [[4], 4],"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1, [3, 4], , 2, [[4], 4]]"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[1,, [3, 4], 2, [[4], 4]]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "1, [3, 4], 2, [[4], 4]"));
+    try t.expectError(E.MissingArrayLayer, tstCollectTokens(allocator, "[1, [3, 4], 2, [[4], 4]]]"));
+}
+
+test "Depth 1 Array tokenizer (strings)" {
+    const t = std.testing;
+    const E = AtDepthArrayTokenIterator.Error;
+    const base = &std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    const expectEmptyString: []const []const u8 = &.{""};
+    try t.expectEqualDeep(expectEmptyString, try tstCollectTokens(allocator, "[ '' ]"));
+    const expectSpaceString: []const []const u8 = &.{" "};
+    try t.expectEqualDeep(expectSpaceString, try tstCollectTokens(allocator, "[ ' ' ]"));
+    const expectWhitespaceString: []const []const u8 = &.{"  "};
+    try t.expectEqualDeep(expectWhitespaceString, try tstCollectTokens(allocator, "[ '  ' ]"));
+    const expectTabString: []const []const u8 = &.{"\t"};
+    try t.expectEqualDeep(expectTabString, try tstCollectTokens(allocator, "[ '\t' ]"));
+    const expectTabSpaceString: []const []const u8 = &.{"\t "};
+    try t.expectEqualDeep(expectTabSpaceString, try tstCollectTokens(allocator, "[ '\t ' ]"));
+    const expectMixedWhitespaceString: []const []const u8 = &.{" \t\t "};
+    try t.expectEqualDeep(expectMixedWhitespaceString, try tstCollectTokens(allocator, "[ ' \t\t ' ]"));
+
+    const expectTwo: []const []const u8 = &.{ "a", "b" };
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "['a','b']"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[ 'a', 'b' ]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[ 'a' , 'b' ]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[ 'a'\t,\t'b' ]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[\t'a'\t,\t'b'\t]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[\t'a' , 'b'\t]"));
+    try t.expectEqualDeep(expectTwo, try tstCollectTokens(allocator, "[\t'a'\t, 'b' ]"));
+
+    const expectEmpty: []const []const u8 = &.{ "", "" };
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "['','']"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[ '', '' ]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[ '' , '' ]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[ ''\t,\t'' ]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[\t''\t,\t''\t]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[\t'' , ''\t]"));
+    try t.expectEqualDeep(expectEmpty, try tstCollectTokens(allocator, "[\t''\t, '' ]"));
+
+    const expectArrayStrings: []const []const u8 = &.{ "[1,2]", "[3,4]" };
+    try t.expectEqualDeep(expectArrayStrings, try tstCollectTokens(allocator, "['[1,2]', '[3,4]']"));
+    try t.expectEqualDeep(expectArrayStrings, try tstCollectTokens(allocator, "[ '[1,2]' , '[3,4]' ]"));
+    try t.expectEqualDeep(expectArrayStrings, try tstCollectTokens(allocator, "[\t'[1,2]',\t'[3,4]'\t]"));
+    try t.expectEqualDeep(expectArrayStrings, try tstCollectTokens(allocator, "[ '[1,2]', '[3,4]' ]"));
+
+    const expectArrayInsideString: []const []const u8 = &.{"[1,2]"};
+    try t.expectEqualDeep(expectArrayInsideString, try tstCollectTokens(allocator, "['[1,2]']"));
+
+    const expectNestedArrayInString: []const []const u8 = &.{"[[1,2]]"};
+    try t.expectEqualDeep(expectNestedArrayInString, try tstCollectTokens(allocator, "['[[1,2]]']"));
+
+    const expectArrayAndCommaInString: []const []const u8 = &.{"[1, 2], [3,4]"};
+    try t.expectEqualDeep(expectArrayAndCommaInString, try tstCollectTokens(allocator, "['[1, 2], [3,4]']"));
+
+    const expectMixed: []const []const u8 = &.{ "a", "[1,2]", "b" };
+    try t.expectEqualDeep(expectMixed, try tstCollectTokens(allocator, "['a', '[1,2]', 'b']"));
+
+    const expectMoreMixed: []const []const u8 = &.{ "[a]", "[b,c]", "x", "y" };
+    try t.expectEqualDeep(expectMoreMixed, try tstCollectTokens(allocator, "['[a]', '[b,c]', 'x', 'y']"));
+
+    const expectSpaced: []const []const u8 = &.{ "[ 1 , 2 ]", "[ 3 , 4 ]" };
+    try t.expectEqualDeep(expectSpaced, try tstCollectTokens(allocator, "[ '[ 1 , 2 ]' , '[ 3 , 4 ]' ]"));
+    try t.expectEqualDeep(expectSpaced, try tstCollectTokens(allocator, "[\t'[ 1 , 2 ]',\t'[ 3 , 4 ]'\t]"));
+
+    const expectUnbalancedBracketsInString: []const []const u8 = &.{"[[[["};
+    try t.expectEqualDeep(expectUnbalancedBracketsInString, try tstCollectTokens(allocator, "['[[[[']"));
+
+    const expectMixedBracketInString2: []const []const u8 = &.{ "[w,]", "[", "]" };
+    try t.expectEqualDeep(expectMixedBracketInString2, try tstCollectTokens(allocator, "['[w,]', '[', ']']"));
+
+    try t.expectError(E.EarlyQuoteTermination, tstCollectTokens(allocator, "['a]"));
+    try t.expectError(E.EarlyQuoteTermination, tstCollectTokens(allocator, "[ 'a ]"));
+    try t.expectError(E.EarlyQuoteTermination, tstCollectTokens(allocator, "['a', 'b]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "['a', 'b'"));
+
+    try t.expectError(E.MissingCommaSeparator, tstCollectTokens(allocator, "[''w]"));
+    try t.expectError(E.MissingCommaSeparator, tstCollectTokens(allocator, "[ 'a'b ]"));
+    try t.expectError(E.MissingCommaSeparator, tstCollectTokens(allocator, "[ 'abc'1 ]"));
+    try t.expectError(E.MissingCommaSeparator, tstCollectTokens(allocator, "['it'broken']"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "[, 'a']"));
+    try t.expectError(E.EmptyCommaSplit, tstCollectTokens(allocator, "['a', , 'b']"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "['a', ]"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "[ 'a',    ]"));
+
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "['a',"));
+    try t.expectError(E.EarlyArrayTermination, tstCollectTokens(allocator, "['a'"));
+}
+
+test "Depth 2+ Array tokenizer (strings)" {
+    const t = std.testing;
+    const E = AtDepthArrayTokenIterator.Error;
+    _ = E;
+    const base = &std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    const expectInnerQuoted: []const []const u8 = &.{ "[1, 'a']", "[2, 'b']" };
+    try t.expectEqualDeep(expectInnerQuoted, try tstCollectTokens(allocator, "[[1, 'a'], [2, 'b']]"));
+
+    const expectQuotedOnlyInner: []const []const u8 = &.{ "['a','b']", "['c','d']" };
+    try t.expectEqualDeep(expectQuotedOnlyInner, try tstCollectTokens(allocator, "[['a','b'], ['c','d']]"));
+
+    const expectNestedMix: []const []const u8 = &.{ "[1, 'a', [2, 'b']]", "x" };
+    try t.expectEqualDeep(expectNestedMix, try tstCollectTokens(allocator, "[[1, 'a', [2, 'b']], 'x']"));
+
+    const expectDeepStringInside: []const []const u8 = &.{ "[[ 'abc', [1,2] ]]", "tail" };
+    try t.expectEqualDeep(expectDeepStringInside, try tstCollectTokens(allocator, "[[[ 'abc', [1,2] ]], 'tail']"));
+
+    const expectSpacedQuoted: []const []const u8 = &.{ "[ 1 , 'a' ]", "[ 'b' , 2 ]" };
+    try t.expectEqualDeep(expectSpacedQuoted, try tstCollectTokens(allocator, "[ [ 1 , 'a' ] , [ 'b' , 2 ] ]"));
+
+    const expectMixedWhitespace: []const []const u8 = &.{ "[1,\t'a']", "[\t'b',2]" };
+    try t.expectEqualDeep(expectMixedWhitespace, try tstCollectTokens(allocator, "[ [1,\t'a'] , [\t'b',2] ]"));
+
+    const expectMixedBracketsAndQuotes2: []const []const u8 = &.{ "['1, 2]", "[2,3']" };
+    try t.expectEqualDeep(expectMixedBracketsAndQuotes2, try tstCollectTokens(allocator, "[['1, 2], [2,3']]"));
 }
 
 test "arg cursor peek with stackItem" {
@@ -583,8 +894,7 @@ pub fn Codec(Spec: type) type {
             const queueCursor = try coll.QueueCursor([:0]const u8).init(scrapAllocator, &queue);
             defer queueCursor.destroy(scrapAllocator);
 
-            const LeafT = meta.LeafTypeOfTag(Spec, @tagName(tag));
-            var arrTokenizer = AtDepthArrayTokenIterator.init(LeafT == u8, slice);
+            var arrTokenizer = AtDepthArrayTokenIterator.init(slice);
 
             while (try arrTokenizer.next()) |token| {
                 try queueCursor.queueItem(scrapAllocator, try scrapAllocator.dupeZ(u8, token));
@@ -870,7 +1180,6 @@ pub fn SpecResponse(comptime Spec: type) type {
                     // TODO: handle required and optional
                     const r = try @call(.auto, @field(SpecCodec, @tagName(codecFTag)), .{ &self.codec, spectag, &allocator, cursor });
 
-                    // TODO: append if array?
                     @field(self.options, f.name) = r;
                     return;
                 }
@@ -966,14 +1275,14 @@ test "parse different types" {
         u1: ?u1 = null,
         f1: ?f16 = null,
         b: ?bool = null,
-        // s1: ?[]const u8 = null,
-        // s2: ?[:0]const u8 = null,
+        s1: ?[]const u8 = null,
+        s2: ?[:0]const u8 = null,
         au1: ?[]const u1 = null,
         au32: ?[]const u32 = null,
         ai32: ?[]const i32 = null,
         af32: ?[]const f32 = null,
-        // // // TODO: missing enum, []enum, []bool
-        // as1: ?[]const []const u8 = null,
+        // TODO: missing enum, []enum, []bool
+        as1: ?[]const []const u8 = null,
         as2: ?[]const [:0]const u8 = null,
         aau32: ?[]const []const u32 = null,
         aaf32: ?[]const []const f32 = null,
@@ -985,14 +1294,14 @@ test "parse different types" {
         \\--u1=0
         \\--f1 1.1
         \\--b false
-        // \\--s1 Hello
-        // \\--s2 "Hello World"
+        \\--s1 Hello
+        \\--s2 "Hello World"
         \\--au1 [1,0,1,0]
         \\--au32=[32,23,133,99,10]
         \\--ai32 "[-1, -44, 22222   ,   -1]"
         \\--af32="[    3.4   , 58,   3.1  ]"
-        // \\--as1 "'Hello', ' World ', '!'"
-        // \\--as2="  'Im'  ,  'Losing it'  "
+        \\--as1 "['Hello', ' World ', '!']"
+        \\--as2="[  'Im'  ,  'Losing it'  ]"
         \\--aau32 "[[1,3], [3300, 222, 333, 33], [1]]"
         \\--aaf32 "[  [  1.1,  3.2,-1] ,   [3.1  ,2,5], [ 1.2 ], [7.1]   ]"
         \\--aai32 "[  [  -1] ,   [2, -2] ]"
@@ -1004,15 +1313,15 @@ test "parse different types" {
     try std.testing.expectEqual(0, r1.options.u1.?);
     try std.testing.expectEqual(1.1, r1.options.f1.?);
     try std.testing.expect(!r1.options.b.?);
-    // try std.testing.expectEqualStrings("Hello", r1.options.s1.?);
-    // try std.testing.expectEqualStrings("Hello World", r1.options.s2.?);
+    try std.testing.expectEqualStrings("Hello", r1.options.s1.?);
+    try std.testing.expectEqualStrings("Hello World", r1.options.s2.?);
     try std.testing.expectEqualDeep(&[_]u1{ 1, 0, 1, 0 }, r1.options.au1.?);
     try std.testing.expectEqualDeep(&[_]u32{ 32, 23, 133, 99, 10 }, r1.options.au32.?);
     try std.testing.expectEqualDeep(&[_]i32{ -1, -44, 22222, -1 }, r1.options.ai32.?);
-    // const expectedAs1: []const []const u8 = &.{ "Hello", " World ", "!" };
-    // try std.testing.expectEqualDeep(expectedAs1, r1.options.as1.?);
-    // const expectedAs2: []const [:0]const u8 = &.{ "Im", "Losing it" };
-    // try std.testing.expectEqualDeep(expectedAs2, r1.options.as2.?);
+    const expectedAs1: []const []const u8 = &.{ "Hello", " World ", "!" };
+    try std.testing.expectEqualDeep(expectedAs1, r1.options.as1.?);
+    const expectedAs2: []const [:0]const u8 = &.{ "Im", "Losing it" };
+    try std.testing.expectEqualDeep(expectedAs2, r1.options.as2.?);
     const expectedAau32: []const [:0]const u32 = &.{ &.{ 1, 3 }, &.{ 3300, 222, 333, 33 }, &.{1} };
     try std.testing.expectEqualDeep(expectedAau32, r1.options.aau32.?);
     const expectedAaf32: []const [:0]const f32 = &.{ &.{ 1.1, 3.2, -1 }, &.{ 3.1, 2, 5 }, &.{1.2}, &.{7.1} };
