@@ -136,27 +136,15 @@ pub fn LeafArrayTypeOfTag(T: type, comptime tag: []const u8) type {
 
 // This is annoyingly strict on purpose
 pub const AtDepthArgs = enum(usize) {
-    @"0" = 0,
-    @"1" = 1,
-    @"2" = 2,
-    @"3" = 3,
     concrete = 20,
     lastPtr,
 };
-
-pub fn TypeAtDepthN(T: type, comptime tag: []const u8, comptime n: usize) type {
-    return comptime switch (n) {
-        0...3 => TypeAtDepth(T, tag, @enumFromInt(n)),
-        else => @compileError(std.fmt.comptimePrint("Depth of {d} is unsupported", .{n})),
-    };
-}
 
 pub fn TypeAtDepth(T: type, comptime tag: []const u8, comptime depth: AtDepthArgs) type {
     // + 1 at the end because depth is usize :)
     comptime var maxDepth: usize = switch (depth) {
         .concrete => 3,
         .lastPtr => 2,
-        else => |en| @intFromEnum(en),
     };
 
     return T: {
@@ -167,16 +155,14 @@ pub fn TypeAtDepth(T: type, comptime tag: []const u8, comptime depth: AtDepthArg
                 .pointer => |ptr| {
                     if (@typeInfo(ptr.child) != .pointer and depth == .lastPtr) break :T Tt else Tt = ptr.child;
                 },
+                .optional => |ptr| {
+                    Tt = ptr.child;
+                },
                 else => break :T Tt,
             }
-        } else {
-            switch (@intFromEnum(depth)) {
-                0...3 => break :T Tt,
-                else => @compileError(std.fmt.comptimePrint(
-                    "Pointer chain for {s} is longer than max depth supported by {s}",
-                    .{ tag, @tagName(depth) },
-                )),
-            }
-        };
+        } else @compileError(std.fmt.comptimePrint(
+            "Pointer chain for {s} is longer than max depth supported by {s}",
+            .{ tag, @tagName(depth) },
+        ));
     };
 }

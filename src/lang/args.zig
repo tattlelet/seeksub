@@ -101,6 +101,15 @@ test "arg cursor peek" {
     try std.testing.expectEqual(null, cursor.peek());
 }
 
+test "arg cursor peek with stackItem" {
+    const allocator = std.testing.allocator;
+    const cursor = try tstArgCursor(&allocator, "");
+    defer cursor.destroy(&allocator);
+
+    cursor.stackItem("Hello");
+    try std.testing.expectEqualStrings("Hello", cursor.peek().?);
+}
+
 pub const AtDepthArrayTokenIterator = struct {
     i: usize,
     slice: [:0]const u8,
@@ -114,7 +123,6 @@ pub const AtDepthArrayTokenIterator = struct {
         inBrackets,
         inBracketsMatching,
         seekComma,
-        seekCommaQuotes,
         needValue,
         ready,
     };
@@ -178,16 +186,6 @@ pub const AtDepthArrayTokenIterator = struct {
             };
         }
 
-        fn seekCommaQuotes(self: *State) void {
-            self.* = .{
-                .tag = .seekCommaQuotes,
-                .depth = self.depth,
-                .start = 0,
-                .end = 0,
-                .earlyStop = false,
-            };
-        }
-
         fn inBracketsMatching(self: *State, i: usize) void {
             self.* = .{
                 .tag = .inBracketsMatching,
@@ -235,7 +233,7 @@ pub const AtDepthArrayTokenIterator = struct {
             switch (c) {
                 0 => {
                     switch (tag) {
-                        .noop, .seekComma, .seekCommaQuotes => {
+                        .noop, .seekComma => {
                             if (self.depth > 0) return State.Error.EarlyArrayTermination;
                         },
                         .needValue, .inBrackets, .inBracketsMatching => return State.Error.EarlyArrayTermination,
@@ -247,7 +245,6 @@ pub const AtDepthArrayTokenIterator = struct {
                     switch (tag) {
                         .noop => self.inBrackets(1),
                         .needValue, .inBrackets, .seekComma => self.inBracketsMatching(i),
-                        .seekCommaQuotes => return State.Error.MissingCommaSeparator,
                         .inBracketsMatching => self.depth += 1,
                         .inQuotes => self.end = i,
                         .ready => return State.Error.CharBlackholed,
@@ -259,10 +256,6 @@ pub const AtDepthArrayTokenIterator = struct {
                         .inBrackets, .seekComma => {
                             self.depth -= 1;
                             self.noop();
-                        },
-                        .seekCommaQuotes => {
-                            if (self.depth == 0) return State.Error.MissingArrayLayer;
-                            self.depth -= 1;
                         },
                         .needValue => return State.Error.EarlyArrayTermination,
                         .inBracketsMatching => {
@@ -279,7 +272,7 @@ pub const AtDepthArrayTokenIterator = struct {
                         .inBrackets => {
                             if (self.depth == 1) self.inQuotes(i) else self.end = i;
                         },
-                        .seekComma, .seekCommaQuotes => return State.Error.MissingCommaSeparator,
+                        .seekComma => return State.Error.MissingCommaSeparator,
                         .needValue => self.inQuotes(i),
                         .inBracketsMatching => self.end = i,
                         .inQuotes => self.ready(i, true),
@@ -289,7 +282,7 @@ pub const AtDepthArrayTokenIterator = struct {
                 ' ', '\t' => {
                     switch (tag) {
                         .noop => self.noop(),
-                        .seekComma, .needValue, .inBrackets, .seekCommaQuotes => {},
+                        .seekComma, .needValue, .inBrackets => {},
                         .inBracketsMatching => {
                             if (self.depth == 1) self.ready(i, true) else self.end = i;
                         },
@@ -302,7 +295,6 @@ pub const AtDepthArrayTokenIterator = struct {
                     switch (tag) {
                         .noop => return State.Error.MissingTypeToken,
                         .seekComma => self.tag = .needValue,
-                        .seekCommaQuotes => self.inBrackets(self.depth),
                         .needValue, .inBrackets => return State.Error.EmptyCommaSplit,
                         .inBracketsMatching => {
                             if (self.depth == 1) self.ready(i, false) else self.end = i;
@@ -321,7 +313,7 @@ pub const AtDepthArrayTokenIterator = struct {
                         },
                         .inBracketsMatching => self.end = i,
                         .inQuotes => self.end = i,
-                        .seekComma, .seekCommaQuotes => return State.Error.MissingCommaSeparator,
+                        .seekComma => return State.Error.MissingCommaSeparator,
                         .ready => return State.Error.CharBlackholed,
                     }
                 },
@@ -765,26 +757,203 @@ test "Depth 2+ Array tokenizer (strings)" {
     try t.expectEqualDeep(expectMixedBracketsAndQuotes2, try tstCollectTokens(allocator, "[['1, 2], [2,3']]"));
 }
 
-test "arg cursor peek with stackItem" {
-    const allocator = std.testing.allocator;
-    const cursor = try tstArgCursor(&allocator, "");
-    defer cursor.destroy(&allocator);
+pub const DefaultCodec = struct {
+    const Error = error{
+        ParseArrayEndOfIterator,
+        ParseOptEndOfIterator,
+        ParseStringEndOfIterator,
+        ParseEnumEndOfIterator,
+        ParseFloatEndOfIterator,
+        ParseIntEndOfIterator,
+        ParseBoolEndOfIterator,
+        InvalidEnum,
+        InvalidBoolLiteral,
+    } ||
+        AtDepthArrayTokenIterator.Error ||
+        std.fmt.ParseIntError ||
+        std.fmt.ParseFloatError ||
+        std.mem.Allocator.Error;
 
-    cursor.stackItem("Hello");
-    try std.testing.expectEqualStrings("Hello", cursor.peek().?);
-}
+    pub const CursorT = coll.Cursor([:0]const u8);
 
-// TODO: split error per operation, glue them together later recursively
-const CodecError = error{
-    ParseIntEndOfIterator,
-    ParseFloatEndOfIterator,
-    ParseStringEndOfIterator,
-    ParseArrayEndOfIterator,
-} ||
-    AtDepthArrayTokenIterator.Error ||
-    std.fmt.ParseIntError ||
-    std.fmt.ParseFloatError ||
-    std.mem.Allocator.Error;
+    pub fn validateType(comptime T: type, comptime tag: @Type(.enum_literal)) void {
+        comptime if (@typeInfo(T) != tag) @compileError(std.fmt.comptimePrint(
+            "Type given to parse method is not {s}, it is {s}",
+            .{
+                @tagName(tag),
+                @typeName(T),
+            },
+        ));
+    }
+
+    pub fn validateConcreteType(comptime T: type, comptime OtherT: type) void {
+        comptime if (T != OtherT) @compileError(std.fmt.comptimePrint("Expected type {s} found {s}", .{
+            @typeName(T),
+            @typeName(OtherT),
+        }));
+    }
+
+    pub fn parseWith(T: type) std.meta.DeclEnum(@This()) {
+        return comptime switch (@typeInfo(T)) {
+            .bool => .parseBool,
+            .int => .parseInt,
+            .float => .parseFloat,
+            .pointer => |ptr| if (ptr.child == u8) .parseString else .parseArray,
+            .optional => .parseOpt,
+            .@"enum" => .parseEnum,
+            else => @compileError(std.fmt.comptimePrint(
+                "Codec: {s} - type {s} not supported by codec",
+                .{
+                    @typeName(@This()),
+                    @typeName(T),
+                },
+            )),
+        };
+    }
+
+    pub fn callByTag(comptime T: type, args: anytype) Error!T {
+        const ArgT = @TypeOf(args);
+        comptime validateType(ArgT, .@"struct");
+        if (!@typeInfo(ArgT).@"struct".is_tuple) @compileError(std.fmt.comptimePrint(
+            "Argument time given to callByTag is not a tuple",
+            .{@typeName(ArgT)},
+        ));
+        // TODO: more tuple validation
+
+        const fTag = comptime parseWith(T);
+
+        const fArgs = switch (fTag) {
+            .parseBool => .{args.@"1"},
+            .parseInt, .parseFloat, .parseEnum => .{ T, args.@"1" },
+            .parseString, .parseOpt, .parseArray => .{ T, args.@"0", args.@"1" },
+            else => @compileError("not supported"),
+        };
+
+        return try @call(.auto, @field(@This(), @tagName(fTag)), fArgs);
+    }
+
+    pub fn parseArray(
+        comptime T: type,
+        allocator: *const Allocator,
+        cursor: *CursorT,
+    ) Error!T {
+        comptime validateType(T, .pointer);
+
+        const PtrT = @typeInfo(T).pointer;
+        const ArrayT = PtrT.child;
+        var ar = std.heap.ArenaAllocator.init(allocator.*);
+        defer ar.deinit();
+        const scrapAllocator = &ar.allocator();
+
+        // Array generic is always one layer lower
+        // Main allocator is used here to move the results outside of stack
+        var array = try std.ArrayList(ArrayT).initCapacity(allocator.*, 6);
+        errdefer array.deinit();
+
+        const slice = cursor.next() orelse return Error.ParseArrayEndOfIterator;
+
+        // Q lives in the stack and dies in the stack
+        const Q = coll.SinglyLinkedQueue([:0]const u8);
+        var queue = Q{};
+        const queueCursor = try coll.QueueCursor([:0]const u8).init(scrapAllocator, &queue);
+        defer queueCursor.destroy(scrapAllocator);
+
+        var arrTokenizer = AtDepthArrayTokenIterator.init(slice);
+
+        while (try arrTokenizer.next()) |token| {
+            try queueCursor.queueItem(scrapAllocator, try scrapAllocator.dupeZ(u8, token));
+        }
+
+        const vCursor = trait.asTrait(CursorT, queueCursor);
+        while (queueCursor.len() > 0) {
+            try array.append(try callByTag(ArrayT, .{ allocator, vCursor }));
+        }
+
+        if (PtrT.sentinel()) |sentinel| {
+            return array.toOwnedSliceSentinel(sentinel);
+        } else {
+            return array.toOwnedSlice();
+        }
+    }
+
+    pub fn isNull(cursor: *CursorT) bool {
+        const s = cursor.peek() orelse return false;
+        return std.mem.eql(u8, "null", s);
+    }
+
+    pub fn parseOpt(
+        comptime T: type,
+        allocator: *const Allocator,
+        cursor: *CursorT,
+    ) Error!T {
+        comptime validateType(T, .optional);
+        const Tt = @typeInfo(T).optional.child;
+
+        _ = cursor.peek() orelse return Error.ParseOptEndOfIterator;
+        if (isNull(cursor)) {
+            cursor.consume();
+            return null;
+        } else {
+            return try callByTag(Tt, .{ allocator, cursor });
+        }
+    }
+
+    pub fn parseString(
+        comptime T: type,
+        allocator: *const Allocator,
+        cursor: *CursorT,
+    ) Error!T {
+        comptime validateType(T, .pointer);
+        const PtrType = @typeInfo(T).pointer;
+        const Tt = comptime meta.ptrTypeToChild(T);
+        comptime validateConcreteType(Tt, u8);
+
+        const s = cursor.next() orelse return Error.ParseStringEndOfIterator;
+        const newPtr = try alloc: {
+            if (PtrType.sentinel()) |sentinel| {
+                break :alloc allocator.allocSentinel(Tt, s.len, sentinel);
+            } else {
+                break :alloc allocator.alloc(Tt, s.len);
+            }
+        };
+        @memcpy(newPtr, s);
+        return newPtr;
+    }
+
+    pub fn parseEnum(
+        comptime T: type,
+        cursor: *CursorT,
+    ) Error!T {
+        comptime validateType(T, .@"enum");
+        const value = cursor.next() orelse return Error.ParseEnumEndOfIterator;
+        return std.meta.stringToEnum(T, value) orelse Error.InvalidEnum;
+    }
+
+    pub fn parseFloat(comptime T: type, cursor: *CursorT) Error!T {
+        comptime validateType(T, .float);
+        const value = cursor.next() orelse return Error.ParseFloatEndOfIterator;
+        return try std.fmt.parseFloat(T, value);
+    }
+
+    pub fn parseInt(comptime T: type, cursor: *CursorT) Error!T {
+        comptime validateType(T, .int);
+        const value = cursor.next() orelse return Error.ParseIntEndOfIterator;
+        return try std.fmt.parseInt(T, value, 10);
+    }
+
+    pub fn parseBool(cursor: *CursorT) Error!bool {
+        const value = cursor.next() orelse return Error.ParseBoolEndOfIterator;
+        return result: switch (value.len) {
+            4 => {
+                break :result if (std.mem.eql(u8, "true", value)) true else Error.InvalidBoolLiteral;
+            },
+            5 => {
+                break :result if (std.mem.eql(u8, "false", value)) false else Error.InvalidBoolLiteral;
+            },
+            else => Error.InvalidBoolLiteral,
+        };
+    }
+};
 
 pub fn Codec(Spec: type) type {
     return struct {
@@ -792,7 +961,8 @@ pub fn Codec(Spec: type) type {
             return .{};
         }
 
-        const CursorT = coll.Cursor([:0]const u8);
+        const Error = DefaultCodec.Error;
+        const CursorT = DefaultCodec.CursorT;
         const SpecFieldEnum = std.meta.FieldEnum(Spec);
 
         pub fn CodecOf(tag: SpecFieldEnum, tTag: @Type(.enum_literal)) type {
@@ -813,32 +983,19 @@ pub fn Codec(Spec: type) type {
 
         /// This is not an instance method and that's on purpose, this needs evaluation 100% at comptime
         pub fn parseWith(comptime tag: SpecFieldEnum) std.meta.DeclEnum(@This()) {
-            const name = @tagName(tag);
             const FieldType = @FieldType(Spec, @tagName(tag));
-            return refeed: switch (@typeInfo(FieldType)) {
-                .bool => .parseBool,
-                .int => .parseInt,
-                .float => .parseFloat,
-                .@"enum" => @compileError("Enum not supported yet"),
-                .pointer => |ptr| ptrReturn: {
-                    // TODO: add meta tag to treat u8 as any other numberic array for parsing
-                    if (ptr.child == u8) break :ptrReturn .parseString;
-                    // if (ptr.child == []const u8) break :ptrReturn .parseArray;
-
-                    break :ptrReturn arrayRefeed: switch (@typeInfo(ptr.child)) {
-                        .bool, .int, .float, .@"enum", .pointer => .parseArray,
-                        .optional => |opt| continue :arrayRefeed @typeInfo(opt.chid),
-                        else => @compileError(std.fmt.comptimePrint(
-                            "Field: {s}, Type: []{s} - unsupported array type",
-                            .{ name, @typeName(ptr.child) },
-                        )),
-                    };
+            return switch (@typeInfo(FieldType)) {
+                .bool => .parseFlag,
+                else => result: {
+                    const fTag = @tagName(DefaultCodec.parseWith(FieldType));
+                    break :result std.meta.stringToEnum(
+                        std.meta.DeclEnum(@This()),
+                        @tagName(DefaultCodec.parseWith(FieldType)),
+                    ) orelse @compileError(std.fmt.comptimePrint(
+                        "Type of {s}, parsed with {s} is not available in interface codec",
+                        .{ @typeName(FieldType), fTag },
+                    ));
                 },
-                .optional => |opt| continue :refeed @typeInfo(opt.child),
-                else => @compileError(std.fmt.comptimePrint(
-                    "Field: {s}, Type: {s} - no codec translation for type available",
-                    .{ name, @typeName(FieldType) },
-                )),
             };
         }
 
@@ -847,80 +1004,34 @@ pub fn Codec(Spec: type) type {
             comptime tag: SpecFieldEnum,
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) CodecError!meta.OptTypeOf(@FieldType(Spec, @tagName(tag))) {
-            const token = if (cursor.next()) |t| t else return ParseSpecError.ParseArrayEndOfIterator;
-
-            const unitCursor = try coll.UnitCursor([:0]const u8).init(allocator, token);
-            defer unitCursor.destroy(allocator);
-
-            var arena = std.heap.ArenaAllocator.init(allocator.*);
-            const scrapAllocator = &arena.allocator();
-            defer arena.deinit();
-
-            return self.parseArrayInner(tag, 0, allocator, scrapAllocator, trait.asTrait(CursorT, unitCursor));
+        ) Error!meta.OptTypeOf(@FieldType(Spec, @tagName(tag))) {
+            _ = self;
+            return try DefaultCodec.parseArray(
+                meta.OptTypeOf(@FieldType(Spec, @tagName(tag))),
+                allocator,
+                cursor,
+            );
         }
 
-        pub fn parseArrayInner(self: *const @This(), comptime tag: SpecFieldEnum, comptime depth: usize, allocator: *const Allocator, scrapAllocator: *const Allocator, cursor: *CursorT) CodecError!meta.TypeAtDepthN(Spec, @tagName(tag), depth) {
-            // Array generic is always one layer lower
-            const ArrayT = meta.TypeAtDepthN(Spec, @tagName(tag), depth + 1);
-            const codecFTag = comptime switch (@typeInfo(ArrayT)) {
-                .bool => .parseBool,
-                .int => .parseInt,
-                .float => .parseFloat,
-                .pointer => |ptr| if (ptr.child == u8) .parseString else .parseArrayInner,
-                // TODO: add a check for opt and return null on catch if that's the type we are dealing with
-                // .optional
-                // .@"enum"
-                else => @compileError(std.fmt.comptimePrint(
-                    "Spec: {s}, Codec: {s}, Field: {s} - type {s} not supported by codec",
-                    .{
-                        @typeName(Spec),
-                        @typeName(@This()),
-                        @tagName(tag),
-                        @TypeOf(@FieldType(Spec, @tagName(tag))),
-                    },
-                )),
-            };
-
-            // Main allocator is used here to move the results outside of stack
-            var array = try std.ArrayList(ArrayT).initCapacity(allocator.*, 6);
-            errdefer array.deinit();
-
-            const slice = cursor.next() orelse return CodecError.ParseArrayEndOfIterator;
-
-            // Q lives in the stack and dies in the stack
-            const Q = coll.SinglyLinkedQueue([:0]const u8);
-            var queue = Q{};
-            const queueCursor = try coll.QueueCursor([:0]const u8).init(scrapAllocator, &queue);
-            defer queueCursor.destroy(scrapAllocator);
-
-            var arrTokenizer = AtDepthArrayTokenIterator.init(slice);
-
-            while (try arrTokenizer.next()) |token| {
-                try queueCursor.queueItem(scrapAllocator, try scrapAllocator.dupeZ(u8, token));
-            }
-
-            const vCursor = trait.asTrait(CursorT, queueCursor);
-            while (queueCursor.len() > 0) {
-                const args = if (comptime codecFTag == .parseArrayInner) .{
-                    self,
-                    tag,
-                    depth + 1,
-                    allocator,
-                    scrapAllocator,
-                    vCursor,
-                } else .{
-                    self,
+        pub fn parseOpt(
+            self: *const @This(),
+            comptime tag: std.meta.FieldEnum(Spec),
+            allocator: *const Allocator,
+            cursor: *CursorT,
+        ) Error!@FieldType(Spec, @tagName(tag)) {
+            const tagT = @FieldType(Spec, @tagName(tag));
+            return if (comptime @typeInfo(tagT).optional.child == bool)
+                if (DefaultCodec.isNull(cursor)) null else try self.parseFlag(
                     tag,
                     allocator,
-                    vCursor,
-                };
-                try array.append(
-                    try @call(.auto, @field(@This(), @tagName(codecFTag)), args),
+                    cursor,
+                )
+            else
+                try DefaultCodec.parseOpt(
+                    tagT,
+                    allocator,
+                    cursor,
                 );
-            }
-
-            return array.toOwnedSlice();
         }
 
         pub fn parseString(
@@ -928,21 +1039,27 @@ pub fn Codec(Spec: type) type {
             comptime tag: std.meta.FieldEnum(Spec),
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) CodecError!CodecOf(tag, .pointer) {
+        ) Error!CodecOf(tag, .pointer) {
             _ = self;
-            const s = cursor.next() orelse return CodecError.ParseIntEndOfIterator;
+            return try DefaultCodec.parseString(
+                CodecOf(tag, .pointer),
+                allocator,
+                cursor,
+            );
+        }
 
-            const PtrType = @typeInfo(meta.LeafArrayTypeOfTag(Spec, @tagName(tag))).pointer;
-
-            const newPtr = try alloc: {
-                if (PtrType.sentinel()) |sentinel| {
-                    break :alloc allocator.allocSentinel(PtrType.child, s.len, sentinel);
-                } else {
-                    break :alloc allocator.alloc(PtrType.child, s.len);
-                }
-            };
-            @memcpy(newPtr, s);
-            return newPtr;
+        pub fn parseEnum(
+            self: *const @This(),
+            comptime tag: SpecFieldEnum,
+            allocator: *const Allocator,
+            cursor: *CursorT,
+        ) Error!CodecOf(tag, .@"enum") {
+            _ = self;
+            _ = allocator;
+            return try DefaultCodec.parseEnum(
+                CodecOf(tag, .@"enum"),
+                cursor,
+            );
         }
 
         pub fn parseFloat(
@@ -950,14 +1067,13 @@ pub fn Codec(Spec: type) type {
             comptime tag: std.meta.FieldEnum(Spec),
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) CodecError!CodecOf(tag, .float) {
+        ) Error!CodecOf(tag, .float) {
             _ = self;
             _ = allocator;
-            const value = cursor.next() orelse return CodecError.ParseFloatEndOfIterator;
-            return try std.fmt.parseFloat(CodecOf(
-                tag,
-                .float,
-            ), value);
+            return try DefaultCodec.parseFloat(
+                CodecOf(tag, .float),
+                cursor,
+            );
         }
 
         pub fn parseInt(
@@ -965,22 +1081,33 @@ pub fn Codec(Spec: type) type {
             comptime tag: SpecFieldEnum,
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) CodecError!CodecOf(tag, .int) {
+        ) Error!CodecOf(tag, .int) {
             _ = self;
             _ = allocator;
-            const value = cursor.next() orelse return CodecError.ParseIntEndOfIterator;
-            return try std.fmt.parseInt(meta.LeafTypeOfTag(Spec, @tagName(tag)), value, 10);
+            return try DefaultCodec.parseInt(
+                CodecOf(tag, .int),
+                cursor,
+            );
         }
 
-        // The only way you can change a flag is by explicitly saying false
-        // all other values are oportunistic trues
-        // TODO: write a require check if it's for arrays
         pub fn parseBool(
             self: *const @This(),
             comptime tag: SpecFieldEnum,
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) CodecError!bool {
+        ) Error!bool {
+            _ = self;
+            _ = allocator;
+            _ = tag;
+            return try DefaultCodec.parseBool(cursor);
+        }
+
+        pub fn parseFlag(
+            self: *const @This(),
+            comptime tag: SpecFieldEnum,
+            allocator: *const Allocator,
+            cursor: *CursorT,
+        ) Error!bool {
             _ = self;
             _ = allocator;
             _ = tag;
@@ -1002,27 +1129,173 @@ pub fn Codec(Spec: type) type {
     };
 }
 
-test "Codec parseBool" {
-    const allocator = &std.testing.allocator;
+test "codec parseArray" {
+    const baseAllocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(baseAllocator);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
     const cursor = try tstArgCursor(allocator,
-        \\true
-        \\false
-        \\"something else"
+        \\"[false, true]"
+        \\"[1, -1]"
+        \\"[1.1, -2.2]"
+        \\"['a', 'b']"
+        \\"['c', 'd']"
+        \\"[[3]]"
+        \\"[small, medium, large]"
+        \\"[false, null]"
+        \\"[[false, null]]"
+        \\"[[false, null], null]"
+        \\"[[null, true, null], [false], null]"
+        \\"[]"
+        \\"[[]]"
     );
     defer cursor.destroy(allocator);
+    const Spec = struct {
+        b: []const bool,
+        i: []const i32,
+        f: []const f32,
+        s: []const []const u8,
+        sz: []const [:0]const u8,
+        ad: []const []const i32,
+        e: []const Size,
+        b2: []const ?bool,
+        b3: []const []const ?bool,
+        b4: []const ?[]const ?bool,
+        b5: ?[]const ?[]const ?bool,
+        b6: ?[]const []bool,
+        b7: ?[]const []bool,
 
-    const codec = Codec(struct { @"test": bool }).init();
-    try std.testing.expect(try codec.parseBool(.@"test", allocator, cursor));
-    try std.testing.expectEqualDeep(null, cursor.curr);
+        const Size = enum {
+            small,
+            medium,
+            large,
+        };
+    };
+    const codec = Codec(Spec).init();
+    const expectBA: []const bool = &.{ false, true };
+    try std.testing.expectEqualDeep(expectBA, try codec.parseArray(.b, allocator, cursor));
+    const expectIA: []const i32 = &.{ 1, -1 };
+    try std.testing.expectEqualDeep(expectIA, try codec.parseArray(.i, allocator, cursor));
+    const expectFA: []const f32 = &.{ 1.1, -2.2 };
+    try std.testing.expectEqualDeep(expectFA, try codec.parseArray(.f, allocator, cursor));
+    const expectSA: []const []const u8 = &.{ "a", "b" };
+    try std.testing.expectEqualDeep(expectSA, try codec.parseArray(.s, allocator, cursor));
+    const expectSZ: []const [:0]const u8 = &.{ "c", "d" };
+    try std.testing.expectEqualDeep(expectSZ, try codec.parseArray(.sz, allocator, cursor));
+    const expectAD: []const [:0]const i32 = &.{&.{3}};
+    try std.testing.expectEqualDeep(expectAD, try codec.parseArray(.ad, allocator, cursor));
+    const expectED: []const Spec.Size = &.{ .small, .medium, .large };
+    try std.testing.expectEqualDeep(expectED, try codec.parseArray(.e, allocator, cursor));
+    const expectB2: []const ?bool = &.{ false, null };
+    try std.testing.expectEqualDeep(expectB2, try codec.parseArray(.b2, allocator, cursor));
+    const expectB3: []const []const ?bool = &.{&.{ false, null }};
+    try std.testing.expectEqualDeep(expectB3, try codec.parseArray(.b3, allocator, cursor));
+    const expectB4: []const ?[]const ?bool = &.{ &.{ false, null }, null };
+    try std.testing.expectEqualDeep(expectB4, try codec.parseArray(.b4, allocator, cursor));
 
-    try std.testing.expect(!try codec.parseBool(.@"test", allocator, cursor));
-    try std.testing.expectEqual(null, cursor.curr);
-
-    try std.testing.expect(try codec.parseBool(.@"test", allocator, cursor));
-    try std.testing.expectEqualStrings("something else", cursor.curr.?);
+    // Those are really Opt recursive tests
+    const expectB5: ?[]const ?[]const ?bool = &.{ &.{ null, true, null }, &.{false}, null };
+    try std.testing.expectEqualDeep(expectB5, try codec.parseArray(.b5, allocator, cursor));
+    const expectB6: ?[]const []bool = &.{};
+    try std.testing.expectEqualDeep(expectB6, try codec.parseArray(.b6, allocator, cursor));
+    const expectB7: ?[]const []bool = &.{&.{}};
+    try std.testing.expectEqualDeep(expectB7, try codec.parseArray(.b7, allocator, cursor));
+    try std.testing.expectError(
+        @TypeOf(codec).Error.ParseArrayEndOfIterator,
+        codec.parseArray(.b7, allocator, cursor),
+    );
 }
 
-test "Codec parseInt" {
+test "codec parseOpt" {
+    const allocator = &std.testing.allocator;
+    const cursor = try tstArgCursor(allocator,
+        \\null
+        \\1
+    );
+    defer cursor.destroy(allocator);
+    const codec = Codec(struct { a1: ?f32 }).init();
+    try std.testing.expectEqual(null, try codec.parseOpt(.a1, allocator, cursor));
+    try std.testing.expectEqual(1, (try codec.parseOpt(.a1, allocator, cursor)).?);
+    cursor.consume();
+    try std.testing.expectError(
+        @TypeOf(codec).Error.ParseOptEndOfIterator,
+        codec.parseOpt(.a1, allocator, cursor),
+    );
+}
+
+test "codec parseString" {
+    const baseAllocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(baseAllocator);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+    const cursor = try tstArgCursor(allocator,
+        \\hello
+        \\world
+    );
+    defer cursor.destroy(allocator);
+    const codec = Codec(struct { s1: []const u8, s2: [:0]const u8 }).init();
+    try std.testing.expectEqualDeep("hello", try codec.parseString(.s1, allocator, cursor));
+    try std.testing.expectEqualDeep("world", try codec.parseString(.s2, allocator, cursor));
+    try std.testing.expectError(
+        @TypeOf(codec).Error.ParseStringEndOfIterator,
+        codec.parseString(.s2, allocator, cursor),
+    );
+}
+
+test "codec parseEnum" {
+    const baseAllocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(baseAllocator);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+    const cursor = try tstArgCursor(allocator,
+        \\small
+        \\medium
+        \\large
+        \\invalid
+    );
+    defer cursor.destroy(allocator);
+    const Spec = struct {
+        size: Size,
+
+        const Size = enum {
+            small,
+            medium,
+            large,
+        };
+    };
+    const codec = Codec(Spec).init();
+    try std.testing.expectEqual(Spec.Size.small, try codec.parseEnum(.size, allocator, cursor));
+    try std.testing.expectEqual(Spec.Size.medium, try codec.parseEnum(.size, allocator, cursor));
+    try std.testing.expectEqual(Spec.Size.large, try codec.parseEnum(.size, allocator, cursor));
+    try std.testing.expectError(
+        @TypeOf(codec).Error.InvalidEnum,
+        codec.parseEnum(.size, allocator, cursor),
+    );
+    try std.testing.expectError(
+        @TypeOf(codec).Error.ParseEnumEndOfIterator,
+        codec.parseEnum(.size, allocator, cursor),
+    );
+}
+
+test "codec parseFloat" {
+    const allocator = &std.testing.allocator;
+    const cursor = try tstArgCursor(allocator,
+        \\44
+        \\-1.2
+        \\32.2222
+    );
+    defer cursor.destroy(allocator);
+    const codec = Codec(struct { f1: f32, f2: f64 }).init();
+    try std.testing.expectEqual(44.0, try codec.parseFloat(.f1, allocator, cursor));
+    try std.testing.expectEqual(-1.2, try codec.parseFloat(.f2, allocator, cursor));
+    try std.testing.expectEqual(32.2222, try codec.parseFloat(.f1, allocator, cursor));
+    try std.testing.expectError(
+        @TypeOf(codec).Error.ParseFloatEndOfIterator,
+        codec.parseFloat(.f1, allocator, cursor),
+    );
+}
+
+test "codec parseInt" {
     const allocator = &std.testing.allocator;
     const cursor = try tstArgCursor(allocator,
         \\44
@@ -1034,36 +1307,115 @@ test "Codec parseInt" {
     try std.testing.expectEqual(44, try codec.parseInt(.n1, allocator, cursor));
     try std.testing.expectEqual(-1, try codec.parseInt(.n2, allocator, cursor));
     try std.testing.expectEqual(25, try codec.parseInt(.n3, allocator, cursor));
+    try std.testing.expectError(
+        @TypeOf(codec).Error.ParseIntEndOfIterator,
+        codec.parseInt(.n3, allocator, cursor),
+    );
 }
 
-// TODO: construct errorset based on codec
-const ParseSpecError = error{
-    UnknownArgumentName,
-    InvalidArgumentToken,
-    MissingShorthandMetadata,
-    MissingShorthandLink,
-    UnknownShorthandName,
-    ArgEqualSplitMissingValue,
-    ArgEqualSplitNotConsumed,
-    CodecParseMethodUnavailable,
-} || std.mem.Allocator.Error || CodecError;
+test "codec parseBool" {
+    const allocator = &std.testing.allocator;
+    const cursor = try tstArgCursor(allocator,
+        \\true
+        \\false
+    );
+    defer cursor.destroy(allocator);
+    const codec = Codec(struct { b1: bool }).init();
+    try std.testing.expectEqual(true, try codec.parseBool(.b1, allocator, cursor));
+    try std.testing.expectEqual(false, try codec.parseBool(.b1, allocator, cursor));
+    try std.testing.expectError(
+        @TypeOf(codec).Error.ParseBoolEndOfIterator,
+        codec.parseBool(.b1, allocator, cursor),
+    );
+}
 
-// NOTE: it's the user's responsability to move pieces outside of the lifecycle of
-// a spec response
+test "codec parseFlag" {
+    const allocator = &std.testing.allocator;
+    const cursor = try tstArgCursor(allocator,
+        \\true
+        \\false
+        \\"something else"
+        \\1234
+        \\12345
+    );
+    defer cursor.destroy(allocator);
+
+    const codec = Codec(struct { @"test": bool }).init();
+    try std.testing.expect(try codec.parseFlag(.@"test", allocator, cursor));
+    try std.testing.expectEqualDeep(null, cursor.curr);
+
+    try std.testing.expect(!try codec.parseFlag(.@"test", allocator, cursor));
+    try std.testing.expectEqual(null, cursor.curr);
+
+    try std.testing.expect(try codec.parseFlag(.@"test", allocator, cursor));
+    try std.testing.expectEqualStrings("something else", cursor.curr.?);
+
+    // 4 letter guess
+    _ = cursor.next();
+    try std.testing.expect(try codec.parseFlag(.@"test", allocator, cursor));
+    try std.testing.expectEqualStrings("1234", cursor.curr.?);
+
+    // 5 letter guess
+    _ = cursor.next();
+    try std.testing.expect(try codec.parseFlag(.@"test", allocator, cursor));
+    try std.testing.expectEqualStrings("12345", cursor.curr.?);
+
+    // null check
+    _ = cursor.next();
+    try std.testing.expect(try codec.parseFlag(.@"test", allocator, cursor));
+    try std.testing.expectEqual(null, cursor.curr);
+}
+
 pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
-    const Options = Spec;
 
-    const CursorT = coll.Cursor([:0]const u8);
-    const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else Codec(Spec);
     return struct {
         arena: std.heap.ArenaAllocator,
         codec: SpecCodec,
         program: ?[:0]const u8,
+        // TODO: move const
         options: Options,
         // TODO: Move to tuple inside Spec, leverage codec
         positionals: [][:0]const u8,
         // TODO: optional error collection
+        // TODO: better get
+        verb: if (@hasDecl(Spec, "Verb")) ?VerbT else void,
+        const Options = Spec;
+
+        fn UnionVerbs() type {
+            const Uni = @typeInfo(Spec.Verb).@"union";
+            comptime var newFields: [Uni.fields.len]std.builtin.Type.UnionField = undefined;
+            for (Uni.fields, 0..) |f, i| {
+                const newSpecR = *const SpecResponse(f.type);
+                newFields[i] = .{
+                    .name = f.name,
+                    .type = newSpecR,
+                    .alignment = @alignOf(newSpecR),
+                };
+            }
+            const newUni: std.builtin.Type = .{ .@"union" = .{
+                .layout = Uni.layout,
+                .tag_type = Uni.tag_type,
+                .fields = &newFields,
+                .decls = Uni.decls,
+            } };
+            return @Type(newUni);
+        }
+
+        const VerbT = if (@hasDecl(Spec, "Verb")) UnionVerbs() else void;
+        const CursorT = coll.Cursor([:0]const u8);
+        const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else Codec(Spec);
+
+        const Error = error{
+            UnknownArgumentName,
+            InvalidArgumentToken,
+            MissingShorthandMetadata,
+            MissingShorthandLink,
+            UnknownShorthandName,
+            ArgEqualSplitMissingValue,
+            ArgEqualSplitNotConsumed,
+            CodecParseMethodUnavailable,
+        } || std.mem.Allocator.Error || SpecCodec.Error;
 
         pub fn init(allc: *const Allocator, codec: SpecCodec) !*@This() {
             var arena = std.heap.ArenaAllocator.init(allc.*);
@@ -1074,15 +1426,28 @@ pub fn SpecResponse(comptime Spec: type) type {
             self.options = Spec{};
             self.program = null;
             self.positionals = undefined;
+            if (comptime @hasDecl(Spec, "Verb")) {
+                self.verb = null;
+            }
             return self;
         }
 
         // TODO: test all error returns
-        pub fn parse(self: *@This(), cursor: *CursorT) ParseSpecError!void {
+        pub fn parse(self: *@This(), cursor: *CursorT) Error!void {
+            try self.parseInner(cursor, true);
+        }
+
+        fn parseInner(self: *@This(), cursor: *CursorT, comptime parseProgram: bool) Error!void {
             const allocator = self.arena.allocator();
-            self.program = if (cursor.next()) |program| blk: {
-                break :blk try allocator.dupeZ(u8, program);
-            } else return;
+
+            if (comptime parseProgram) {
+                self.program = if (cursor.next()) |program|
+                    try allocator.dupeZ(u8, program)
+                else
+                    return;
+            } else {
+                _ = cursor.peek() orelse return;
+            }
 
             var positionals = try std.ArrayList([:0]const u8).initCapacity(allocator, 32);
 
@@ -1112,10 +1477,33 @@ pub fn SpecResponse(comptime Spec: type) type {
             while (cursor.next()) |item| {
                 try positionals.append(try allocator.dupeZ(u8, item));
             }
+            if (positionals.items.len > 0) {
+                if (@hasDecl(Spec, "Verb")) {
+                    cursor.stackItem(positionals.items[0]);
+                    const Uni = @typeInfo(Spec.Verb).@"union";
+                    const e = DefaultCodec.parseEnum(Uni.tag_type.?, cursor) catch null;
+                    if (e) |ex| {
+                        std.debug.print("Verb: {s}", .{@tagName(ex)});
+                        inline for (Uni.fields) |f| {
+                            if (std.mem.eql(u8, f.name, @tagName(ex))) {
+                                const verbR = try SpecResponse(f.type).init(&allocator, Codec(f.type).init());
+
+                                const unmanaged = positionals.moveToUnmanaged();
+                                const vCursor = try coll.ArrayCursor([:0]const u8).init(&allocator, unmanaged.items, 1);
+
+                                try verbR.parseInner(trait.asTrait(CursorT, vCursor), false);
+                                self.verb = @unionInit(VerbT, f.name, verbR);
+
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             self.positionals = try positionals.toOwnedSlice();
         }
 
-        fn namedToken(self: *@This(), offset: usize, arg: [:0]const u8, cursor: *CursorT) ParseSpecError!void {
+        fn namedToken(self: *@This(), offset: usize, arg: [:0]const u8, cursor: *CursorT) Error!void {
             var splitValue: ?[:0]u8 = null;
             var slice: []const u8 = arg[offset..];
             const optValueIdx = std.mem.indexOf(u8, slice, "=");
@@ -1123,7 +1511,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             // Feed split arg to buffer
             if (optValueIdx) |i| {
                 // TODO: should this sanitize the sliced arg?
-                if (i + 1 >= arg.len) return ParseSpecError.ArgEqualSplitMissingValue;
+                if (i + 1 >= arg.len) return Error.ArgEqualSplitMissingValue;
                 const newValue = try self.arena.allocator().allocSentinel(u8, slice.len - i - 1, 0);
                 @memcpy(newValue, slice[i + 1 ..]);
                 cursor.stackItem(newValue);
@@ -1135,37 +1523,55 @@ pub fn SpecResponse(comptime Spec: type) type {
             try switch (offset) {
                 2 => self.namedArg(slice, cursor),
                 1 => self.shortArg(slice, cursor),
-                else => ParseSpecError.InvalidArgumentToken,
+                else => Error.InvalidArgumentToken,
             };
 
             // if split not consumed, it's not sane to progress
             if (splitValue) |v| {
                 const peekR: [*]const u8 = @ptrCast(cursor.peek() orelse return);
-                if (peekR == @as([*]u8, @ptrCast(v))) return ParseSpecError.ArgEqualSplitNotConsumed;
+                if (peekR == @as([*]u8, @ptrCast(v))) return Error.ArgEqualSplitNotConsumed;
             }
         }
 
         // TODO: re-feed chain of flags, enforce max n chars for shorthand
-        fn shortArg(self: *@This(), arg: []const u8, cursor: *CursorT) ParseSpecError!void {
-            if (@typeInfo(FieldEnum(Spec)).@"enum".fields.len == 0) return ParseSpecError.UnknownArgumentName;
-            if (!@hasDecl(Spec, "Short")) return ParseSpecError.MissingShorthandMetadata;
+        fn shortArg(self: *@This(), arg: []const u8, cursor: *CursorT) Error!void {
+            if (@typeInfo(FieldEnum(Spec)).@"enum".fields.len == 0) return Error.UnknownArgumentName;
+            if (!@hasDecl(Spec, "Short")) return Error.MissingShorthandMetadata;
 
-            inline for (std.meta.fields(@TypeOf(Spec.Short))) |s| {
-                if (std.mem.eql(u8, s.name, arg)) {
-                    const tag = s.defaultValue() orelse return ParseSpecError.MissingShorthandLink;
-                    try self.namedArg(tag, cursor);
-                    return;
+            // This provides isolation between shorthands and next args until last arg
+            var arena = std.heap.ArenaAllocator.init(self.arena.allocator());
+            const scrapAllocator = &arena.allocator();
+            const unit = try coll.UnitCursor([:0]const u8).init(scrapAllocator, null);
+            defer unit.destroy(scrapAllocator);
+            var vCursor = trait.asTrait(CursorT, unit);
+
+            var start: usize = 0;
+            var end: usize = @min(2, arg.len);
+            while (end <= arg.len) {
+                if (end == arg.len) vCursor = cursor;
+                ret: inline for (std.meta.fields(@TypeOf(Spec.Short))) |s| {
+                    if (std.mem.eql(u8, s.name, arg[start..end])) {
+                        const tag = s.defaultValue() orelse return Error.MissingShorthandLink;
+                        try self.namedArg(tag, vCursor);
+                        start = end;
+                        break :ret;
+                    }
+                } else if (end - start == 1) {
+                    return Error.UnknownShorthandName;
                 }
-            } else {
-                return ParseSpecError.UnknownShorthandName;
+
+                if (start == end and end == arg.len) return else if (end - start == 0)
+                    end = @min(end + 2, arg.len)
+                else
+                    end -= 1;
             }
         }
 
-        fn namedArg(self: *@This(), arg: []const u8, cursor: *CursorT) ParseSpecError!void {
-            @setEvalBranchQuota(10000);
+        fn namedArg(self: *@This(), arg: []const u8, cursor: *CursorT) Error!void {
+            @setEvalBranchQuota(1000000);
             const SpecEnum = FieldEnum(Spec);
             const fields = @typeInfo(SpecEnum).@"enum".fields;
-            if (fields.len == 0) return ParseSpecError.UnknownArgumentName;
+            if (fields.len == 0) return Error.UnknownArgumentName;
 
             inline for (fields) |f| {
                 // This gives me a comptime-value for name
@@ -1184,7 +1590,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                     return;
                 }
             } else {
-                return ParseSpecError.UnknownArgumentName;
+                return Error.UnknownArgumentName;
             }
         }
 
@@ -1194,7 +1600,7 @@ pub fn SpecResponse(comptime Spec: type) type {
     };
 }
 
-pub fn tstParseSpec(allocator: *const Allocator, cursor: *coll.Cursor([:0]const u8), Spec: type) ParseSpecError!*const SpecResponse(Spec) {
+pub fn tstParseSpec(allocator: *const Allocator, cursor: *coll.Cursor([:0]const u8), Spec: type) !*const SpecResponse(Spec) {
     var response = try SpecResponse(Spec).init(allocator, Codec(Spec).init());
     errdefer response.deinit();
     try response.parse(cursor);
@@ -1241,6 +1647,31 @@ test "parse named" {
     try std.testing.expectEqualDeep(expected, r4.positionals);
 }
 
+test "parsed chained flags" {
+    const Spec = struct {
+        t1: ?bool = null,
+        t2: ?bool = null,
+        t3: ?bool = null,
+        t4: ?bool = null,
+        t5: ?bool = null,
+
+        pub const Short = .{
+            .a = "t1",
+            .aA = "t2",
+            .b = "t3",
+            .Ss = "t4",
+            .c = "t5",
+        };
+    };
+    const r1 = try tstParse("program -aaAbSsc=false", Spec);
+    defer r1.deinit();
+    try std.testing.expect(r1.options.t1.?);
+    try std.testing.expect(r1.options.t2.?);
+    try std.testing.expect(r1.options.t3.?);
+    try std.testing.expect(r1.options.t4.?);
+    try std.testing.expect(!r1.options.t5.?);
+}
+
 test "parse short arg" {
     const Spec = struct {
         something: bool = false,
@@ -1272,28 +1703,36 @@ test "parse short arg" {
 
 test "parse different types" {
     const Spec = struct {
+        o1: ?bool = null,
         u1: ?u1 = null,
         f1: ?f16 = null,
         b: ?bool = null,
+        e: ?Animal = null,
         s1: ?[]const u8 = null,
         s2: ?[:0]const u8 = null,
         au1: ?[]const u1 = null,
         au32: ?[]const u32 = null,
         ai32: ?[]const i32 = null,
         af32: ?[]const f32 = null,
-        // TODO: missing enum, []enum, []bool
         as1: ?[]const []const u8 = null,
         as2: ?[]const [:0]const u8 = null,
         aau32: ?[]const []const u32 = null,
         aaf32: ?[]const []const f32 = null,
         aai32: ?[]const []const i32 = null,
+        aab: ?[]const []const bool = null,
+        ae: ?[]const Animal = null,
+        o2: ?bool = null,
+
+        pub const Animal = enum { dog, cat };
     };
 
     const r1 = try tstParse(
         \\program
+        \\--o1
         \\--u1=0
         \\--f1 1.1
         \\--b false
+        \\--e dog
         \\--s1 Hello
         \\--s2 "Hello World"
         \\--au1 [1,0,1,0]
@@ -1305,14 +1744,19 @@ test "parse different types" {
         \\--aau32 "[[1,3], [3300, 222, 333, 33], [1]]"
         \\--aaf32 "[  [  1.1,  3.2,-1] ,   [3.1  ,2,5], [ 1.2 ], [7.1]   ]"
         \\--aai32 "[  [  -1] ,   [2, -2] ]"
+        \\--aab="[[true, true, false], [false, true]]"
+        \\--ae "[cat, cat]"
+        \\--o2
     ,
         Spec,
     );
     defer r1.deinit();
 
+    try std.testing.expect(r1.options.o1.?);
     try std.testing.expectEqual(0, r1.options.u1.?);
     try std.testing.expectEqual(1.1, r1.options.f1.?);
     try std.testing.expect(!r1.options.b.?);
+    try std.testing.expectEqual(Spec.Animal.dog, r1.options.e.?);
     try std.testing.expectEqualStrings("Hello", r1.options.s1.?);
     try std.testing.expectEqualStrings("Hello World", r1.options.s2.?);
     try std.testing.expectEqualDeep(&[_]u1{ 1, 0, 1, 0 }, r1.options.au1.?);
@@ -1324,10 +1768,14 @@ test "parse different types" {
     try std.testing.expectEqualDeep(expectedAs2, r1.options.as2.?);
     const expectedAau32: []const [:0]const u32 = &.{ &.{ 1, 3 }, &.{ 3300, 222, 333, 33 }, &.{1} };
     try std.testing.expectEqualDeep(expectedAau32, r1.options.aau32.?);
-    const expectedAaf32: []const [:0]const f32 = &.{ &.{ 1.1, 3.2, -1 }, &.{ 3.1, 2, 5 }, &.{1.2}, &.{7.1} };
+    const expectedAaf32: []const []const f32 = &.{ &.{ 1.1, 3.2, -1 }, &.{ 3.1, 2, 5 }, &.{1.2}, &.{7.1} };
     try std.testing.expectEqualDeep(expectedAaf32, r1.options.aaf32.?);
-    const expectedAai32: []const [:0]const i32 = &.{ &.{-1}, &.{ 2, -2 } };
+    const expectedAai32: []const []const i32 = &.{ &.{-1}, &.{ 2, -2 } };
     try std.testing.expectEqualDeep(expectedAai32, r1.options.aai32.?);
+    const expectAab: []const []const bool = &.{ &.{ true, true, false }, &.{ false, true } };
+    try std.testing.expectEqualDeep(expectAab, r1.options.aab.?);
+    try std.testing.expectEqualDeep(&[_]Spec.Animal{ .cat, .cat }, r1.options.ae.?);
+    try std.testing.expect(r1.options.o2.?);
 }
 
 test "parse kvargs" {
@@ -1365,4 +1813,51 @@ test "parse positionals" {
 
     const expectSkip: []const [:0]const u8 = &.{ "--test", "positional1", "positional2", "positional3" };
     try std.testing.expectEqualDeep(expectSkip, r3.positionals);
+}
+
+test "parse verb" {
+    const Spec = struct {
+        verbose: ?bool = null,
+
+        pub const Copy = struct {
+            src: ?[]const u8 = null,
+        };
+
+        pub const Paste = struct {
+            target: ?[]const u8 = null,
+        };
+
+        pub const Verb = union(enum) {
+            copy: Copy,
+            paste: Paste,
+        };
+    };
+    const r1 = try tstParse("program copy --src file1", Spec);
+    defer r1.deinit();
+    const r2 = try tstParse("program paste --target file2", Spec);
+    defer r2.deinit();
+    const r3 = try tstParse("program --verbose false copy --src file3", Spec);
+    defer r3.deinit();
+    const r4 = try tstParse("program --verbose true paste --target file4", Spec);
+    defer r4.deinit();
+    const r5 = try tstParse("program --verbose true paste --target file4 positional1", Spec);
+    defer r5.deinit();
+
+    try std.testing.expectEqual(Spec.Copy, @TypeOf(r1.verb.?.copy.options));
+    try std.testing.expectEqualStrings("file1", r1.verb.?.copy.options.src.?);
+    try std.testing.expectEqual(null, r1.options.verbose);
+    try std.testing.expectEqual(Spec.Paste, @TypeOf(r2.verb.?.paste.options));
+    try std.testing.expectEqualStrings("file2", r2.verb.?.paste.options.target.?);
+    try std.testing.expectEqual(null, r2.options.verbose);
+    try std.testing.expectEqual(Spec.Copy, @TypeOf(r3.verb.?.copy.options));
+    try std.testing.expectEqualStrings("file3", r3.verb.?.copy.options.src.?);
+    try std.testing.expectEqual(false, r3.options.verbose.?);
+    try std.testing.expectEqual(Spec.Paste, @TypeOf(r4.verb.?.paste.options));
+    try std.testing.expectEqualStrings("file4", r4.verb.?.paste.options.target.?);
+    try std.testing.expectEqual(true, r4.options.verbose.?);
+    try std.testing.expectEqual(Spec.Paste, @TypeOf(r5.verb.?.paste.options));
+    try std.testing.expectEqualStrings("file4", r5.verb.?.paste.options.target.?);
+    try std.testing.expectEqual(true, r5.options.verbose.?);
+    const expected: []const [:0]const u8 = &.{"positional1"};
+    try std.testing.expectEqualDeep(expected, r5.verb.?.paste.positionals);
 }

@@ -169,7 +169,7 @@ pub fn UnitCursor(T: type) type {
             cursor: *Cursor(T),
         },
 
-        pub fn init(allocator: *const Allocator, item: T) !*@This() {
+        pub fn init(allocator: *const Allocator, item: ?T) !*@This() {
             var self = try allocator.create(@This());
             self.traits = try trait.newTraitTable(allocator, self, .{
                 (try trait.extend(
@@ -271,6 +271,41 @@ pub fn QueueCursor(T: type) type {
 
         pub fn len(self: *@This()) usize {
             return self.queue.len;
+        }
+    };
+}
+
+pub fn ArrayCursor(T: type) type {
+    return struct {
+        i: usize,
+        list: []const T,
+        traits: *const struct {
+            cursor: *Cursor(T),
+        },
+
+        pub fn init(allocator: *const Allocator, list: []const T, start: usize) !*@This() {
+            var self = try allocator.create(@This());
+            self.traits = try trait.newTraitTable(allocator, self, .{
+                (try trait.extend(
+                    allocator,
+                    Cursor(T),
+                    self,
+                )).new(),
+            });
+            self.i = start;
+            self.list = list;
+            return self;
+        }
+
+        pub fn destroy(self: *@This(), allocator: *const Allocator) void {
+            trait.destroyTraits(allocator, self);
+        }
+
+        pub fn next(self: *@This()) ?[:0]const u8 {
+            return if (self.i >= self.list.len) null else ret: {
+                defer self.i += 1;
+                break :ret self.list[self.i];
+            };
         }
     };
 }
