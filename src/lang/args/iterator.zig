@@ -77,14 +77,16 @@ pub const AtDepthArrayTokenIterator = struct {
         seekComma,
         needValue,
         ready,
+        finish,
     };
 
     const State = struct {
         tag: StateTag,
-        depth: usize,
-        start: usize,
-        end: usize,
-        earlyStop: bool,
+        depth: usize = 0,
+        quoted: bool = false,
+        start: usize = 0,
+        end: usize = 0,
+        earlyStop: bool = false,
 
         const Error = error{
             CharBlackholed,
@@ -102,10 +104,6 @@ pub const AtDepthArrayTokenIterator = struct {
 
         const Noop: State = .{
             .tag = .noop,
-            .depth = 0,
-            .start = 0,
-            .end = 0,
-            .earlyStop = false,
         };
 
         fn noop(self: *State) void {
@@ -115,6 +113,7 @@ pub const AtDepthArrayTokenIterator = struct {
         fn ready(self: *State, i: usize, earlyStop: bool) void {
             self.end = i;
             self.earlyStop = earlyStop;
+            self.quoted = false;
             self.tag = .ready;
         }
 
@@ -122,9 +121,6 @@ pub const AtDepthArrayTokenIterator = struct {
             self.* = .{
                 .tag = .inBrackets,
                 .depth = depth,
-                .start = 0,
-                .end = 0,
-                .earlyStop = false,
             };
         }
 
@@ -132,9 +128,6 @@ pub const AtDepthArrayTokenIterator = struct {
             self.* = .{
                 .tag = .seekComma,
                 .depth = depth,
-                .start = 0,
-                .end = 0,
-                .earlyStop = false,
             };
         }
 
@@ -142,9 +135,9 @@ pub const AtDepthArrayTokenIterator = struct {
             self.* = .{
                 .tag = .inBracketsMatching,
                 .depth = self.depth + 1,
+                .quoted = self.quoted,
                 .start = i,
                 .end = i + 1,
-                .earlyStop = false,
             };
         }
 
@@ -152,9 +145,9 @@ pub const AtDepthArrayTokenIterator = struct {
             self.* = .{
                 .tag = .inQuotes,
                 .depth = self.depth,
+                .quoted = true,
                 .start = i + 1,
                 .end = i + 1,
-                .earlyStop = false,
             };
         }
 
@@ -162,9 +155,12 @@ pub const AtDepthArrayTokenIterator = struct {
             self.* = .{
                 .tag = .needValue,
                 .depth = 1,
-                .start = 0,
-                .end = 0,
-                .earlyStop = false,
+            };
+        }
+
+        fn finish(self: *State) void {
+            self.* = .{
+                .tag = .finish,
             };
         }
 
@@ -172,7 +168,7 @@ pub const AtDepthArrayTokenIterator = struct {
             if (self.earlyStop == true) {
                 self.seekComma(self.depth);
             } else if (self.depth == 0) {
-                self.noop();
+                self.finish();
             } else if (self.depth == 1) {
                 self.needValue();
             } else {
@@ -188,31 +184,45 @@ pub const AtDepthArrayTokenIterator = struct {
                         .noop, .seekComma => {
                             if (self.depth > 0) return State.Error.EarlyArrayTermination;
                         },
-                        .needValue, .inBrackets, .inBracketsMatching => return State.Error.EarlyArrayTermination,
+                        .needValue, .inBrackets, .inBracketsMatching => {
+                            if (self.quoted) return State.Error.EarlyQuoteTermination;
+                            return State.Error.EarlyArrayTermination;
+                        },
                         .inQuotes => return State.Error.EarlyQuoteTermination,
                         .ready => return State.Error.ResultBlackholed,
+                        .finish => {},
                     }
                 },
                 '[' => {
                     switch (tag) {
                         .noop => self.inBrackets(1),
                         .needValue, .inBrackets, .seekComma => self.inBracketsMatching(i),
-                        .inBracketsMatching => self.depth += 1,
+                        .inBracketsMatching => {
+                            if (!self.quoted) {
+                                self.depth += 1;
+                            } else {
+                                self.end = i;
+                            }
+                        },
                         .inQuotes => self.end = i,
-                        .ready => return State.Error.CharBlackholed,
+                        .ready, .finish => return State.Error.CharBlackholed,
                     }
                 },
                 ']' => {
                     switch (tag) {
-                        .noop => return State.Error.MissingArrayLayer,
+                        .noop, .finish => return State.Error.MissingArrayLayer,
                         .inBrackets, .seekComma => {
                             self.depth -= 1;
-                            self.noop();
+                            self.finish();
                         },
                         .needValue => return State.Error.EarlyArrayTermination,
                         .inBracketsMatching => {
-                            self.depth -= 1;
-                            if (self.depth == 0) self.ready(i, false) else self.end = i;
+                            if (!self.quoted) {
+                                self.depth -= 1;
+                                if (self.depth == 0) self.ready(i, false) else self.end = i;
+                            } else {
+                                self.end = i;
+                            }
                         },
                         .inQuotes => self.end = i,
                         .ready => return State.Error.CharBlackholed,
@@ -226,17 +236,24 @@ pub const AtDepthArrayTokenIterator = struct {
                         },
                         .seekComma => return State.Error.MissingCommaSeparator,
                         .needValue => self.inQuotes(i),
-                        .inBracketsMatching => self.end = i,
+                        .inBracketsMatching => {
+                            self.end = i;
+                            self.quoted = !self.quoted;
+                        },
                         .inQuotes => self.ready(i, true),
-                        .ready => return State.Error.CharBlackholed,
+                        .ready, .finish => return State.Error.CharBlackholed,
                     }
                 },
                 ' ', '\t' => {
                     switch (tag) {
-                        .noop => self.noop(),
+                        .noop, .finish => self.noop(),
                         .seekComma, .needValue, .inBrackets => {},
                         .inBracketsMatching => {
-                            if (self.depth == 1) self.ready(i, true) else self.end = i;
+                            if (!self.quoted and self.depth == 1) {
+                                self.ready(i, true);
+                            } else {
+                                self.end = i;
+                            }
                         },
                         .inQuotes => self.end = i,
                         .ready => return State.Error.CharBlackholed,
@@ -249,10 +266,14 @@ pub const AtDepthArrayTokenIterator = struct {
                         .seekComma => self.tag = .needValue,
                         .needValue, .inBrackets => return State.Error.EmptyCommaSplit,
                         .inBracketsMatching => {
-                            if (self.depth == 1) self.ready(i, false) else self.end = i;
+                            if (!self.quoted and self.depth == 1) {
+                                self.ready(i, false);
+                            } else {
+                                self.end = i;
+                            }
                         },
                         .inQuotes => self.end = i,
-                        .ready => return State.Error.CharBlackholed,
+                        .ready, .finish => return State.Error.CharBlackholed,
                     }
                 },
                 else => {
@@ -266,7 +287,7 @@ pub const AtDepthArrayTokenIterator = struct {
                         .inBracketsMatching => self.end = i,
                         .inQuotes => self.end = i,
                         .seekComma => return State.Error.MissingCommaSeparator,
-                        .ready => return State.Error.CharBlackholed,
+                        .ready, .finish => return State.Error.CharBlackholed,
                     }
                 },
             }
@@ -297,7 +318,6 @@ pub const AtDepthArrayTokenIterator = struct {
 
                 const s = slice[state.start..state.end];
                 state.resetReady();
-
                 return s;
             }
         }
@@ -680,8 +700,6 @@ test "Depth 1 Array tokenizer (strings)" {
 
 test "Depth 2+ Array tokenizer (strings)" {
     const t = std.testing;
-    const E = AtDepthArrayTokenIterator.Error;
-    _ = E;
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
@@ -704,9 +722,44 @@ test "Depth 2+ Array tokenizer (strings)" {
 
     const expectMixedWhitespace: []const []const u8 = &.{ "[1,\t'a']", "[\t'b',2]" };
     try t.expectEqualDeep(expectMixedWhitespace, try tstCollectTokens(allocator, "[ [1,\t'a'] , [\t'b',2] ]"));
+}
 
-    // TODO: fix this, as bad as it looks
-    // should be: &.{ "['1,2], [2,3']" }
-    const expectMixedBracketsAndQuotes2: []const []const u8 = &.{ "['1, 2]", "[2,3']" };
-    try t.expectEqualDeep(expectMixedBracketsAndQuotes2, try tstCollectTokens(allocator, "[['1, 2], [2,3']]"));
+test "Any depth any match tricky cases" {
+    const t = std.testing;
+    const E = AtDepthArrayTokenIterator.Error;
+    const base = &std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    try t.expectError(E.CharBlackholed, tstCollectTokens(allocator, "['a', 'b']['c', 'd']"));
+
+    try t.expectError(E.EarlyQuoteTermination, tstCollectTokens(allocator, "[[1, 2], [3, 4']"));
+
+    const expectTricky1: []const []const u8 = &.{ "['a,b', 'c']", "['d', 'e']" };
+    try t.expectEqualDeep(expectTricky1, try tstCollectTokens(allocator, "[['a,b', 'c'], ['d', 'e']]"));
+
+    const expectTricky2: []const []const u8 = &.{"['[1,2]', '[3,4]']"};
+    try t.expectEqualDeep(expectTricky2, try tstCollectTokens(allocator, "[['[1,2]', '[3,4]']]"));
+
+    const expectTricky3: []const []const u8 = &.{"['1, 2], [2,3']"};
+    try t.expectEqualDeep(expectTricky3, try tstCollectTokens(allocator, "[['1, 2], [2,3']]"));
+
+    const expectTricky4: []const []const u8 = &.{"1, 2], [2,3"};
+    try t.expectEqualDeep(expectTricky4, try tstCollectTokens(allocator, "['1, 2], [2,3']"));
+
+    try t.expectError(E.EarlyQuoteTermination, tstCollectTokens(allocator, "['[1, 2]', [3, '4]"));
+
+    const expectTricky5: []const []const u8 = &.{ "1", "2, 3], [4, 5" };
+    try t.expectEqualDeep(expectTricky5, try tstCollectTokens(allocator, "[1, '2, 3], [4, 5']"));
+
+    try t.expectError(E.CharBlackholed, tstCollectTokens(allocator, "['[a, b'],"));
+
+    const expectTricky6: []const []const u8 = &.{ "['[x, y], z']", "['a, b]']" };
+    try t.expectEqualDeep(expectTricky6, try tstCollectTokens(allocator, "[['[x, y], z'], ['a, b]']]"));
+
+    try t.expectError(E.EarlyQuoteTermination, tstCollectTokens(allocator, "[['1, 2'], ['3]]"));
+
+    const expectTricky7: []const []const u8 = &.{ "1", "2", "3, [4, 5]" };
+    try t.expectEqualDeep(expectTricky7, try tstCollectTokens(allocator, "[1, 2, '3, [4, 5]']"));
 }
