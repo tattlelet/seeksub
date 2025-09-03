@@ -119,7 +119,7 @@ test "ptr to type" {
     try std.testing.expectEqual(u8, ptrTypeToChild(*u8));
 }
 
-pub fn OptTypeOf(T: type) type {
+pub fn OptTypeOf(comptime T: type) type {
     return comptime switch (@typeInfo(T)) {
         .optional => |opt| opt.child,
         else => T,
@@ -165,4 +165,13 @@ pub fn TypeAtDepth(T: type, comptime tag: []const u8, comptime depth: AtDepthArg
             .{ tag, @tagName(depth) },
         ));
     };
+}
+
+pub fn stringToEnum(comptime T: type, str: []const u8) ?T {
+    inline for (@typeInfo(T).@"enum".fields) |enumField| {
+        if (std.mem.eql(u8, str, enumField.name)) {
+            return @field(T, enumField.name);
+        }
+    }
+    return null;
 }

@@ -8,6 +8,7 @@ pub fn SinglyLinkedQueue(comptime T: type) type {
         start: ?*Node = null,
         end: ?*Node = null,
         len: usize = 0,
+        allocator: *const Allocator,
 
         pub const Node = struct {
             data: T,
@@ -28,8 +29,8 @@ pub fn SinglyLinkedQueue(comptime T: type) type {
             }
         };
 
-        pub fn append(self: *@This(), allocator: *const Allocator, data: T) !void {
-            const node = try Node.init(allocator, data);
+        pub fn append(self: *@This(), data: T) !void {
+            const node = try Node.init(self.allocator, data);
 
             self.len += 1;
             if (self.end) |prevNode| {
@@ -43,6 +44,7 @@ pub fn SinglyLinkedQueue(comptime T: type) type {
 
         pub fn pop(self: *@This()) ?T {
             if (self.start) |sNode| {
+                defer sNode.deinit(self.allocator);
                 self.len -= 1;
                 self.start = sNode.next;
                 return sNode.data;
@@ -121,35 +123,25 @@ pub fn Iterator(T: type) type {
 
 pub fn Cursor(T: type) type {
     return struct {
-        concrete: *anyopaque,
+        ptr: *anyopaque,
         vtable: *const VTable,
         curr: ?T,
 
         pub const VTable = struct {
-            destroy: *const fn (*anyopaque, *const Allocator) void = undefined,
             next: *const fn (*anyopaque) ?T = undefined,
         };
-
-        pub fn new(self: *@This()) *@This() {
-            self.curr = null;
-            return self;
-        }
-
-        pub fn destroy(self: *@This(), allocator: *const Allocator) void {
-            self.vtable.destroy(self.concrete, allocator);
-        }
 
         pub fn next(self: *@This()) ?T {
             if (self.curr) |item| {
                 self.curr = null;
                 return item;
             }
-            return self.vtable.next(self.concrete);
+            return self.vtable.next(self.ptr);
         }
 
         pub fn peek(self: *@This()) ?T {
             if (self.curr) |item| return item;
-            self.curr = self.vtable.next(self.concrete);
+            self.curr = self.vtable.next(self.ptr);
             return self.curr;
         }
 
@@ -165,29 +157,28 @@ pub fn Cursor(T: type) type {
 
 pub fn UnitCursor(T: type) type {
     return struct {
-        traits: *const struct {
-            cursor: *Cursor(T),
-        },
-
-        pub fn init(allocator: *const Allocator, item: ?T) !*@This() {
-            var self = try allocator.create(@This());
-            self.traits = try trait.newTraitTable(allocator, self, .{
-                (try trait.extend(
-                    allocator,
-                    Cursor(T),
-                    self,
-                )).new(),
-            });
-            self.traits.cursor.curr = item;
-            return self;
+        pub fn asCursor(item: ?T) Cursor(T) {
+            return .{
+                .curr = item,
+                .ptr = @constCast(@ptrCast(&{})),
+                .vtable = &.{
+                    .next = @This().next,
+                },
+            };
         }
 
-        pub fn destroy(self: *@This(), allocator: *const Allocator) void {
-            trait.destroyTraits(allocator, self);
+        pub fn asNoneCursor() Cursor(T) {
+            return .{
+                .curr = null,
+                .ptr = @constCast(@ptrCast(&{})),
+                .vtable = &.{
+                    .next = @This().next,
+                },
+            };
         }
 
-        pub fn next(self: *@This()) ?[:0]const u8 {
-            _ = self;
+        pub fn next(cursor: *anyopaque) ?[]const u8 {
+            _ = cursor;
             return null;
         }
     };
@@ -240,36 +231,33 @@ pub fn DFSCursor(T: type) type {
 pub fn QueueCursor(T: type) type {
     return struct {
         queue: *SinglyLinkedQueue(T),
-        traits: *const struct {
-            cursor: *Cursor(T),
-        },
 
-        pub fn init(allocator: *const Allocator, queue: *SinglyLinkedQueue(T)) !*@This() {
-            var self = try allocator.create(@This());
-            self.traits = try trait.newTraitTable(allocator, self, .{
-                (try trait.extend(
-                    allocator,
-                    Cursor(T),
-                    self,
-                )).new(),
-            });
-            self.queue = queue;
-            return self;
+        pub fn init(queue: *SinglyLinkedQueue(T)) @This() {
+            return .{
+                .queue = queue,
+            };
         }
 
-        pub fn destroy(self: *@This(), allocator: *const Allocator) void {
-            trait.destroyTraits(allocator, self);
+        pub fn asCursor(self: *const @This()) Cursor(T) {
+            return .{
+                .curr = null,
+                .ptr = @constCast(self),
+                .vtable = &.{
+                    .next = next,
+                },
+            };
         }
 
-        pub fn next(self: *@This()) ?[:0]const u8 {
+        pub fn next(cursor: *anyopaque) ?[:0]const u8 {
+            const self: *const @This() = @alignCast(@ptrCast(cursor));
             return self.queue.pop();
         }
 
-        pub fn queueItem(self: *@This(), allocator: *const Allocator, item: T) Allocator.Error!void {
-            try self.queue.append(allocator, item);
+        pub fn queueItem(self: *const @This(), item: T) Allocator.Error!void {
+            try self.queue.append(item);
         }
 
-        pub fn len(self: *@This()) usize {
+        pub fn len(self: *const @This()) usize {
             return self.queue.len;
         }
     };
@@ -279,29 +267,26 @@ pub fn ArrayCursor(T: type) type {
     return struct {
         i: usize,
         list: []const T,
-        traits: *const struct {
-            cursor: *Cursor(T),
-        },
 
-        pub fn init(allocator: *const Allocator, list: []const T, start: usize) !*@This() {
-            var self = try allocator.create(@This());
-            self.traits = try trait.newTraitTable(allocator, self, .{
-                (try trait.extend(
-                    allocator,
-                    Cursor(T),
-                    self,
-                )).new(),
-            });
-            self.i = start;
-            self.list = list;
-            return self;
+        pub fn init(list: []const T, start: usize) @This() {
+            return .{
+                .i = start,
+                .list = list,
+            };
         }
 
-        pub fn destroy(self: *@This(), allocator: *const Allocator) void {
-            trait.destroyTraits(allocator, self);
+        pub fn asCursor(self: *@This()) Cursor(T) {
+            return .{
+                .curr = null,
+                .ptr = self,
+                .vtable = &.{
+                    .next = next,
+                },
+            };
         }
 
-        pub fn next(self: *@This()) ?[:0]const u8 {
+        pub fn next(cursor: *anyopaque) ?T {
+            var self: *@This() = @alignCast(@ptrCast(cursor));
             return if (self.i >= self.list.len) null else ret: {
                 defer self.i += 1;
                 break :ret self.list[self.i];
