@@ -9,8 +9,8 @@ const argCodec = @import("codec.zig");
 const Allocator = std.mem.Allocator;
 const FieldEnum = std.meta.FieldEnum;
 const TstArgCursor = argIter.TstArgCursor;
-const DefaultCodec = argCodec.DefaultCodec;
-const Codec = argCodec.Codec;
+const PrimitiveCodec = argCodec.PrimitiveCodec;
+const ArgCodec = argCodec.ArgCodec;
 
 pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
@@ -24,7 +24,6 @@ pub fn SpecResponse(comptime Spec: type) type {
         // TODO: Move to tuple inside Spec, leverage codec
         positionals: [][]const u8,
         // TODO: optional error collection
-        // TODO: better get
         verb: if (VerbT != void) ?VerbT else void,
         const Options = Spec;
 
@@ -50,7 +49,7 @@ pub fn SpecResponse(comptime Spec: type) type {
 
         const CursorT = coll.Cursor([]const u8);
         const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
-        const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else Codec(Spec);
+        const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
         const SpecEnumFields = std.meta.FieldEnum(Spec);
 
         const Error = error{
@@ -136,7 +135,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                     const verbR = try SpecResponse(f.type).init(
                         allocator,
                         // TODO: should use SpecCodec
-                        Codec(f.type){},
+                        SpecResponse(f.type).SpecCodec{},
                     );
 
                     const unmanaged = positionals.moveToUnmanaged();
@@ -223,12 +222,13 @@ pub fn SpecResponse(comptime Spec: type) type {
                         "Spec: {s}, Field: {s} - could no translate field to tag",
                         .{ @typeName(Spec), f.name },
                     )));
-                    const codecFTag = comptime SpecCodec.parseWith(spectag);
 
                     var allocator = self.arena.allocator();
-                    const r = try @call(.auto, @field(SpecCodec, @tagName(codecFTag)), .{ &self.codec, spectag, &allocator, cursor });
-
-                    @field(self.options, f.name) = r;
+                    @field(self.options, f.name) = try self.codec.parseByTag(
+                        spectag,
+                        &allocator,
+                        cursor,
+                    );
                     return;
                 }
             } else {
@@ -243,7 +243,10 @@ pub fn SpecResponse(comptime Spec: type) type {
 }
 
 pub fn tstParseSpec(allocator: *const Allocator, cursor: *coll.Cursor([]const u8), Spec: type) !*const SpecResponse(Spec) {
-    var response = try SpecResponse(Spec).init(allocator, Codec(Spec){});
+    var response = try SpecResponse(Spec).init(
+        allocator,
+        if (@hasDecl(Spec, "Codec")) Spec.Codec{} else ArgCodec(Spec){},
+    );
     errdefer response.deinit();
     try response.parse(cursor);
     return response;
@@ -551,4 +554,213 @@ test "parse verb" {
     try std.testing.expectEqual(true, r5.options.verbose.?);
     const expected: []const []const u8 = &.{"positional1"};
     try std.testing.expectEqualDeep(expected, r5.verb.?.paste.positionals);
+}
+
+test "parse with custom codec" {
+    const base = &std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+    const Spec = struct {
+        i: ?i32 = null,
+        i2: ?i32 = null,
+        arf: ?i32 = null,
+        // This is handled by CodecIn (not default)
+        b: ?bool = null,
+
+        pub const SpecFieldEnum = std.meta.FieldEnum(@This());
+        pub const Spc = @This();
+
+        pub const Codec = struct {
+            innerCodec: CodecIn = .{},
+
+            pub const CodecIn = argCodec.ArgCodec(Spc);
+            pub const Error = CodecIn.Error;
+
+            pub fn supports(
+                comptime Tx: type,
+                comptime tag: SpecFieldEnum,
+            ) bool {
+                _ = tag;
+                return comptime switch (@typeInfo(Tx)) {
+                    .int => true,
+                    else => false,
+                };
+            }
+
+            pub fn parseByTag(
+                self: *@This(),
+                comptime tag: SpecFieldEnum,
+                allc: *const Allocator,
+                crsor: *CodecIn.CursorT,
+            ) Error!@FieldType(Spc, @tagName(tag)) {
+                const Tx = @FieldType(Spc, @tagName(tag));
+                return try self.parseByType(Tx, tag, allc, crsor);
+            }
+
+            pub fn parseByType(
+                self: *@This(),
+                comptime Tx: type,
+                comptime tag: SpecFieldEnum,
+                allc: *const Allocator,
+                crsor: *CodecIn.CursorT,
+            ) Error!Tx {
+                return try switch (@typeInfo(Tx)) {
+                    .int => switch (tag) {
+                        .arf => self.parseSumAll(Tx, tag, allc, crsor),
+                        .i => self.parseIntX2(Tx, crsor),
+                        else => self.innerCodec.parseByType(Tx, tag, allc, crsor),
+                    },
+                    else => CodecIn.parseByType(self, Tx, tag, allc, crsor),
+                };
+            }
+
+            pub fn parseIntX2(
+                self: *@This(),
+                comptime Tx: type,
+                cursor: *CodecIn.CursorT,
+            ) Error!Tx {
+                _ = self;
+                return (try PrimitiveCodec.parseInt(
+                    Tx,
+                    cursor,
+                )) * 2;
+            }
+
+            pub fn parseSumAll(
+                self: *@This(),
+                comptime Tx: type,
+                comptime tag: SpecFieldEnum,
+                allc: *const Allocator,
+                cursor: *CodecIn.CursorT,
+            ) Error!Tx {
+                var r: Tx = 0;
+                const arr = (try self.innerCodec.parseByType(
+                    []const Tx,
+                    tag,
+                    allc,
+                    cursor,
+                ));
+                defer allc.free(arr);
+                for (arr) |n| {
+                    r += n;
+                }
+                return r;
+            }
+        };
+    };
+    const r = try tstParse(
+        allocator,
+        \\program
+        \\--i 31
+        \\--i2 31
+        \\--arf "[1,2,3,4,5]"
+        \\--b"
+    ,
+        Spec,
+    );
+    defer r.deinit();
+    try std.testing.expectEqual(62, r.options.i.?);
+    try std.testing.expectEqual(31, r.options.i2.?);
+    try std.testing.expectEqual(15, r.options.arf.?);
+    try std.testing.expectEqual(true, r.options.b.?);
+}
+
+test "parse verb with custom codec" {
+    const base = &std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    const Spec = struct {
+        verbose: ?bool = null,
+
+        pub const Copy = struct {
+            src: ?[]const u8 = null,
+        };
+
+        pub const Paste = struct {
+            target: ?[]const u8 = null,
+
+            pub const SpecFieldEnum = std.meta.FieldEnum(@This());
+            pub const Spc = @This();
+
+            pub const Codec = struct {
+                innerCodec: CodecIn = .{},
+
+                pub const CodecIn = argCodec.ArgCodec(Spc);
+                pub const Error = CodecIn.Error;
+
+                pub fn supports(
+                    comptime Tx: type,
+                    comptime tag: SpecFieldEnum,
+                ) bool {
+                    return tag == .target and Tx == []const u8;
+                }
+
+                pub fn parseByTag(
+                    self: *@This(),
+                    comptime tag: SpecFieldEnum,
+                    allc: *const Allocator,
+                    crsor: *CodecIn.CursorT,
+                ) Error!@FieldType(Spc, @tagName(tag)) {
+                    const Tx = @FieldType(Spc, @tagName(tag));
+                    return try self.parseByType(Tx, tag, allc, crsor);
+                }
+
+                pub fn parseByType(
+                    self: *@This(),
+                    comptime Tx: type,
+                    comptime tag: SpecFieldEnum,
+                    allc: *const Allocator,
+                    crsor: *CodecIn.CursorT,
+                ) Error!Tx {
+                    return try switch (@typeInfo(Tx)) {
+                        .pointer => |ptr| if (ptr.child == u8 and tag == .target) self.parsePath(
+                            Tx,
+                            allc,
+                            crsor,
+                        ) else CodecIn.parseByType(self, Tx, tag, allc, crsor),
+                        else => CodecIn.parseByType(self, Tx, tag, allc, crsor),
+                    };
+                }
+
+                pub fn parsePath(
+                    self: *@This(),
+                    comptime Tx: type,
+                    allc: *const Allocator,
+                    crsor: *CodecIn.CursorT,
+                ) Error!Tx {
+                    _ = self;
+                    const file = try PrimitiveCodec.parseString(Tx, allc, crsor);
+                    var fullPath = try allc.alloc(u8, 19 + file.len);
+                    _ = &fullPath;
+                    var buff: [*]u8 = @as([*]u8, @ptrCast(fullPath));
+                    @memcpy(buff, "~/.config/file/");
+                    buff += 15;
+                    @memcpy(buff, file);
+                    buff += file.len;
+                    @memcpy(buff, ".png");
+                    buff -= 15 + file.len;
+                    return fullPath;
+                }
+            };
+        };
+
+        pub const Verb = union(enum) {
+            copy: Copy,
+            paste: Paste,
+        };
+    };
+    const r1 = try tstParse(
+        allocator,
+        "program paste --target file1",
+        Spec,
+    );
+    defer r1.deinit();
+
+    try std.testing.expectEqualStrings(
+        "~/.config/file/file1.png",
+        r1.verb.?.paste.options.target.?,
+    );
 }
