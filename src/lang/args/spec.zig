@@ -1,11 +1,10 @@
 const std = @import("std");
-const trait = @import("../trait.zig");
-const shared = @import("../shared.zig");
-const duck = @import("../ducktape.zig");
 const meta = @import("../meta.zig");
 const coll = @import("../collections.zig");
 const argIter = @import("iterator.zig");
 const argCodec = @import("codec.zig");
+const validate = @import("validate.zig");
+const GroupTracker = validate.GroupTracker;
 const Allocator = std.mem.Allocator;
 const FieldEnum = std.meta.FieldEnum;
 const TstArgCursor = argIter.TstArgCursor;
@@ -14,18 +13,17 @@ const ArgCodec = argCodec.ArgCodec;
 
 pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
-
+    // TODO: optional error collection
     return struct {
         arena: std.heap.ArenaAllocator,
-        codec: SpecCodec,
+        codec: *SpecCodec,
         program: ?[]const u8,
         // TODO: move const
         options: Options,
         // TODO: Move to tuple inside Spec, leverage codec
         positionals: [][]const u8,
-        // TODO: optional error collection
         verb: if (VerbT != void) ?VerbT else void,
-        const Options = Spec;
+        groupMatch: if (GroupMatch != void) GroupMatch else void,
 
         fn SpecUnionVerbs() type {
             const VerbUnion = @typeInfo(Spec.Verb).@"union";
@@ -47,9 +45,11 @@ pub fn SpecResponse(comptime Spec: type) type {
             return @Type(newUni);
         }
 
+        const Options = Spec;
         const CursorT = coll.Cursor([]const u8);
         const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
         const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
+        const GroupMatch = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
         const SpecEnumFields = std.meta.FieldEnum(Spec);
 
         const Error = error{
@@ -61,19 +61,29 @@ pub fn SpecResponse(comptime Spec: type) type {
             ArgEqualSplitMissingValue,
             ArgEqualSplitNotConsumed,
             CodecParseMethodUnavailable,
-        } || std.mem.Allocator.Error || SpecCodec.Error;
+        } ||
+            std.mem.Allocator.Error ||
+            SpecCodec.Error ||
+            // TODO: add errors from Verb
+            if (GroupMatch != void) GroupMatch.Error else error{};
 
-        pub fn init(allc: *const Allocator, codec: SpecCodec) !*@This() {
+        pub fn init(allc: *const Allocator) !*@This() {
             var arena = std.heap.ArenaAllocator.init(allc.*);
             const allocator = arena.allocator();
             var self = try allocator.create(@This());
             self.arena = arena;
-            self.codec = codec;
+            self.codec = t: {
+                var c = SpecCodec{};
+                break :t &c;
+            };
             self.options = Spec{};
             self.program = null;
             self.positionals = undefined;
-            if (comptime @hasDecl(Spec, "Verb")) {
+            if (comptime VerbT != void) {
                 self.verb = null;
+            }
+            if (comptime GroupMatch != void) {
+                self.groupMatch = .{};
             }
             return self;
         }
@@ -119,6 +129,8 @@ pub fn SpecResponse(comptime Spec: type) type {
             }
             try self.parseVerb(&allocator, &positionals);
             self.positionals = try positionals.toOwnedSlice();
+
+            if (comptime GroupMatch != void) try self.groupMatch.validate();
         }
 
         fn parseVerb(
@@ -132,11 +144,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             const verbArg = positionals.items[0];
             inline for (@typeInfo(Spec.Verb).@"union".fields) |f| {
                 if (std.mem.eql(u8, f.name, verbArg)) {
-                    const verbR = try SpecResponse(f.type).init(
-                        allocator,
-                        // TODO: should use SpecCodec
-                        SpecResponse(f.type).SpecCodec{},
-                    );
+                    const verbR = try SpecResponse(f.type).init(allocator);
 
                     const unmanaged = positionals.moveToUnmanaged();
                     var arrCursor = coll.ArrayCursor([]const u8).init(
@@ -229,6 +237,8 @@ pub fn SpecResponse(comptime Spec: type) type {
                         &allocator,
                         cursor,
                     );
+
+                    if (comptime GroupMatch != void) self.groupMatch.parsed(spectag);
                     return;
                 }
             } else {
@@ -243,10 +253,7 @@ pub fn SpecResponse(comptime Spec: type) type {
 }
 
 pub fn tstParseSpec(allocator: *const Allocator, cursor: *coll.Cursor([]const u8), Spec: type) !*const SpecResponse(Spec) {
-    var response = try SpecResponse(Spec).init(
-        allocator,
-        if (@hasDecl(Spec, "Codec")) Spec.Codec{} else ArgCodec(Spec){},
-    );
+    var response = try SpecResponse(Spec).init(allocator);
     errdefer response.deinit();
     try response.parse(cursor);
     return response;
@@ -763,4 +770,43 @@ test "parse verb with custom codec" {
         "~/.config/file/file1.png",
         r1.verb.?.paste.options.target.?,
     );
+}
+
+test "validate require" {
+    const t = std.testing;
+    const base = &std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    const r = try tstParse(
+        allocator,
+        \\program
+        \\--i 1
+        \\--i2 2
+        \\--i3 3
+        \\--i4 4
+        \\--i6 5
+    ,
+        struct {
+            i: ?i32 = null,
+            i2: ?i32 = null,
+            i3: ?i32 = null,
+            i4: ?i32 = null,
+            i5: ?i32 = null,
+            i6: ?i32 = null,
+
+            pub const GroupMatch = .{
+                .mutuallyInclusive = .{
+                    .{ .i3, .i4 },
+                },
+                .mutuallyExclusive = .{
+                    .{ .i5, .i6 },
+                },
+                .required = .{ .i, .i2 },
+            };
+        },
+    );
+    defer r.deinit();
+    try t.expectEqualStrings("program", r.program.?);
 }
