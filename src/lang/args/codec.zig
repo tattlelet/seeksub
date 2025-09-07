@@ -302,6 +302,8 @@ pub fn ArgCodec(Spec: type) type {
     };
 }
 
+// TODO: add test with no arena to test ownership for array and string
+
 test "codec parseArray" {
     const baseAllocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(baseAllocator);

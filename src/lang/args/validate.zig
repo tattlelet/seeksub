@@ -72,43 +72,66 @@ test "track bits for field" {
     try t.expectEqual(false, fbset.oneOf(.{ .a, .b, .c }));
 }
 
+pub fn GroupMatchConfig(Spec: type) type {
+    const SpecEnumFields = std.meta.FieldEnum(Spec);
+    return struct {
+        mutuallyInclusive: []const []const SpecEnumFields = &.{},
+        mutuallyExclusive: []const []const SpecEnumFields = &.{},
+        required: []const SpecEnumFields = &.{},
+        mandatoryVerb: bool = false,
+    };
+}
+
 pub fn GroupTracker(Spec: type) type {
     const SpecEnumFields = std.meta.FieldEnum(Spec);
+    std.debug.assert(@TypeOf(Spec.GroupMatch) == GroupMatchConfig(Spec));
 
     return struct {
         fbset: FieldBitSet(Spec) = .{},
-        const GroupMatch = Spec.GroupMatch;
+        verb: bool = false,
 
         pub const Error = error{
             MissingRequiredField,
             MutuallyInclusiveConstraintNotMet,
             MutuallyExclusiveConstraintNotMet,
+            MissingVerb,
         };
 
         pub fn parsed(self: *@This(), comptime tag: SpecEnumFields) void {
             self.fbset.fieldSet(tag);
         }
 
-        pub fn required(self: *const @This()) Error!void {
-            if (!self.fbset.allOf(GroupMatch.required)) return Error.MissingRequiredField;
+        pub fn parsedVerb(self: *@This()) void {
+            self.verb = true;
         }
 
-        pub fn mutuallyInclusive(self: *const @This()) Error!void {
-            inline for (GroupMatch.mutuallyInclusive) |group| {
+        pub fn checkRequired(self: *const @This()) Error!void {
+            if (!self.fbset.allOf(Spec.GroupMatch.required)) return Error.MissingRequiredField;
+        }
+
+        pub fn checkMutuallyInclusive(self: *const @This()) Error!void {
+            inline for (Spec.GroupMatch.mutuallyInclusive) |group| {
                 if (!self.fbset.allOf(group)) return Error.MutuallyInclusiveConstraintNotMet;
             }
         }
 
-        pub fn mutuallyExclusive(self: *const @This()) Error!void {
-            inline for (GroupMatch.mutuallyExclusive) |group| {
+        pub fn checkMutuallyExclusive(self: *const @This()) Error!void {
+            inline for (Spec.GroupMatch.mutuallyExclusive) |group| {
                 if (!self.fbset.oneOf(group)) return Error.MutuallyExclusiveConstraintNotMet;
             }
         }
 
+        pub fn checkVerb(self: *const @This()) Error!void {
+            if (comptime Spec.GroupMatch.mandatoryVerb) {
+                if (!self.verb) return Error.MissingVerb;
+            }
+        }
+
         pub fn validate(self: *const @This()) Error!void {
-            try self.mutuallyExclusive();
-            try self.mutuallyInclusive();
-            try self.required();
+            try self.checkMutuallyExclusive();
+            try self.checkMutuallyInclusive();
+            try self.checkRequired();
+            try self.checkVerb();
         }
     };
 }
@@ -122,33 +145,52 @@ test "check required fields" {
         i4: ?i32 = null,
         i5: ?i32 = null,
         i6: ?i32 = null,
+        i7: ?i32 = null,
+        i8: ?i32 = null,
 
-        pub const GroupMatch = .{
-            .mutuallyInclusive = .{
-                .{ .i, .i2 },
-                .{ .i3, .i4 },
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .mutuallyInclusive = &.{
+                &.{ .i, .i2 },
+                &.{ .i3, .i4 },
             },
-            .mutuallyExclusive = .{
-                .{ .i5, .i6 },
+            .mutuallyExclusive = &.{
+                &.{ .i5, .i6 },
             },
-            .required = .{ .i, .i2 },
+            .required = &.{ .i7, .i8 },
+            .mandatoryVerb = true,
         };
     };
 
     var tracker = GroupTracker(Spec){};
-    tracker.parsed(.i);
-    try t.expectError(@TypeOf(tracker).Error.MissingRequiredField, tracker.required());
-    tracker.parsed(.i2);
-    try t.expectEqual({}, try tracker.required());
+    try t.expectError(@TypeOf(tracker).Error.MutuallyExclusiveConstraintNotMet, tracker.validate());
+    try t.expectError(@TypeOf(tracker).Error.MutuallyExclusiveConstraintNotMet, tracker.checkMutuallyExclusive());
+    tracker.parsed(.i5);
+    try t.expectEqual({}, try tracker.checkMutuallyExclusive());
+    const tracker1 = tracker;
+    tracker.parsed(.i6);
+    try t.expectError(@TypeOf(tracker).Error.MutuallyExclusiveConstraintNotMet, tracker.checkMutuallyExclusive());
+    tracker = tracker1;
 
-    try t.expectError(@TypeOf(tracker).Error.MutuallyInclusiveConstraintNotMet, tracker.mutuallyInclusive());
+    try t.expectError(@TypeOf(tracker).Error.MutuallyInclusiveConstraintNotMet, tracker.validate());
+    try t.expectError(@TypeOf(tracker).Error.MutuallyInclusiveConstraintNotMet, tracker.checkMutuallyInclusive());
+    tracker.parsed(.i);
+    tracker.parsed(.i2);
+    try t.expectError(@TypeOf(tracker).Error.MutuallyInclusiveConstraintNotMet, tracker.checkMutuallyInclusive());
     tracker.parsed(.i3);
     tracker.parsed(.i4);
-    try t.expectEqual({}, try tracker.mutuallyInclusive());
+    try t.expectEqual({}, try tracker.checkMutuallyInclusive());
 
-    try t.expectError(@TypeOf(tracker).Error.MutuallyExclusiveConstraintNotMet, tracker.mutuallyExclusive());
-    tracker.parsed(.i5);
-    try t.expectEqual({}, try tracker.mutuallyExclusive());
-    tracker.parsed(.i6);
-    try t.expectError(@TypeOf(tracker).Error.MutuallyExclusiveConstraintNotMet, tracker.mutuallyExclusive());
+    try t.expectError(@TypeOf(tracker).Error.MissingRequiredField, tracker.validate());
+    try t.expectError(@TypeOf(tracker).Error.MissingRequiredField, tracker.checkRequired());
+    tracker.parsed(.i7);
+    tracker.parsed(.i8);
+    try t.expectEqual({}, try tracker.checkRequired());
+
+    try t.expectError(@TypeOf(tracker).Error.MissingVerb, tracker.validate());
+    try t.expectError(@TypeOf(tracker).Error.MissingVerb, tracker.checkVerb());
+    tracker.parsedVerb();
+    try t.expectEqual({}, try tracker.checkVerb());
+    try t.expectEqual({}, try tracker.validate());
 }
+
+// TODO: test partial definitons

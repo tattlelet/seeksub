@@ -325,6 +325,8 @@ pub const AtDepthArrayTokenIterator = struct {
     }
 };
 
+// TODO: add simple test with no arena to test ownership
+
 fn tstCollectTokens(allocator: *const Allocator, slice: []const u8) ![]const []const u8 {
     var result = std.ArrayList([]const u8).init(allocator.*);
     var tokenizer = AtDepthArrayTokenIterator.init(slice);

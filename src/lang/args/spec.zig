@@ -5,6 +5,7 @@ const argIter = @import("iterator.zig");
 const argCodec = @import("codec.zig");
 const validate = @import("validate.zig");
 const GroupTracker = validate.GroupTracker;
+const GroupMatchConfig = validate.GroupMatchConfig;
 const Allocator = std.mem.Allocator;
 const FieldEnum = std.meta.FieldEnum;
 const TstArgCursor = argIter.TstArgCursor;
@@ -16,14 +17,13 @@ pub fn SpecResponse(comptime Spec: type) type {
     // TODO: optional error collection
     return struct {
         arena: std.heap.ArenaAllocator,
-        codec: *SpecCodec,
+        codec: SpecCodec,
         program: ?[]const u8,
-        // TODO: move const
         options: Options,
         // TODO: Move to tuple inside Spec, leverage codec
-        positionals: [][]const u8,
+        positionals: ?[][]const u8,
         verb: if (VerbT != void) ?VerbT else void,
-        groupMatch: if (GroupMatch != void) GroupMatch else void,
+        tracker: if (SpecTracker != void) SpecTracker else void,
 
         fn SpecUnionVerbs() type {
             const VerbUnion = @typeInfo(Spec.Verb).@"union";
@@ -36,55 +36,66 @@ pub fn SpecResponse(comptime Spec: type) type {
                     .alignment = @alignOf(newSpecR),
                 };
             }
-            const newUni: std.builtin.Type = .{ .@"union" = .{
-                .layout = VerbUnion.layout,
-                .tag_type = VerbUnion.tag_type,
-                .fields = &newUnionFields,
-                .decls = VerbUnion.decls,
-            } };
+            const newUni: std.builtin.Type = .{
+                .@"union" = .{
+                    .layout = VerbUnion.layout,
+                    .tag_type = VerbUnion.tag_type,
+                    .fields = &newUnionFields,
+                    .decls = VerbUnion.decls,
+                },
+            };
             return @Type(newUni);
+        }
+
+        fn SpecVerbsErrors() type {
+            comptime var errors = error{};
+            for (@typeInfo(SpecUnionVerbs()).@"union".fields) |field| {
+                errors = errors || meta.ptrTypeToChild(field.type).Error;
+            }
+            return errors;
         }
 
         const Options = Spec;
         const CursorT = coll.Cursor([]const u8);
+        // Inner union element is a ptr
         const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
         const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
-        const GroupMatch = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
+        const SpecTracker = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
         const SpecEnumFields = std.meta.FieldEnum(Spec);
 
-        const Error = error{
-            UnknownArgumentName,
-            InvalidArgumentToken,
-            MissingShorthandMetadata,
-            MissingShorthandLink,
-            UnknownShorthandName,
-            ArgEqualSplitMissingValue,
-            ArgEqualSplitNotConsumed,
-            CodecParseMethodUnavailable,
-        } ||
-            std.mem.Allocator.Error ||
-            SpecCodec.Error ||
-            // TODO: add errors from Verb
-            if (GroupMatch != void) GroupMatch.Error else error{};
+        // BUG: Custom codec errors can be bubbled up as shown
+        // here, however parseByType/Tag's design contaminates
+        // lower level implementations with custom errors
+        // because they may call the upper-level structure
+        pub const Error = E: {
+            var errors = error{
+                UnknownArgumentName,
+                InvalidArgumentToken,
+                MissingShorthandMetadata,
+                MissingShorthandLink,
+                UnknownShorthandName,
+                ArgEqualSplitMissingValue,
+                ArgEqualSplitNotConsumed,
+                CodecParseMethodUnavailable,
+            } ||
+                std.mem.Allocator.Error ||
+                SpecCodec.Error;
+            errors = errors || if (VerbT != void) SpecVerbsErrors() else error{};
+            errors = errors || if (SpecTracker != void) SpecTracker.Error else error{};
+            break :E errors;
+        };
 
-        pub fn init(allc: *const Allocator) !*@This() {
+        pub fn init(allc: *const Allocator) std.mem.Allocator.Error!*@This() {
             var arena = std.heap.ArenaAllocator.init(allc.*);
             const allocator = arena.allocator();
             var self = try allocator.create(@This());
             self.arena = arena;
-            self.codec = t: {
-                var c = SpecCodec{};
-                break :t &c;
-            };
-            self.options = Spec{};
+            self.codec = .{};
+            self.options = .{};
             self.program = null;
-            self.positionals = undefined;
-            if (comptime VerbT != void) {
-                self.verb = null;
-            }
-            if (comptime GroupMatch != void) {
-                self.groupMatch = .{};
-            }
+            self.positionals = null;
+            if (comptime VerbT != void) self.verb = null;
+            if (comptime SpecTracker != void) self.tracker = .{};
             return self;
         }
 
@@ -94,18 +105,15 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         fn parseInner(self: *@This(), cursor: *CursorT, comptime parseProgram: bool) Error!void {
-            const allocator = self.arena.allocator();
-
+            self.positionals = null;
             if (comptime parseProgram) {
-                self.program = if (cursor.next()) |program|
-                    program
-                else
-                    return;
+                self.program = cursor.next();
+                if (self.program == null) return;
             } else {
                 _ = cursor.peek() orelse return;
             }
 
-            var positionals = try std.ArrayList([]const u8).initCapacity(allocator, 4);
+            var positionals = try std.ArrayList([]const u8).initCapacity(self.arena.allocator(), 4);
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
                     try positionals.append("-");
@@ -127,15 +135,14 @@ pub fn SpecResponse(comptime Spec: type) type {
             while (cursor.next()) |item| {
                 try positionals.append(item);
             }
-            try self.parseVerb(&allocator, &positionals);
+            try self.parseVerb(&positionals);
             self.positionals = try positionals.toOwnedSlice();
 
-            if (comptime GroupMatch != void) try self.groupMatch.validate();
+            if (comptime SpecTracker != void) try self.tracker.validate();
         }
 
         fn parseVerb(
             self: *@This(),
-            allocator: *const Allocator,
             positionals: *std.ArrayList([]const u8),
         ) Error!void {
             if (comptime VerbT == void) return;
@@ -144,7 +151,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             const verbArg = positionals.items[0];
             inline for (@typeInfo(Spec.Verb).@"union".fields) |f| {
                 if (std.mem.eql(u8, f.name, verbArg)) {
-                    const verbR = try SpecResponse(f.type).init(allocator);
+                    const verbR = try SpecResponse(f.type).init(&self.arena.child_allocator);
 
                     const unmanaged = positionals.moveToUnmanaged();
                     var arrCursor = coll.ArrayCursor([]const u8).init(
@@ -156,10 +163,11 @@ pub fn SpecResponse(comptime Spec: type) type {
                         break :blk &c;
                     };
                     _ = &vCursor;
+
                     try verbR.parseInner(vCursor, false);
                     self.verb = @unionInit(VerbT, f.name, verbR);
-
-                    break;
+                    if (comptime SpecTracker != void) self.tracker.parsedVerb();
+                    return;
                 }
             }
         }
@@ -203,9 +211,10 @@ pub fn SpecResponse(comptime Spec: type) type {
                 ret: inline for (std.meta.fields(@TypeOf(Spec.Short))) |s| {
                     if (std.mem.eql(u8, s.name, arg[start..end])) {
                         const tag = s.defaultValue() orelse return Error.MissingShorthandLink;
-                        var vCursor = if (end == arg.len) cursor else noneCursor;
-                        _ = &vCursor;
-                        try self.namedArg(tag, vCursor);
+                        try self.namedArg(
+                            tag,
+                            if (end == arg.len) cursor else noneCursor,
+                        );
                         start = end;
                         break :ret;
                     }
@@ -213,10 +222,13 @@ pub fn SpecResponse(comptime Spec: type) type {
                     return Error.UnknownShorthandName;
                 }
 
-                if (start == end and end == arg.len) return else if (end - start == 0)
-                    end = @min(end + 2, arg.len)
-                else
+                if (start == end and end == arg.len) {
+                    return;
+                } else if (end - start == 0) {
+                    end = @min(end + 2, arg.len);
+                } else {
                     end -= 1;
+                }
             }
         }
 
@@ -231,14 +243,13 @@ pub fn SpecResponse(comptime Spec: type) type {
                         .{ @typeName(Spec), f.name },
                     )));
 
-                    var allocator = self.arena.allocator();
                     @field(self.options, f.name) = try self.codec.parseByTag(
                         spectag,
-                        &allocator,
+                        &self.arena.allocator(),
                         cursor,
                     );
 
-                    if (comptime GroupMatch != void) self.groupMatch.parsed(spectag);
+                    if (comptime SpecTracker != void) self.tracker.parsed(spectag);
                     return;
                 }
             } else {
@@ -247,6 +258,11 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         pub fn deinit(self: *const @This()) void {
+            if (comptime VerbT != void) {
+                if (self.verb) |verbUnion| switch (verbUnion) {
+                    inline else => |verb| verb.deinit(),
+                };
+            }
             self.arena.deinit();
         }
     };
@@ -532,7 +548,12 @@ test "parse verb" {
             copy: Copy,
             paste: Paste,
         };
+
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .mandatoryVerb = true,
+        };
     };
+    try std.testing.expectError(GroupTracker(Spec).Error.MissingVerb, tstParse(allocator, "program", Spec));
     const r1 = try tstParse(allocator, "program copy --src file1", Spec);
     defer r1.deinit();
     const r2 = try tstParse(allocator, "program paste --target file2", Spec);
@@ -696,6 +717,9 @@ test "parse verb with custom codec" {
                 innerCodec: CodecIn = .{},
 
                 pub const CodecIn = argCodec.ArgCodec(Spc);
+                // pub const Error = error{
+                //     UnsupportedPathInFileName,
+                // } || CodecIn.Error;
                 pub const Error = CodecIn.Error;
 
                 pub fn supports(
@@ -740,6 +764,8 @@ test "parse verb with custom codec" {
                 ) Error!Tx {
                     _ = self;
                     const file = try PrimitiveCodec.parseString(Tx, allc, crsor);
+                    // if (std.mem.indexOf(u8, file, "/") == null) return Error.UnsupportedPathInFileName;
+
                     var fullPath = try allc.alloc(u8, 19 + file.len);
                     _ = &fullPath;
                     var buff: [*]u8 = @as([*]u8, @ptrCast(fullPath));
@@ -796,17 +822,50 @@ test "validate require" {
             i5: ?i32 = null,
             i6: ?i32 = null,
 
-            pub const GroupMatch = .{
-                .mutuallyInclusive = .{
-                    .{ .i3, .i4 },
+            pub const GroupMatch: GroupMatchConfig(@This()) = .{
+                .mutuallyInclusive = &.{
+                    &.{ .i3, .i4 },
                 },
-                .mutuallyExclusive = .{
-                    .{ .i5, .i6 },
+                .mutuallyExclusive = &.{
+                    &.{ .i5, .i6 },
                 },
-                .required = .{ .i, .i2 },
+                .required = &.{ .i, .i2 },
             };
         },
     );
     defer r.deinit();
     try t.expectEqualStrings("program", r.program.?);
+}
+
+test "parsed spec cleanup with verb" {
+    const allocator = &std.testing.allocator;
+
+    var tstCursor = try TstArgCursor.init(allocator,
+        \\program
+        \\--verbose
+        \\copy
+        \\--src "file1"
+    );
+    defer tstCursor.deinit();
+    var cursor = t: {
+        var c = tstCursor.asCursor();
+        break :t &c;
+    };
+    _ = &cursor;
+
+    const Spec = struct {
+        verbose: ?bool = null,
+
+        pub const Copy = struct {
+            // sentinels are cloned
+            src: ?[:0]const u8 = null,
+        };
+
+        pub const Verb = union(enum) {
+            copy: Copy,
+        };
+    };
+
+    const r1 = try tstParseSpec(allocator, cursor, Spec);
+    defer r1.deinit();
 }
