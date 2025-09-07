@@ -52,7 +52,7 @@ pub const PrimitiveCodec = struct {
         comptime tag: anytype,
         allocator: *const Allocator,
         cursor: *CursorT,
-    ) Error!T {
+    ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
         if (comptime meta.ptrTypeToChild(@TypeOf(codec)).supports(T, tag)) {
             return try codec.parseByType(T, tag, allocator, cursor);
         }
@@ -90,7 +90,7 @@ pub const PrimitiveCodec = struct {
         comptime tag: anytype,
         allocator: *const Allocator,
         cursor: *CursorT,
-    ) Error!T {
+    ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
         comptime validateType(T, .pointer);
         const PtrT = comptime @typeInfo(T).pointer;
         const ArrayT = comptime PtrT.child;
@@ -123,7 +123,7 @@ pub const PrimitiveCodec = struct {
         comptime tag: anytype,
         allocator: *const Allocator,
         cursor: *CursorT,
-    ) Error!T {
+    ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
         comptime validateType(T, .optional);
         const Tt = comptime @typeInfo(T).optional.child;
 
@@ -246,7 +246,7 @@ pub fn ArgCodec(Spec: type) type {
             comptime tag: SpecFieldEnum,
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) Error!T {
+        ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
             return try switch (@typeInfo(T)) {
                 .bool => @This().parseFlag(cursor),
                 .optional => |opt| switch (@typeInfo(opt.child)) {
@@ -262,7 +262,7 @@ pub fn ArgCodec(Spec: type) type {
             comptime tag: std.meta.FieldEnum(Spec),
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) Error!@FieldType(Spec, @tagName(tag)) {
+        ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!@FieldType(Spec, @tagName(tag)) {
             const tagT = comptime @FieldType(Spec, @tagName(tag));
             if (comptime @typeInfo(tagT).optional.child == bool)
                 if (PrimitiveCodec.isNull(cursor)) {

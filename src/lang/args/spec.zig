@@ -63,10 +63,6 @@ pub fn SpecResponse(comptime Spec: type) type {
         const SpecTracker = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
         const SpecEnumFields = std.meta.FieldEnum(Spec);
 
-        // BUG: Custom codec errors can be bubbled up as shown
-        // here, however parseByType/Tag's design contaminates
-        // lower level implementations with custom errors
-        // because they may call the upper-level structure
         pub const Error = E: {
             var errors = error{
                 UnknownArgumentName,
@@ -717,10 +713,10 @@ test "parse verb with custom codec" {
                 innerCodec: CodecIn = .{},
 
                 pub const CodecIn = argCodec.ArgCodec(Spc);
-                // pub const Error = error{
-                //     UnsupportedPathInFileName,
-                // } || CodecIn.Error;
-                pub const Error = CodecIn.Error;
+                pub const Error = error{
+                    UnsupportedPathInFileName,
+                } || CodecIn.Error;
+                // pub const Error = CodecIn.Error;
 
                 pub fn supports(
                     comptime Tx: type,
@@ -764,7 +760,7 @@ test "parse verb with custom codec" {
                 ) Error!Tx {
                     _ = self;
                     const file = try PrimitiveCodec.parseString(Tx, allc, crsor);
-                    // if (std.mem.indexOf(u8, file, "/") == null) return Error.UnsupportedPathInFileName;
+                    if (std.mem.indexOf(u8, file, "/") != null) return Error.UnsupportedPathInFileName;
 
                     var fullPath = try allc.alloc(u8, 19 + file.len);
                     _ = &fullPath;
@@ -795,6 +791,11 @@ test "parse verb with custom codec" {
     try std.testing.expectEqualStrings(
         "~/.config/file/file1.png",
         r1.verb.?.paste.options.target.?,
+    );
+
+    try std.testing.expectError(
+        Spec.Paste.Codec.Error.UnsupportedPathInFileName,
+        tstParse(allocator, "program paste --target /file1", Spec),
     );
 }
 
