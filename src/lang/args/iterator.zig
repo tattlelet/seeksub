@@ -62,7 +62,7 @@ test "arg cursor peek with stackItem" {
     try std.testing.expectEqualStrings("Hello", cursor.peek().?);
 }
 
-pub const AtDepthArrayTokenIterator = struct {
+pub const AtDepthArrayTokenizer = struct {
     i: usize,
     slice: []const u8,
     state: State,
@@ -325,11 +325,18 @@ pub const AtDepthArrayTokenIterator = struct {
     }
 };
 
-// TODO: add simple test with no arena to test ownership
+test "simple array iterator" {
+    const t = std.testing;
+    var iterator = AtDepthArrayTokenizer.init("[1,2,3]");
+    try t.expectEqualStrings("1", (try iterator.next()).?);
+    try t.expectEqualStrings("2", (try iterator.next()).?);
+    try t.expectEqualStrings("3", (try iterator.next()).?);
+    try t.expectEqual(null, try iterator.next());
+}
 
 fn tstCollectTokens(allocator: *const Allocator, slice: []const u8) ![]const []const u8 {
     var result = std.ArrayList([]const u8).init(allocator.*);
-    var tokenizer = AtDepthArrayTokenIterator.init(slice);
+    var tokenizer = AtDepthArrayTokenizer.init(slice);
 
     while (try tokenizer.next()) |item| {
         try result.append(item);
@@ -340,7 +347,7 @@ fn tstCollectTokens(allocator: *const Allocator, slice: []const u8) ![]const []c
 
 test "Depth 1 Array tokenizer (non-string)" {
     const t = std.testing;
-    const E = AtDepthArrayTokenIterator.Error;
+    const E = AtDepthArrayTokenizer.Error;
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
@@ -498,7 +505,7 @@ test "Depth 1 Array tokenizer (non-string)" {
 
 test "Depth 2+ Array tokenizer (non-string)" {
     const t = std.testing;
-    const E = AtDepthArrayTokenIterator.Error;
+    const E = AtDepthArrayTokenizer.Error;
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
@@ -614,7 +621,7 @@ test "Depth 2+ Array tokenizer (non-string)" {
 
 test "Depth 1 Array tokenizer (strings)" {
     const t = std.testing;
-    const E = AtDepthArrayTokenIterator.Error;
+    const E = AtDepthArrayTokenizer.Error;
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
@@ -728,7 +735,7 @@ test "Depth 2+ Array tokenizer (strings)" {
 
 test "Any depth any match tricky cases" {
     const t = std.testing;
-    const E = AtDepthArrayTokenIterator.Error;
+    const E = AtDepthArrayTokenizer.Error;
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();

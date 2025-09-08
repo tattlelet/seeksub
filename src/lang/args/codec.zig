@@ -4,9 +4,91 @@ const meta = @import("../meta.zig");
 const argIter = @import("iterator.zig");
 const Allocator = std.mem.Allocator;
 const FieldEnum = std.meta.FieldEnum;
-const AtDepthArrayTokenIterator = argIter.AtDepthArrayTokenIterator;
+const AtDepthArrayTokenizer = argIter.AtDepthArrayTokenizer;
 const TstArgCursor = argIter.TstArgCursor;
 
+pub fn ensureTypeTag(comptime T: type, comptime tag: @Type(.enum_literal)) void {
+    comptime if (@typeInfo(T) != tag) @compileError(std.fmt.comptimePrint(
+        "Type given to parse method is not {s}, it is {s}",
+        .{
+            @tagName(tag),
+            @typeName(T),
+        },
+    ));
+}
+
+pub fn ensureType(
+    comptime T: type,
+    comptime OtherT: type,
+) void {
+    comptime if (T != OtherT) @compileError(std.fmt.comptimePrint(
+        "Expected type {s} found {s}",
+        .{ @typeName(T), @typeName(OtherT) },
+    ));
+}
+
+pub fn ensureCodec(comptime PtrT: type) void {
+    const T = meta.ptrTypeToChild(PtrT);
+    comptime ensureTypeTag(T, .@"struct");
+    comptime if (!std.meta.hasMethod(T, "supports")) @compileError(std.fmt.comptimePrint(
+        "Type {s} is not a codec - it's missing supports method",
+        .{@typeName(T)},
+    ));
+
+    // Check supports fn
+    const supportsFn = @typeInfo(@TypeOf(@field(T, "supports")));
+    const supportsParams = supportsFn.@"fn".params;
+    comptime if (supportsParams.len != 2) @compileError(std.fmt.comptimePrint(
+        "Signature mismatch for Codec.supports on type {s}",
+        .{@typeName(T)},
+    ));
+    comptime if (@typeInfo(supportsParams[0].type.?) != .type) @compileError(std.fmt.comptimePrint(
+        "Codec - {s}: supports param [0] is not type",
+        .{@typeName(T)},
+    ));
+    comptime if (@typeInfo(supportsParams[1].type.?) != .@"enum") @compileError(std.fmt.comptimePrint(
+        "Codec - {s}: supports param [1] is not an enum",
+        .{@typeName(T)},
+    ));
+    comptime if (@typeInfo(supportsFn.@"fn".return_type.?) != .bool) @compileError(std.fmt.comptimePrint(
+        "Codec - {s}: supports return is not bool",
+        .{@typeName(T)},
+    ));
+
+    // Check parseByType
+    comptime if (!std.meta.hasMethod(T, "parseByType")) @compileError(std.fmt.comptimePrint(
+        "Type {s} is not a codec. It's missing parseBytype method",
+        .{@typeName(T)},
+    ));
+    const parseByTypeFn = @typeInfo(@TypeOf(@field(T, "parseByType")));
+    const parseByTypeParams = parseByTypeFn.@"fn".params;
+    comptime if (parseByTypeParams.len != 5) @compileError(std.fmt.comptimePrint(
+        "Signature mismatch for Codec.parseByType on type {s}",
+        .{@typeName(T)},
+    ));
+    comptime if (!(parseByTypeParams[0].is_generic and parseByTypeParams[0].type == null) and !(parseByTypeParams[0].type.? == *T)) @compileError(std.fmt.comptimePrint(
+        "Codec - {s}: parseByType param [0] is not generic (anytype) or of *Codec",
+        .{@typeName(T)},
+    ));
+    comptime if (@typeInfo(parseByTypeParams[1].type.?) != .type) @compileError(std.fmt.comptimePrint(
+        "Codec - {s}: parseByType param [1] is not type",
+        .{@typeName(T)},
+    ));
+    comptime if (@typeInfo(parseByTypeParams[2].type.?) != .@"enum") @compileError(std.fmt.comptimePrint(
+        "Codec - {s}: parseByType param [2] is not an enum",
+        .{@typeName(T)},
+    ));
+    comptime if (parseByTypeParams[3].type.? != *const Allocator) @compileError(std.fmt.comptimePrint(
+        "Codec - {s}: parseByType param [3] is not *const Allocator",
+        .{@typeName(T)},
+    ));
+    comptime if (parseByTypeParams[4].type.? != *coll.Cursor([]const u8)) @compileError(std.fmt.comptimePrint(
+        "Codec - {s}: parseByType param [4] is not *coll.Cursor([]const u8)",
+        .{@typeName(T)},
+    ));
+}
+
+// Tag is passed around but never used by this codec
 pub const PrimitiveCodec = struct {
     pub const Error = error{
         ParseArrayEndOfIterator,
@@ -19,32 +101,12 @@ pub const PrimitiveCodec = struct {
         InvalidEnum,
         InvalidBoolLiteral,
     } ||
-        AtDepthArrayTokenIterator.Error ||
+        AtDepthArrayTokenizer.Error ||
         std.fmt.ParseIntError ||
         std.fmt.ParseFloatError ||
         std.mem.Allocator.Error;
 
     pub const CursorT = coll.Cursor([]const u8);
-
-    pub fn validateType(comptime T: type, comptime tag: @Type(.enum_literal)) void {
-        comptime if (@typeInfo(T) != tag) @compileError(std.fmt.comptimePrint(
-            "Type given to parse method is not {s}, it is {s}",
-            .{
-                @tagName(tag),
-                @typeName(T),
-            },
-        ));
-    }
-
-    pub fn validateConcreteType(
-        comptime T: type,
-        comptime OtherT: type,
-    ) void {
-        comptime if (T != OtherT) @compileError(std.fmt.comptimePrint("Expected type {s} found {s}", .{
-            @typeName(T),
-            @typeName(OtherT),
-        }));
-    }
 
     pub fn parseByType(
         codec: anytype,
@@ -53,6 +115,7 @@ pub const PrimitiveCodec = struct {
         allocator: *const Allocator,
         cursor: *CursorT,
     ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
+        comptime ensureCodec(@TypeOf(codec));
         if (comptime meta.ptrTypeToChild(@TypeOf(codec)).supports(T, tag)) {
             return try codec.parseByType(T, tag, allocator, cursor);
         }
@@ -91,14 +154,14 @@ pub const PrimitiveCodec = struct {
         allocator: *const Allocator,
         cursor: *CursorT,
     ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
-        comptime validateType(T, .pointer);
+        comptime ensureTypeTag(T, .pointer);
         const PtrT = comptime @typeInfo(T).pointer;
         const ArrayT = comptime PtrT.child;
         var array = try std.ArrayList(ArrayT).initCapacity(allocator.*, 3);
         errdefer array.deinit();
 
         const slice = cursor.next() orelse return Error.ParseArrayEndOfIterator;
-        var arrTokenizer = AtDepthArrayTokenIterator.init(slice);
+        var arrTokenizer = AtDepthArrayTokenizer.init(slice);
         while (try arrTokenizer.next()) |token| {
             cursor.stackItem(token);
             try array.append(try parseByType(codec, ArrayT, tag, allocator, cursor));
@@ -124,7 +187,7 @@ pub const PrimitiveCodec = struct {
         allocator: *const Allocator,
         cursor: *CursorT,
     ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
-        comptime validateType(T, .optional);
+        comptime ensureTypeTag(T, .optional);
         const Tt = comptime @typeInfo(T).optional.child;
 
         _ = cursor.peek() orelse return Error.ParseOptEndOfIterator;
@@ -141,10 +204,10 @@ pub const PrimitiveCodec = struct {
         allocator: *const Allocator,
         cursor: *CursorT,
     ) Error!T {
-        comptime validateType(T, .pointer);
+        comptime ensureTypeTag(T, .pointer);
         const PtrType = comptime @typeInfo(T).pointer;
         const Tt = comptime std.meta.Child(T);
-        comptime validateConcreteType(Tt, u8);
+        comptime ensureType(Tt, u8);
 
         const s = cursor.next() orelse return Error.ParseStringEndOfIterator;
         if (comptime PtrType.sentinel()) |sentinel| {
@@ -160,19 +223,19 @@ pub const PrimitiveCodec = struct {
         comptime T: type,
         cursor: *CursorT,
     ) Error!T {
-        comptime validateType(T, .@"enum");
+        comptime ensureTypeTag(T, .@"enum");
         const value = cursor.next() orelse return Error.ParseEnumEndOfIterator;
         return std.meta.stringToEnum(T, value) orelse Error.InvalidEnum;
     }
 
     pub fn parseFloat(comptime T: type, cursor: *CursorT) Error!T {
-        comptime validateType(T, .float);
+        comptime ensureTypeTag(T, .float);
         const value = cursor.next() orelse return Error.ParseFloatEndOfIterator;
         return try std.fmt.parseFloat(T, value);
     }
 
     pub fn parseInt(comptime T: type, cursor: *CursorT) Error!T {
-        comptime validateType(T, .int);
+        comptime ensureTypeTag(T, .int);
         const value = cursor.next() orelse return Error.ParseIntEndOfIterator;
         return try std.fmt.parseInt(T, value, 10);
     }
@@ -209,6 +272,7 @@ test "default codec parseBool" {
     );
 }
 
+// Tag is only used to ensure ?bool and bool are parsed as flags
 pub fn ArgCodec(Spec: type) type {
     return struct {
         pub const Error = PrimitiveCodec.Error;
@@ -219,13 +283,16 @@ pub fn ArgCodec(Spec: type) type {
             comptime T: type,
             comptime tag: SpecFieldEnum,
         ) bool {
+            // ?bool and bool parse as flag, any other bool-ending type
+            // ends up parsed by requiring a bool param
             const FieldType = comptime @FieldType(Spec, @tagName(tag));
-            return switch (@typeInfo(T)) {
-                .bool => FieldType == ?bool or FieldType == bool,
+            return comptime switch (@typeInfo(T)) {
+                .bool, .optional => FieldType == ?bool or FieldType == bool,
                 else => false,
             };
         }
 
+        // TODO: remove parse by tag
         pub fn parseByTag(
             self: *@This(),
             comptime tag: SpecFieldEnum,
@@ -240,6 +307,8 @@ pub fn ArgCodec(Spec: type) type {
             );
         }
 
+        // This method can be used in a mixin style to handle flags
+        // for custom codecs
         pub fn parseByType(
             codec: anytype,
             comptime T: type,
@@ -247,13 +316,18 @@ pub fn ArgCodec(Spec: type) type {
             allocator: *const Allocator,
             cursor: *CursorT,
         ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
+            comptime ensureCodec(@TypeOf(codec));
+            if (comptime !supports(T, tag)) {
+                return try PrimitiveCodec.parseByType(codec, T, tag, allocator, cursor);
+            }
+
             return try switch (@typeInfo(T)) {
                 .bool => @This().parseFlag(cursor),
                 .optional => |opt| switch (@typeInfo(opt.child)) {
                     .bool => @This().parseOpt(codec, tag, allocator, cursor),
-                    else => PrimitiveCodec.parseByType(codec, T, tag, allocator, cursor),
+                    else => unreachable,
                 },
-                else => PrimitiveCodec.parseByType(codec, T, tag, allocator, cursor),
+                else => unreachable,
             };
         }
 
@@ -264,6 +338,8 @@ pub fn ArgCodec(Spec: type) type {
             cursor: *CursorT,
         ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!@FieldType(Spec, @tagName(tag)) {
             const tagT = comptime @FieldType(Spec, @tagName(tag));
+            comptime ensureTypeTag(tagT, .optional);
+
             if (comptime @typeInfo(tagT).optional.child == bool)
                 if (PrimitiveCodec.isNull(cursor)) {
                     cursor.consume();
@@ -302,7 +378,25 @@ pub fn ArgCodec(Spec: type) type {
     };
 }
 
-// TODO: add test with no arena to test ownership for array and string
+test "codec parseArray caller ownership" {
+    const allocator = &std.testing.allocator;
+    var tstCursor = try TstArgCursor.init(allocator, "\"[false, true]\"");
+    defer tstCursor.deinit();
+
+    var cursor = @constCast(&tstCursor.asCursor());
+    _ = &cursor;
+
+    const Spec = struct {
+        b: []const bool,
+    };
+    var codec = ArgCodec(Spec){};
+    const expectBA: []const bool = &.{ false, true };
+    const boolArray = try codec.parseByTag(.b, allocator, cursor);
+    // Ownership belongs to caller
+    defer allocator.free(boolArray);
+
+    try std.testing.expectEqualDeep(expectBA, boolArray);
+}
 
 test "codec parseArray" {
     const baseAllocator = std.testing.allocator;
@@ -434,6 +528,43 @@ test "codec parseString" {
         @TypeOf(codec).Error.ParseStringEndOfIterator,
         codec.parseByTag(.s2, allocator, cursor),
     );
+}
+
+test "codec parseString caller ownership" {
+    const allocator = &std.testing.allocator;
+    var tstCursor = try TstArgCursor.init(allocator, "Hello");
+    defer tstCursor.deinit();
+
+    var cursor = @constCast(&tstCursor.asCursor());
+    _ = &cursor;
+
+    const Spec = struct {
+        // Only sentinels are copied
+        s: [:0]const u8,
+    };
+    var codec = ArgCodec(Spec){};
+    const s = try codec.parseByTag(.s, allocator, cursor);
+    // Ownership belongs to caller
+    defer allocator.free(s);
+
+    try std.testing.expectEqualDeep("Hello", s);
+}
+
+test "codec parseString 0 copy for slice" {
+    const allocator = &std.testing.allocator;
+    var tstCursor = try TstArgCursor.init(allocator, "Hello");
+    defer tstCursor.deinit();
+
+    var cursor = @constCast(&tstCursor.asCursor());
+    _ = &cursor;
+
+    const Spec = struct {
+        s: []const u8,
+    };
+    var codec = ArgCodec(Spec){};
+    const s = try codec.parseByTag(.s, allocator, cursor);
+
+    try std.testing.expectEqualDeep("Hello", s);
 }
 
 test "codec parseEnum" {

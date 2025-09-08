@@ -629,13 +629,19 @@ test "parse with custom codec" {
                 allc: *const Allocator,
                 crsor: *CodecIn.CursorT,
             ) Error!Tx {
+                if (comptime !supports(Tx, tag)) {
+                    return try CodecIn.parseByType(self, Tx, tag, allc, crsor);
+                }
+
                 return try switch (@typeInfo(Tx)) {
                     .int => switch (tag) {
                         .arf => self.parseSumAll(Tx, tag, allc, crsor),
                         .i => self.parseIntX2(Tx, crsor),
+                        // forces inner-codec behaviour rather than self for ints other than
+                        // .arf and .i
                         else => self.innerCodec.parseByType(Tx, tag, allc, crsor),
                     },
-                    else => CodecIn.parseByType(self, Tx, tag, allc, crsor),
+                    else => unreachable,
                 };
             }
 
@@ -659,7 +665,8 @@ test "parse with custom codec" {
                 cursor: *CodecIn.CursorT,
             ) Error!Tx {
                 var r: Tx = 0;
-                const arr = (try self.innerCodec.parseByType(
+                const arr = (try PrimitiveCodec.parseArray(
+                    &self.innerCodec,
                     []const Tx,
                     tag,
                     allc,
@@ -716,7 +723,6 @@ test "parse verb with custom codec" {
                 pub const Error = error{
                     UnsupportedPathInFileName,
                 } || CodecIn.Error;
-                // pub const Error = CodecIn.Error;
 
                 pub fn supports(
                     comptime Tx: type,
@@ -742,13 +748,17 @@ test "parse verb with custom codec" {
                     allc: *const Allocator,
                     crsor: *CodecIn.CursorT,
                 ) Error!Tx {
+                    if (comptime !supports(Tx, tag)) {
+                        return try CodecIn.parseByType(self, Tx, tag, allc, crsor);
+                    }
+
                     return try switch (@typeInfo(Tx)) {
                         .pointer => |ptr| if (ptr.child == u8 and tag == .target) self.parsePath(
                             Tx,
                             allc,
                             crsor,
-                        ) else CodecIn.parseByType(self, Tx, tag, allc, crsor),
-                        else => CodecIn.parseByType(self, Tx, tag, allc, crsor),
+                        ) else unreachable,
+                        else => unreachable,
                     };
                 }
 
