@@ -154,13 +154,8 @@ pub fn SpecResponse(comptime Spec: type) type {
                         unmanaged.items,
                         1,
                     );
-                    var vCursor = blk: {
-                        var c = arrCursor.asCursor();
-                        break :blk &c;
-                    };
-                    _ = &vCursor;
-
-                    try verbR.parseInner(vCursor, false);
+                    var vCursor = arrCursor.asCursor();
+                    try verbR.parseInner(&vCursor, false);
                     self.verb = @unionInit(VerbT, f.name, verbR);
                     if (comptime SpecTracker != void) self.tracker.parsedVerb();
                     return;
@@ -198,18 +193,14 @@ pub fn SpecResponse(comptime Spec: type) type {
 
             var start: usize = 0;
             var end: usize = @min(2, arg.len);
-            var noneCursor = blk: {
-                var c = coll.UnitCursor([]const u8).asNoneCursor();
-                break :blk &c;
-            };
-            _ = &noneCursor;
+            var noneCursor = coll.UnitCursor([]const u8).asNoneCursor();
             while (end <= arg.len) {
                 ret: inline for (std.meta.fields(@TypeOf(Spec.Short))) |s| {
                     if (std.mem.eql(u8, s.name, arg[start..end])) {
                         const tag = s.defaultValue() orelse return Error.MissingShorthandLink;
                         try self.namedArg(
                             tag,
-                            if (end == arg.len) cursor else noneCursor,
+                            if (end == arg.len) cursor else &noneCursor,
                         );
                         start = end;
                         break :ret;
@@ -234,18 +225,19 @@ pub fn SpecResponse(comptime Spec: type) type {
 
             inline for (fields) |f| {
                 if (std.mem.eql(u8, f.name, arg)) {
-                    const spectag = comptime (meta.stringToEnum(SpecEnumFields, f.name) orelse @compileError(std.fmt.comptimePrint(
+                    const tag = comptime (meta.stringToEnum(SpecEnumFields, f.name) orelse @compileError(std.fmt.comptimePrint(
                         "Spec: {s}, Field: {s} - could no translate field to tag",
                         .{ @typeName(Spec), f.name },
                     )));
 
-                    @field(self.options, f.name) = try self.codec.parseByTag(
-                        spectag,
+                    @field(self.options, f.name) = try self.codec.parseByType(
+                        @FieldType(Spec, @tagName(tag)),
+                        tag,
                         &self.arena.allocator(),
                         cursor,
                     );
 
-                    if (comptime SpecTracker != void) self.tracker.parsed(spectag);
+                    if (comptime SpecTracker != void) self.tracker.parsed(tag);
                     return;
                 }
             } else {
@@ -273,12 +265,8 @@ pub fn tstParseSpec(allocator: *const Allocator, cursor: *coll.Cursor([]const u8
 
 fn tstParse(allocator: *const Allocator, data: [:0]const u8, Spec: type) !*const SpecResponse(Spec) {
     var tstCursor = try TstArgCursor.init(allocator, data);
-    var cursor = t: {
-        var c = tstCursor.asCursor();
-        break :t &c;
-    };
-    _ = &cursor;
-    return try tstParseSpec(allocator, cursor, Spec);
+    var cursor = tstCursor.asCursor();
+    return try tstParseSpec(allocator, &cursor, Spec);
 }
 
 test "empty args with default" {
@@ -612,16 +600,6 @@ test "parse with custom codec" {
                 };
             }
 
-            pub fn parseByTag(
-                self: *@This(),
-                comptime tag: SpecFieldEnum,
-                allc: *const Allocator,
-                crsor: *CodecIn.CursorT,
-            ) Error!@FieldType(Spc, @tagName(tag)) {
-                const Tx = @FieldType(Spc, @tagName(tag));
-                return try self.parseByType(Tx, tag, allc, crsor);
-            }
-
             pub fn parseByType(
                 self: *@This(),
                 comptime Tx: type,
@@ -731,16 +709,6 @@ test "parse verb with custom codec" {
                     return tag == .target and Tx == []const u8;
                 }
 
-                pub fn parseByTag(
-                    self: *@This(),
-                    comptime tag: SpecFieldEnum,
-                    allc: *const Allocator,
-                    crsor: *CodecIn.CursorT,
-                ) Error!@FieldType(Spc, @tagName(tag)) {
-                    const Tx = @FieldType(Spc, @tagName(tag));
-                    return try self.parseByType(Tx, tag, allc, crsor);
-                }
-
                 pub fn parseByType(
                     self: *@This(),
                     comptime Tx: type,
@@ -807,6 +775,17 @@ test "parse verb with custom codec" {
         Spec.Paste.Codec.Error.UnsupportedPathInFileName,
         tstParse(allocator, "program paste --target /file1", Spec),
     );
+
+    const r2 = try tstParse(
+        allocator,
+        "program copy --src file1",
+        Spec,
+    );
+    defer r2.deinit();
+    try std.testing.expectEqualStrings(
+        "file1",
+        r2.verb.?.copy.options.src.?,
+    );
 }
 
 test "validate require" {
@@ -858,12 +837,7 @@ test "parsed spec cleanup with verb" {
         \\--src "file1"
     );
     defer tstCursor.deinit();
-    var cursor = t: {
-        var c = tstCursor.asCursor();
-        break :t &c;
-    };
-    _ = &cursor;
-
+    var cursor = tstCursor.asCursor();
     const Spec = struct {
         verbose: ?bool = null,
 
@@ -877,6 +851,6 @@ test "parsed spec cleanup with verb" {
         };
     };
 
-    const r1 = try tstParseSpec(allocator, cursor, Spec);
+    const r1 = try tstParseSpec(allocator, &cursor, Spec);
     defer r1.deinit();
 }

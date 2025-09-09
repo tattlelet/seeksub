@@ -261,14 +261,13 @@ test "default codec parseBool" {
         \\false
     );
     defer tstCursor.deinit();
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
-    try std.testing.expectEqual(true, try PrimitiveCodec.parseBool(cursor));
-    try std.testing.expectEqual(false, try PrimitiveCodec.parseBool(cursor));
+    try std.testing.expectEqual(true, try PrimitiveCodec.parseBool(&cursor));
+    try std.testing.expectEqual(false, try PrimitiveCodec.parseBool(&cursor));
     try std.testing.expectError(
         PrimitiveCodec.Error.ParseBoolEndOfIterator,
-        PrimitiveCodec.parseBool(cursor),
+        PrimitiveCodec.parseBool(&cursor),
     );
 }
 
@@ -292,8 +291,8 @@ pub fn ArgCodec(Spec: type) type {
             };
         }
 
-        // TODO: remove parse by tag
-        pub fn parseByTag(
+        // Test method
+        fn parseByTag(
             self: *@This(),
             comptime tag: SpecFieldEnum,
             allocator: *const Allocator,
@@ -382,16 +381,14 @@ test "codec parseArray caller ownership" {
     const allocator = &std.testing.allocator;
     var tstCursor = try TstArgCursor.init(allocator, "\"[false, true]\"");
     defer tstCursor.deinit();
-
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     const Spec = struct {
         b: []const bool,
     };
     var codec = ArgCodec(Spec){};
     const expectBA: []const bool = &.{ false, true };
-    const boolArray = try codec.parseByTag(.b, allocator, cursor);
+    const boolArray = try codec.parseByTag(.b, allocator, &cursor);
     // Ownership belongs to caller
     defer allocator.free(boolArray);
 
@@ -416,8 +413,7 @@ test "codec parseArray" {
         \\"[[false, null], null]"
     );
     defer tstCursor.deinit();
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     const Spec = struct {
         b: []const bool,
@@ -437,31 +433,31 @@ test "codec parseArray" {
             large,
         };
     };
-    const C = ArgCodec(Spec);
-    var codec = C{};
+    var codec = ArgCodec(Spec){};
+
     const expectBA: []const bool = &.{ false, true };
-    try std.testing.expectEqualDeep(expectBA, try codec.parseByTag(.b, allocator, cursor));
+    try std.testing.expectEqualDeep(expectBA, try codec.parseByTag(.b, allocator, &cursor));
     const expectIA: []const i32 = &.{ 1, -1 };
-    try std.testing.expectEqualDeep(expectIA, try codec.parseByTag(.i, allocator, cursor));
+    try std.testing.expectEqualDeep(expectIA, try codec.parseByTag(.i, allocator, &cursor));
     const expectFA: []const f32 = &.{ 1.1, -2.2 };
-    try std.testing.expectEqualDeep(expectFA, try codec.parseByTag(.f, allocator, cursor));
+    try std.testing.expectEqualDeep(expectFA, try codec.parseByTag(.f, allocator, &cursor));
     const expectSA: []const []const u8 = &.{ "a", "b" };
-    try std.testing.expectEqualDeep(expectSA, try codec.parseByTag(.s, allocator, cursor));
+    try std.testing.expectEqualDeep(expectSA, try codec.parseByTag(.s, allocator, &cursor));
     const expectSZ: []const [:0]const u8 = &.{ "c", "d" };
-    try std.testing.expectEqualDeep(expectSZ, try codec.parseByTag(.sz, allocator, cursor));
+    try std.testing.expectEqualDeep(expectSZ, try codec.parseByTag(.sz, allocator, &cursor));
     const expectAD: []const [:0]const i32 = &.{&.{3}};
-    try std.testing.expectEqualDeep(expectAD, try codec.parseByTag(.ad, allocator, cursor));
+    try std.testing.expectEqualDeep(expectAD, try codec.parseByTag(.ad, allocator, &cursor));
     const expectED: []const Spec.Size = &.{ .small, .medium, .large };
-    try std.testing.expectEqualDeep(expectED, try codec.parseByTag(.e, allocator, cursor));
+    try std.testing.expectEqualDeep(expectED, try codec.parseByTag(.e, allocator, &cursor));
     const expectB2: []const ?bool = &.{ false, null };
-    try std.testing.expectEqualDeep(expectB2, try codec.parseByTag(.b2, allocator, cursor));
+    try std.testing.expectEqualDeep(expectB2, try codec.parseByTag(.b2, allocator, &cursor));
     const expectB3: []const []const ?bool = &.{&.{ false, null }};
-    try std.testing.expectEqualDeep(expectB3, try codec.parseByTag(.b3, allocator, cursor));
+    try std.testing.expectEqualDeep(expectB3, try codec.parseByTag(.b3, allocator, &cursor));
     const expectB4: []const ?[]const ?bool = &.{ &.{ false, null }, null };
-    try std.testing.expectEqualDeep(expectB4, try codec.parseByTag(.b4, allocator, cursor));
+    try std.testing.expectEqualDeep(expectB4, try codec.parseByTag(.b4, allocator, &cursor));
     try std.testing.expectError(
-        C.Error.ParseArrayEndOfIterator,
-        codec.parseByTag(.b4, allocator, cursor),
+        @TypeOf(codec).Error.ParseArrayEndOfIterator,
+        codec.parseByTag(.b4, allocator, &cursor),
     );
 }
 
@@ -479,8 +475,7 @@ test "codec parseOpt" {
         \\null
     );
     defer tstCursor.deinit();
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     const C = ArgCodec(struct {
         b5: ?[]const ?[]const ?bool,
@@ -492,19 +487,19 @@ test "codec parseOpt" {
     });
     var codec = C{};
     const expectB5: ?[]const ?[]const ?bool = &.{ &.{ null, true, null }, &.{false}, null };
-    try std.testing.expectEqualDeep(expectB5, try codec.parseByTag(.b5, allocator, cursor));
+    try std.testing.expectEqualDeep(expectB5, try codec.parseByTag(.b5, allocator, &cursor));
     const expectB6: ?[]const []bool = &.{};
-    try std.testing.expectEqualDeep(expectB6, try codec.parseByTag(.b6, allocator, cursor));
+    try std.testing.expectEqualDeep(expectB6, try codec.parseByTag(.b6, allocator, &cursor));
     const expectB7: ?[]const []bool = &.{&.{}};
-    try std.testing.expectEqualDeep(expectB7, try codec.parseByTag(.b7, allocator, cursor));
-    try std.testing.expectEqual(null, try codec.parseByTag(.a1, allocator, cursor));
-    try std.testing.expectEqual(1, (try codec.parseByTag(.a1, allocator, cursor)).?);
-    try std.testing.expectEqual(null, try codec.parseByTag(.flag1, allocator, cursor));
-    try std.testing.expect((try codec.parseByTag(.flag2, allocator, cursor)).?);
+    try std.testing.expectEqualDeep(expectB7, try codec.parseByTag(.b7, allocator, &cursor));
+    try std.testing.expectEqual(null, try codec.parseByTag(.a1, allocator, &cursor));
+    try std.testing.expectEqual(1, (try codec.parseByTag(.a1, allocator, &cursor)).?);
+    try std.testing.expectEqual(null, try codec.parseByTag(.flag1, allocator, &cursor));
+    try std.testing.expect((try codec.parseByTag(.flag2, allocator, &cursor)).?);
     // cursor.consume();
     try std.testing.expectError(
         C.Error.ParseOptEndOfIterator,
-        codec.parseByTag(.a1, allocator, cursor),
+        codec.parseByTag(.a1, allocator, &cursor),
     );
 }
 
@@ -518,15 +513,14 @@ test "codec parseString" {
         \\world
     );
     defer tstCursor.deinit();
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     var codec = ArgCodec(struct { s1: []const u8, s2: [:0]const u8 }){};
-    try std.testing.expectEqualDeep("hello", try codec.parseByTag(.s1, allocator, cursor));
-    try std.testing.expectEqualDeep("world", try codec.parseByTag(.s2, allocator, cursor));
+    try std.testing.expectEqualDeep("hello", try codec.parseByTag(.s1, allocator, &cursor));
+    try std.testing.expectEqualDeep("world", try codec.parseByTag(.s2, allocator, &cursor));
     try std.testing.expectError(
         @TypeOf(codec).Error.ParseStringEndOfIterator,
-        codec.parseByTag(.s2, allocator, cursor),
+        codec.parseByTag(.s2, allocator, &cursor),
     );
 }
 
@@ -534,16 +528,14 @@ test "codec parseString caller ownership" {
     const allocator = &std.testing.allocator;
     var tstCursor = try TstArgCursor.init(allocator, "Hello");
     defer tstCursor.deinit();
-
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     const Spec = struct {
         // Only sentinels are copied
         s: [:0]const u8,
     };
     var codec = ArgCodec(Spec){};
-    const s = try codec.parseByTag(.s, allocator, cursor);
+    const s = try codec.parseByTag(.s, allocator, &cursor);
     // Ownership belongs to caller
     defer allocator.free(s);
 
@@ -554,15 +546,13 @@ test "codec parseString 0 copy for slice" {
     const allocator = &std.testing.allocator;
     var tstCursor = try TstArgCursor.init(allocator, "Hello");
     defer tstCursor.deinit();
-
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     const Spec = struct {
         s: []const u8,
     };
     var codec = ArgCodec(Spec){};
-    const s = try codec.parseByTag(.s, allocator, cursor);
+    const s = try codec.parseByTag(.s, allocator, &cursor);
 
     try std.testing.expectEqualDeep("Hello", s);
 }
@@ -579,8 +569,7 @@ test "codec parseEnum" {
         \\invalid
     );
     defer tstCursor.deinit();
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     const Spec = struct {
         size: Size,
@@ -592,16 +581,16 @@ test "codec parseEnum" {
         };
     };
     var codec = ArgCodec(Spec){};
-    try std.testing.expectEqual(Spec.Size.small, try codec.parseByTag(.size, allocator, cursor));
-    try std.testing.expectEqual(Spec.Size.medium, try codec.parseByTag(.size, allocator, cursor));
-    try std.testing.expectEqual(Spec.Size.large, try codec.parseByTag(.size, allocator, cursor));
+    try std.testing.expectEqual(Spec.Size.small, try codec.parseByTag(.size, allocator, &cursor));
+    try std.testing.expectEqual(Spec.Size.medium, try codec.parseByTag(.size, allocator, &cursor));
+    try std.testing.expectEqual(Spec.Size.large, try codec.parseByTag(.size, allocator, &cursor));
     try std.testing.expectError(
         @TypeOf(codec).Error.InvalidEnum,
-        codec.parseByTag(.size, allocator, cursor),
+        codec.parseByTag(.size, allocator, &cursor),
     );
     try std.testing.expectError(
         @TypeOf(codec).Error.ParseEnumEndOfIterator,
-        codec.parseByTag(.size, allocator, cursor),
+        codec.parseByTag(.size, allocator, &cursor),
     );
 }
 
@@ -613,16 +602,15 @@ test "codec parseFloat" {
         \\32.2222
     );
     defer tstCursor.deinit();
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     var codec = ArgCodec(struct { f1: f32, f2: f64 }){};
-    try std.testing.expectEqual(44.0, try codec.parseByTag(.f1, allocator, cursor));
-    try std.testing.expectEqual(-1.2, try codec.parseByTag(.f2, allocator, cursor));
-    try std.testing.expectEqual(32.2222, try codec.parseByTag(.f1, allocator, cursor));
+    try std.testing.expectEqual(44.0, try codec.parseByTag(.f1, allocator, &cursor));
+    try std.testing.expectEqual(-1.2, try codec.parseByTag(.f2, allocator, &cursor));
+    try std.testing.expectEqual(32.2222, try codec.parseByTag(.f1, allocator, &cursor));
     try std.testing.expectError(
         @TypeOf(codec).Error.ParseFloatEndOfIterator,
-        codec.parseByTag(.f1, allocator, cursor),
+        codec.parseByTag(.f1, allocator, &cursor),
     );
 }
 
@@ -634,16 +622,15 @@ test "codec parseInt" {
         \\25
     );
     defer tstCursor.deinit();
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     var codec = ArgCodec(struct { n1: u6, n2: i2, n3: u88 }){};
-    try std.testing.expectEqual(44, try codec.parseByTag(.n1, allocator, cursor));
-    try std.testing.expectEqual(-1, try codec.parseByTag(.n2, allocator, cursor));
-    try std.testing.expectEqual(25, try codec.parseByTag(.n3, allocator, cursor));
+    try std.testing.expectEqual(44, try codec.parseByTag(.n1, allocator, &cursor));
+    try std.testing.expectEqual(-1, try codec.parseByTag(.n2, allocator, &cursor));
+    try std.testing.expectEqual(25, try codec.parseByTag(.n3, allocator, &cursor));
     try std.testing.expectError(
         @TypeOf(codec).Error.ParseIntEndOfIterator,
-        codec.parseByTag(.n3, allocator, cursor),
+        codec.parseByTag(.n3, allocator, &cursor),
     );
 }
 
@@ -657,31 +644,30 @@ test "codec parseFlag" {
         \\12345
     );
     defer tstCursor.deinit();
-    var cursor = @constCast(&tstCursor.asCursor());
-    _ = &cursor;
+    var cursor = tstCursor.asCursor();
 
     var codec = ArgCodec(struct { @"test": bool }){};
-    try std.testing.expect(try codec.parseByTag(.@"test", allocator, cursor));
+    try std.testing.expect(try codec.parseByTag(.@"test", allocator, &cursor));
     try std.testing.expectEqualDeep(null, cursor.curr);
 
-    try std.testing.expect(!try codec.parseByTag(.@"test", allocator, cursor));
+    try std.testing.expect(!try codec.parseByTag(.@"test", allocator, &cursor));
     try std.testing.expectEqual(null, cursor.curr);
 
-    try std.testing.expect(try codec.parseByTag(.@"test", allocator, cursor));
+    try std.testing.expect(try codec.parseByTag(.@"test", allocator, &cursor));
     try std.testing.expectEqualStrings("something else", cursor.curr.?);
 
     // 4 letter guess
     _ = cursor.next();
-    try std.testing.expect(try codec.parseByTag(.@"test", allocator, cursor));
+    try std.testing.expect(try codec.parseByTag(.@"test", allocator, &cursor));
     try std.testing.expectEqualStrings("1234", cursor.curr.?);
 
     // 5 letter guess
     _ = cursor.next();
-    try std.testing.expect(try codec.parseByTag(.@"test", allocator, cursor));
+    try std.testing.expect(try codec.parseByTag(.@"test", allocator, &cursor));
     try std.testing.expectEqualStrings("12345", cursor.curr.?);
 
     // null check
     _ = cursor.next();
-    try std.testing.expect(try codec.parseByTag(.@"test", allocator, cursor));
+    try std.testing.expect(try codec.parseByTag(.@"test", allocator, &cursor));
     try std.testing.expectEqual(null, cursor.curr);
 }
