@@ -197,7 +197,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             while (end <= arg.len) {
                 ret: inline for (std.meta.fields(@TypeOf(Spec.Short))) |s| {
                     if (std.mem.eql(u8, s.name, arg[start..end])) {
-                        const tag = s.defaultValue() orelse return Error.MissingShorthandLink;
+                        const tag = @tagName(s.defaultValue() orelse return Error.MissingShorthandLink);
                         try self.namedArg(
                             tag,
                             if (end == arg.len) cursor else &noneCursor,
@@ -331,11 +331,11 @@ test "parsed chained flags" {
         t5: ?bool = null,
 
         pub const Short = .{
-            .a = "t1",
-            .aA = "t2",
-            .b = "t3",
-            .Ss = "t4",
-            .c = "t5",
+            .a = .t1,
+            .aA = .t2,
+            .b = .t3,
+            .Ss = .t4,
+            .c = .t5,
         };
     };
     const r1 = try tstParse(allocator, "program -aaAbSsc=false", Spec);
@@ -358,8 +358,8 @@ test "parse short arg" {
         @"super-something": bool = false,
 
         const Short = .{
-            .s = "something",
-            .S = "super-something",
+            .s = .something,
+            .S = .@"super-something",
         };
     };
     const r1 = try tstParse(allocator, "program -s --super-something true", Spec);
@@ -475,8 +475,8 @@ test "parse kvargs" {
         @"super-something": bool = false,
 
         const Short = .{
-            .s = "something",
-            .S = "super-something",
+            .s = .something,
+            .S = .@"super-something",
         };
     };
 
@@ -805,8 +805,8 @@ test "validate require" {
         \\--i6 5
     ,
         struct {
-            i: ?i32 = null,
-            i2: ?i32 = null,
+            i: i32 = undefined,
+            i2: i32 = undefined,
             i3: ?i32 = null,
             i4: ?i32 = null,
             i5: ?i32 = null,
