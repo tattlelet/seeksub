@@ -1,4 +1,5 @@
 const std = @import("std");
+const GroupMatchConfig = @import("validate.zig").GroupMatchConfig;
 
 pub const HelpConf = struct {
     spacesPerBlock: u4 = 2,
@@ -7,6 +8,7 @@ pub const HelpConf = struct {
     nDescSpaces: u2 = 2,
     simpleTypes: bool = false,
     optionsBreakline: bool = false,
+    groupMatchHint: bool = true,
 };
 
 // TODO: add GroupMatch checks for help
@@ -127,7 +129,11 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
                 const block: [conf.spacesPerBlock]u8 = @splat(' ');
                 const disp = displacement(enumFields);
 
-                var commandText: []const u8 = "Commands:\n" ++ conf.blockDelimiter;
+                var commandText: []const u8 = "Commands:";
+                if (@hasDecl(Spec, "GroupMatch") and Spec.GroupMatch.mandatoryVerb) {
+                    commandText = commandText ++ " [Required]";
+                }
+                commandText = commandText ++ "\n" ++ conf.blockDelimiter;
                 for (enumFields, 0..) |f, i| {
                     const desc = std.meta.TagPayloadByName(Spec.Verb, f.name).Help.shortDescription;
                     const displacementDelta = disp - f.name.len;
@@ -233,7 +239,8 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
                         hint = hint ++ translateType(field.type);
                     }
 
-                    // NOTE: hacky and probably only ever works in comptime, possibly not guaranteed to either
+                    // NOTE: https://github.com/ziglang/zig/issues/18047#issuecomment-1818265581
+                    // Apparently not IB but would keep an eye on this
                     const defaultAvailable = if (field.default_value_ptr) |ptr| ptr != @as(*const anyopaque, @ptrCast(&@as(field.type, undefined))) else false;
                     if (desc.typeHint and desc.defaultHint and defaultAvailable) {
                         hint = hint ++ " = ";
@@ -246,6 +253,80 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
                 }
             }
             return null;
+        }
+
+        // TODO: test group match info
+        fn groupInfo(comptime name: []const u8, T: type, group: T) T {
+            return comptime rt: {
+                var result: T = &.{};
+                outer: for (group) |groupBlk| {
+                    for (groupBlk) |item| {
+                        if (std.mem.eql(u8, @tagName(item), name)) {
+                            result = result ++ @as(T, &.{groupBlk});
+                            continue :outer;
+                        }
+                    }
+                }
+                break :rt result;
+            };
+        }
+
+        fn groupToArgsText(comptime name: []const u8, group: anytype) []const u8 {
+            return comptime rt: {
+                var result: []const u8 = "";
+                for (group) |groupBlk| {
+                    for (groupBlk) |item| {
+                        if (std.mem.eql(u8, @tagName(item), name)) continue;
+                        if (result.len != 0) {
+                            result = result ++ ", ";
+                        }
+                        result = result ++ "--" ++ @tagName(item);
+                    }
+                }
+                const final = result;
+                break :rt final;
+            };
+        }
+
+        pub fn groupMatchInfo(comptime name: []const u8) []const u8 {
+            return comptime rt: {
+                if (!conf.groupMatchHint) break :rt "";
+                if (!@hasDecl(Spec, "GroupMatch")) break :rt "";
+
+                var required = false;
+                for (Spec.GroupMatch.required) |req| {
+                    if (std.mem.eql(u8, @tagName(req), name)) {
+                        required = true;
+                        break;
+                    }
+                }
+
+                const inclusive = groupInfo(name, @TypeOf(Spec.GroupMatch.mutuallyInclusive), Spec.GroupMatch.mutuallyInclusive);
+
+                const exclusive = groupInfo(name, @TypeOf(Spec.GroupMatch.mutuallyExclusive), Spec.GroupMatch.mutuallyExclusive);
+
+                var rules: []const u8 = "";
+                if (required) {
+                    rules = rules ++ "[Required] ";
+                }
+
+                if (inclusive.len > 0) {
+                    const inclText: []const u8 = groupToArgsText(name, inclusive);
+                    if (inclText.len > 0) {
+                        rules = rules ++ "[Requires: " ++ inclText ++ "] ";
+                    }
+                }
+
+                if (exclusive.len > 0) {
+                    const exclText: []const u8 = groupToArgsText(name, exclusive);
+                    if (exclText.len > 0) {
+                        rules = rules ++ "[Excludes: " ++ exclText ++ "] ";
+                    }
+                }
+
+                const final: []const u8 = rules;
+                break :rt final;
+            };
         }
 
         pub fn options() []const u8 {
@@ -282,7 +363,9 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
                                 const displacementText: [displacementDelta]u8 = @splat(' ');
                                 break :rv &displacementText;
                             };
-                            optionsText = optionsText ++ block ++ line ++ displacementText ++ desc.description;
+
+                            const rules = groupMatchInfo(field.name);
+                            optionsText = optionsText ++ block ++ line ++ displacementText ++ rules ++ desc.description;
                             if (conf.optionsBreakline) {
                                 optionsText = optionsText ++ "\n";
                             }
@@ -604,18 +687,22 @@ test "options" {
 test "help" {
     const t = std.testing;
     const Spec = struct {
-        verbose: bool = false,
         match: []const u8 = undefined,
         files: []const []const u8 = undefined,
-        byteRanges: []const []const usize = undefined,
-        @"match-n": ?usize = null,
+        byteRanges: ?[]const []const usize = null,
+        verbose: bool = false,
 
         pub const Match = struct {
-            pub const Help: HelpData(@This()) = .{
-                .usage = &.{"seeksub ... match"},
-                .description = "Matches based on options at the top-level. This performs no mutation or replacement, it's simply a dry-run.",
-                .shortDescription = "Match-only operation. This is a dry-run with no replacement.",
+            @"match-n": ?usize = null,
+
+            pub const Short = .{
+                .n = .@"match-n",
             };
+
+            const MatchHelp = HelpData(@This());
+            pub const Help: MatchHelp = .{ .usage = &.{"seeksub ... match"}, .description = "Matches based on options at the top-level. This performs no mutation or replacement, it's simply a dry-run.", .shortDescription = "Match-only operation. This is a dry-run with no replacement.", .optionsDescription = &.{
+                MatchHelp.FieldDesc.init(.@"match-n", "N-match stop for each file if set."),
+            } };
         };
 
         pub const Diff = struct {
@@ -634,15 +721,19 @@ test "help" {
                     DiffHelp.FieldDesc.init(.replace, "Replace match on all files using this PCRE2 regex."),
                 },
             };
+
+            pub const GroupMatch: GroupMatchConfig(@This()) = .{
+                .required = &.{.replace},
+            };
         };
 
         pub const Apply = struct {
-            trace: bool = false,
             replace: []const u8 = undefined,
+            trace: bool = false,
 
             pub const Short = .{
-                .tt = .trace,
                 .r = .replace,
+                .tt = .trace,
             };
 
             pub const ApplyHelp = HelpData(@This());
@@ -651,9 +742,13 @@ test "help" {
                 .description = "Matches based on options at the top-level and then performs a replacement over matches. This is mutate the files.",
                 .shortDescription = "Replaces based on match and replace PCRE2 regexes over all files.",
                 .optionsDescription = &.{
-                    ApplyHelp.FieldDesc.init(.trace, "Trace mutations"),
                     ApplyHelp.FieldDesc.init(.replace, "Replace match on all files using this PCRE2 regex."),
+                    ApplyHelp.FieldDesc.init(.trace, "Trace mutations"),
                 },
+            };
+
+            pub const GroupMatch: GroupMatchConfig(@This()) = .{
+                .required = &.{.replace},
             };
         };
 
@@ -664,11 +759,10 @@ test "help" {
         };
 
         pub const Short = .{
-            .v = .verbose,
             .m = .match,
             .fL = .files,
             .bR = .byteRanges,
-            .n = .@"match-n",
+            .v = .verbose,
         };
 
         const SpecHelp = HelpData(@This());
@@ -676,15 +770,19 @@ test "help" {
             .usage = &.{"seeksub [options] [command] ..."},
             .description = "CLI tool to match, diff and apply regex in bulk using PCRE2. One of the main features of this CLI is the ability to seek byte ranges before matching or replacing.",
             .optionsDescription = &.{
-                SpecHelp.FieldDesc.init(.verbose, "Verbose mode."),
                 SpecHelp.FieldDesc.init(.match, "PCRE2 Regex to match on all files."),
                 SpecHelp.FieldDesc.init(.files, "File path list to run matches on."),
                 SpecHelp.FieldDesc.init(
                     .byteRanges,
                     "Range of bytes for n files, top-level array length has to be of (len <= files.len) and will be applied sequentially over files.",
                 ),
-                SpecHelp.FieldDesc.init(.@"match-n", "N-match stop for each file if set."),
+                SpecHelp.FieldDesc.init(.verbose, "Verbose mode."),
             },
+        };
+
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .required = &.{ .match, .files },
+            .mandatoryVerb = true,
         };
     };
     std.debug.print("{s}", .{HelpFmt(Spec, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
