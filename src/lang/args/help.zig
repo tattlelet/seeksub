@@ -2,7 +2,7 @@ const std = @import("std");
 const GroupMatchConfig = @import("validate.zig").GroupMatchConfig;
 
 pub const HelpConf = struct {
-    spacesPerBlock: u4 = 2,
+    indent: u4 = 2,
     blockDelimiter: []const u8 = "\n",
     descSpaces: u4 = 4,
     nDescSpaces: u2 = 2,
@@ -12,133 +12,116 @@ pub const HelpConf = struct {
 };
 
 // TODO: add GroupMatch checks for help
-pub fn HelpFmt(Spec: type, conf: HelpConf) type {
+pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
     return struct {
+        const Help: HelpData(Spec) = if (@hasDecl(Spec, "Help")) rt: {
+            if (@TypeOf(Spec.Help) != HelpData(Spec)) @compileError(std.fmt.comptimePrint("Spec.Help of type {s} is not of type HelpData(Spec)", .{@typeName(@TypeOf(Spec.Help))}));
+            break :rt Spec.Help;
+        } else .{};
+        const Verb = if (@hasDecl(Spec, "Verb")) Spec.Verb else void;
+        const HasShort = if (@hasDecl(Spec, "Short")) true else false;
+        const GroupMatch: GroupMatchConfig(Spec) = if (@hasDecl(Spec, "GroupMatch")) Spec.GroupMatch else .{};
+        const INDENT: [conf.indent]u8 = @splat(' ');
+
         const Visitor = struct {
             visited: []const type,
         };
 
-        pub fn verbPath(comptime program: []const u8, comptime T: type) []const u8 {
+        pub fn usage() ?[]const u8 {
             return comptime rt: {
-                if (T == Spec) break :rt program;
-                var visited: Visitor = .{
-                    .visited = &.{Spec},
-                };
-
-                break :rt program ++ " " ++ (verbCallInner(
-                    Spec,
-                    T,
-                    &visited,
-                ) orelse @compileError("Not found"));
-            };
-        }
-
-        fn verbCallInner(
-            comptime T: type,
-            comptime Target: type,
-            comptime visitor: *Visitor,
-        ) ?[]const u8 {
-            if (@hasDecl(T, "Verb")) {
-                outer: for (@typeInfo(T.Verb).@"union".fields) |f| {
-                    for (visitor.visited) |v| if (f.type == v) continue :outer;
-                    if (f.type == Target) return @as([]const u8, f.name);
-                    visitor.visited = .{f.type} ++ visitor.visited;
-                    const found = verbCallInner(
-                        f.type,
-                        Target,
-                        visitor,
-                    );
-                    if (found) |path| {
-                        return f.name ++ " " ++ path;
-                    }
-                }
-            }
-            return null;
-        }
-
-        pub fn usage() []const u8 {
-            return comptime rt: {
-                if (Spec.Help.usage.len == 0) break :rt "";
-                const args = Spec.Help.usage;
+                const usageList = Help.usage orelse break :rt null;
                 const usageTemplate = "Usage: ";
-                var usageText: []const u8 = usageTemplate ++ args[0];
-                for (args[1..]) |case| {
-                    usageText = usageText ++ "\n" ++ usageTemplate ++ case;
+                var usageText: []const u8 = usageTemplate ++ usageList[0];
+                for (usageList[1..]) |item| {
+                    usageText = usageText ++ "\n" ++ usageTemplate ++ item;
                 }
                 const final = usageText;
                 break :rt final;
             };
         }
 
-        pub fn description() []const u8 {
+        pub fn description() ?[]const u8 {
             return comptime rt: {
-                if (Spec.Help.description.len == 0) break :rt "";
-                var byLine = std.mem.tokenizeScalar(u8, Spec.Help.description, '\n');
+                const desc = Help.description orelse break :rt null;
+                var byLine = std.mem.tokenizeScalar(u8, desc, '\n');
 
-                const block: [conf.spacesPerBlock]u8 = @splat(' ');
-                var desc: []const u8 = block ++ (byLine.next() orelse unreachable);
+                var descText: []const u8 = INDENT ++ (byLine.next() orelse unreachable);
                 while (byLine.next()) |line| {
-                    desc = desc ++ "\n" ++ block ++ line;
+                    descText = descText ++ "\n" ++ INDENT ++ line;
                 }
-                const final = desc;
+                const final = descText;
                 break :rt final;
             };
         }
 
-        pub fn examples() []const u8 {
+        pub fn examples() ?[]const u8 {
             return comptime rt: {
-                if (Spec.Help.examples.len == 0) break :rt "";
-                const args = Spec.Help.examples;
-                const block: [conf.spacesPerBlock]u8 = @splat(' ');
-                var examplesText: []const u8 = "Examples:\n" ++ conf.blockDelimiter ++ block ++ args[0];
-                for (args[1..]) |case| {
-                    examplesText = examplesText ++ "\n" ++ block ++ case;
+                const exampleList = Help.examples orelse break :rt null;
+                var examplesText: []const u8 = "Examples:\n" ++ conf.blockDelimiter ++ INDENT ++ exampleList[0];
+                for (exampleList[1..]) |item| {
+                    examplesText = examplesText ++ "\n" ++ INDENT ++ item;
                 }
                 const final = examplesText;
                 break :rt final;
             };
         }
 
-        pub fn maxChars(fields: anytype) usize {
-            var disp: usize = 0;
-            for (fields) |f| {
-                const len = switch (@TypeOf(f)) {
-                    std.builtin.Type.EnumField, std.builtin.Type.StructField, std.builtin.Type.UnionField => f.name.len,
-                    []const u8, []u8 => f.len,
-                    else => @compileError("Unknow type to calculate displacement"),
-                };
-                disp = @max(disp, len);
-            }
-            return disp;
-        }
-
-        pub fn displacement(fields: anytype) usize {
-            var disp: usize = maxChars(fields) - 1;
-            disp += conf.spacesPerBlock;
-            disp = ((disp / conf.descSpaces) + conf.nDescSpaces) * conf.descSpaces;
-            return disp;
-        }
-
-        pub fn commands() []const u8 {
+        pub fn columnSize(comptime fields: anytype) usize {
             return comptime rt: {
-                if (!@hasDecl(Spec, "Verb")) break :rt "";
+                var size: usize = 0;
+                for (fields) |f| {
+                    const len = switch (@TypeOf(f)) {
+                        std.builtin.Type.EnumField, std.builtin.Type.StructField, std.builtin.Type.UnionField => f.name.len,
+                        []const u8, []u8 => f.len,
+                        else => @compileError("Unknow type to calculate displacement"),
+                    };
+                    size = @max(size, len);
+                }
+                break :rt size;
+            };
+        }
 
-                const enumFields = @typeInfo(@typeInfo(Spec.Verb).@"union".tag_type.?).@"enum".fields;
-                if (enumFields.len == 0) break :rt "";
+        pub fn displacement(comptime fields: anytype) usize {
+            return comptime rt: {
+                var disp: usize = columnSize(fields) -| 1;
+                disp += conf.indent;
+                disp = ((disp / conf.descSpaces) + conf.nDescSpaces) * conf.descSpaces;
+                break :rt disp;
+            };
+        }
 
-                const block: [conf.spacesPerBlock]u8 = @splat(' ');
+        fn verbShortDesc(comptime name: []const u8) ?[]const u8 {
+            return comptime rt: {
+                const T = std.meta.TagPayloadByName(Verb, name);
+                if (!@hasDecl(T, "Help")) break :rt null;
+                const THelp: HelpData(T) = T.Help;
+                break :rt THelp.shortDescription;
+            };
+        }
+
+        pub fn commands() ?[]const u8 {
+            return comptime rt: {
+                if (Verb == void) break :rt null;
+
+                const enumFields = @typeInfo(@typeInfo(Verb).@"union".tag_type.?).@"enum".fields;
+                if (enumFields.len == 0) break :rt null;
+
                 const disp = displacement(enumFields);
 
                 var commandText: []const u8 = "Commands:";
-                if (@hasDecl(Spec, "GroupMatch") and Spec.GroupMatch.mandatoryVerb) {
+                if (GroupMatch.mandatoryVerb) {
                     commandText = commandText ++ " [Required]";
                 }
                 commandText = commandText ++ "\n" ++ conf.blockDelimiter;
                 for (enumFields, 0..) |f, i| {
-                    const desc = std.meta.TagPayloadByName(Spec.Verb, f.name).Help.shortDescription;
-                    const displacementDelta = disp - f.name.len;
-                    const displacementText: [displacementDelta]u8 = @splat(' ');
-                    commandText = commandText ++ block ++ f.name ++ displacementText ++ desc;
+                    commandText = commandText ++ INDENT ++ f.name;
+
+                    if (verbShortDesc(f.name)) |verbDesc| {
+                        const dispDelta = disp - f.name.len;
+                        const displacementText: [dispDelta]u8 = @splat(' ');
+                        commandText = commandText ++ displacementText ++ verbDesc;
+                    }
+
                     if (i != enumFields.len - 1) {
                         commandText = commandText ++ "\n";
                     }
@@ -160,15 +143,17 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
         }
 
         pub fn shorthand(
-            shortFields: []const std.builtin.Type.StructField,
-            field: std.builtin.Type.StructField,
+            comptime shortFields: []const std.builtin.Type.StructField,
+            comptime field: std.builtin.Type.StructField,
         ) ?[]const u8 {
-            for (shortFields) |shortField| {
-                if (std.mem.eql(u8, field.name, @tagName(shortField.defaultValue() orelse @compileError("Short defined with no default value")))) {
-                    return "-" ++ shortField.name;
+            return comptime rt: {
+                for (shortFields) |shortField| {
+                    if (std.mem.eql(u8, field.name, @tagName(shortField.defaultValue() orelse @compileError("Short defined with no default value")))) {
+                        break :rt "-" ++ shortField.name;
+                    }
                 }
-            }
-            return null;
+                break :rt null;
+            };
         }
 
         pub fn simpleTypeTranslation(T: type) []const u8 {
@@ -228,11 +213,14 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
         }
 
         pub fn typeHint(
-            field: std.builtin.Type.StructField,
+            comptime field: std.builtin.Type.StructField,
         ) ?[]const u8 {
-            for (Spec.Help.optionsDescription) |desc| {
-                if (std.mem.eql(u8, desc.field, field.name)) {
-                    if (!desc.typeHint and !desc.defaultHint) return null;
+            return comptime rt: {
+                if (Help.optionsDescription == null) break :rt null;
+                for (Help.optionsDescription.?) |desc| {
+                    if (!std.mem.eql(u8, desc.field, field.name)) continue;
+
+                    if (!desc.typeHint and !desc.defaultHint) break :rt null;
 
                     var hint: []const u8 = "(";
                     if (desc.typeHint) {
@@ -249,10 +237,10 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
                     if (desc.defaultHint and defaultAvailable) {
                         hint = hint ++ formatDefaultValue(field.type, field.defaultValue().?);
                     }
-                    return hint ++ ")";
+                    break :rt hint ++ ")";
                 }
-            }
-            return null;
+                break :rt null;
+            };
         }
 
         // TODO: test group match info
@@ -329,18 +317,19 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
             };
         }
 
-        pub fn options() []const u8 {
+        pub fn options() ?[]const u8 {
             return comptime rt: {
                 const fields = std.meta.fields(Spec);
-                if (fields.len == 0) break :rt "";
-                const ShortFields = std.meta.fields(@TypeOf(Spec.Short));
+                if (fields.len == 0) break :rt null;
+                const OptShortFields: ?[]const std.builtin.Type.StructField = if (HasShort) std.meta.fields(@TypeOf(Spec.Short)) else null;
 
-                const block: [conf.spacesPerBlock]u8 = @splat(' ');
                 var lines: [fields.len][]const u8 = undefined;
                 for (fields, 0..) |field, i| {
                     var line: []const u8 = "";
-                    if (shorthand(ShortFields, field)) |shand| {
-                        line = line ++ shand ++ ", ";
+                    if (OptShortFields) |ShortFields| {
+                        if (shorthand(ShortFields, field)) |shand| {
+                            line = line ++ shand ++ ", ";
+                        }
                     }
                     line = line ++ "--" ++ field.name;
 
@@ -352,26 +341,30 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
 
                 var optionsText: []const u8 = "Options:\n" ++ conf.blockDelimiter;
                 const disp = displacement(lines);
+                const innerBlock: [conf.indent * 2]u8 = @splat(' ');
                 for (fields, &lines, 0..) |field, line, i| {
-                    for (Spec.Help.optionsDescription) |desc| {
-                        if (std.mem.eql(u8, desc.field, field.name)) {
-                            const displacementText: []const u8 = if (conf.optionsBreakline) rv: {
-                                const innerBlock: [conf.spacesPerBlock * 2]u8 = @splat(' ');
-                                break :rv "\n" ++ innerBlock;
-                            } else rv: {
-                                const displacementDelta = disp - line.len;
-                                const displacementText: [displacementDelta]u8 = @splat(' ');
-                                break :rv &displacementText;
-                            };
+                    optionsText = optionsText ++ INDENT ++ line;
+                    if (Help.optionsDescription) |descriptions| for (
+                        descriptions,
+                    ) |desc| {
+                        if (!std.mem.eql(u8, desc.field, field.name)) continue;
 
-                            const rules = groupMatchInfo(field.name);
-                            optionsText = optionsText ++ block ++ line ++ displacementText ++ rules ++ desc.description;
-                            if (conf.optionsBreakline) {
-                                optionsText = optionsText ++ "\n";
-                            }
-                            break;
+                        const displacementText: []const u8 = if (conf.optionsBreakline) rv: {
+                            break :rv "\n" ++ innerBlock;
+                        } else rv: {
+                            const displacementDelta = disp - line.len;
+                            const displacementText: [displacementDelta]u8 = @splat(' ');
+                            break :rv &displacementText;
+                        };
+
+                        const rules = groupMatchInfo(field.name);
+                        optionsText = optionsText ++ displacementText ++ rules ++ desc.description;
+                        if (conf.optionsBreakline) {
+                            optionsText = optionsText ++ "\n";
                         }
-                    }
+                        break;
+                    };
+
                     if (i != fields.len - 1) {
                         optionsText = optionsText ++ "\n";
                     }
@@ -385,11 +378,11 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
             return comptime rt: {
                 var helpText: []const u8 = "";
                 const pieces: []const []const u8 = &.{
-                    usage(),
-                    description(),
-                    examples(),
-                    commands(),
-                    options(),
+                    usage().?,
+                    description().?,
+                    examples() orelse "",
+                    commands() orelse "",
+                    options() orelse "",
                 };
                 for (pieces, 0..) |piece, i| {
                     if (piece.len > 1) {
@@ -409,11 +402,12 @@ pub fn HelpFmt(Spec: type, conf: HelpConf) type {
 pub fn HelpData(T: type) type {
     const SpecEnum = std.meta.FieldEnum(T);
     return struct {
-        usage: []const []const u8 = &.{},
-        description: []const u8 = &.{},
-        shortDescription: []const u8 = &.{},
-        examples: []const []const u8 = &.{},
-        optionsDescription: []const FieldDesc = &.{},
+        // TODO: use ?
+        usage: ?[]const []const u8 = null,
+        description: ?[]const u8 = null,
+        shortDescription: ?[]const u8 = null,
+        examples: ?[]const []const u8 = null,
+        optionsDescription: ?[]const FieldDesc = null,
         footer: []const u8 = &.{},
 
         pub const FieldDesc = struct {
@@ -434,6 +428,7 @@ pub fn HelpData(T: type) type {
 
 test "format usage" {
     const t = std.testing;
+    try t.expectEqual(null, HelpFmt(struct {}, .{}).usage());
     const Spec = struct {
         pub const Help: HelpData(@This()) = .{
             .usage = &.{
@@ -442,53 +437,15 @@ test "format usage" {
             },
         };
     };
-    try t.expectEqualStrings("", HelpFmt(struct {
-        pub const Help: HelpData(@This()) = .{};
-    }, .{}).usage());
     try t.expectEqualStrings(
         \\Usage: test [options] <url>
         \\Usage: test [options] <path>
-    , HelpFmt(Spec, .{}).usage());
-}
-
-test "verb path" {
-    const t = std.testing;
-    const Spec = struct {};
-    try t.expectEqualStrings("prog", comptime HelpFmt(Spec, .{}).verbPath("prog", Spec));
-    const Spec2 = struct {
-        pub const Looper = @This();
-        pub const A = struct {};
-        pub const B = struct {};
-        pub const C = struct {
-            pub const CA = struct {};
-            pub const CB = struct {
-                pub const Verb = union(enum) {
-                    c: Looper.C,
-                };
-            };
-            pub const CC = struct {};
-            pub const Verb = union(enum) {
-                ca: CA,
-                cb: CB,
-                cc: CC,
-            };
-        };
-        pub const D = struct {};
-        pub const E = struct {};
-        pub const Verb = union(enum) {
-            a: A,
-            b: B,
-            c: C,
-            d: D,
-            e: E,
-        };
-    };
-    try t.expectEqualStrings("prog e", comptime HelpFmt(Spec2, .{}).verbPath("prog", Spec2.E));
-    try t.expectEqualStrings("prog c cc", comptime HelpFmt(Spec2, .{}).verbPath("prog", Spec2.C.CC));
+    , HelpFmt(Spec, .{}).usage().?);
 }
 
 test "description" {
     const t = std.testing;
+    try t.expectEqual(null, HelpFmt(struct {}, .{}).description());
     const Spec = struct {
         pub const Help: HelpData(@This()) = .{
             .description =
@@ -500,15 +457,16 @@ test "description" {
     try t.expectEqualStrings(
         \\  I'm a cool description
         \\  Look at me going
-    , HelpFmt(Spec, .{}).description());
+    , HelpFmt(Spec, .{}).description().?);
     try t.expectEqualStrings(
         \\    I'm a cool description
         \\    Look at me going
-    , HelpFmt(Spec, .{ .spacesPerBlock = 4 }).description());
+    , HelpFmt(Spec, .{ .indent = 4 }).description().?);
 }
 
 test "examples" {
     const t = std.testing;
+    try t.expectEqual(null, HelpFmt(struct {}, .{}).examples());
     const Spec = struct {
         pub const Help: HelpData(@This()) = .{
             .examples = &.{
@@ -522,16 +480,24 @@ test "examples" {
         \\
         \\    prog --help
         \\    prog --verbose help --help
-    , HelpFmt(Spec, .{ .spacesPerBlock = 4 }).examples());
+    , HelpFmt(Spec, .{ .indent = 4 }).examples().?);
     try t.expectEqualStrings(
         \\Examples:
         \\  prog --help
         \\  prog --verbose help --help
-    , HelpFmt(Spec, .{ .blockDelimiter = "" }).examples());
+    , HelpFmt(Spec, .{ .blockDelimiter = "" }).examples().?);
 }
 
 test "commands" {
     const t = std.testing;
+    try t.expectEqual(null, HelpFmt(struct {}, .{}).commands());
+    try t.expectEqualStrings(
+        \\Commands:
+        \\  a
+    , HelpFmt(struct {
+        pub const A = struct {};
+        pub const Verb = union(enum) { a: A };
+    }, .{ .blockDelimiter = "" }).commands().?);
     const Spec = struct {
         pub const A = struct {
             pub const Help: HelpData(@This()) = .{
@@ -569,18 +535,18 @@ test "commands" {
         \\  nameForSomething                                Just a brief description of a sorts
         \\  short                                           A
         \\  d                                               grapefruit
-    , HelpFmt(Spec, .{}).commands());
-    try t.expectEqualStrings(
-        \\Commands:
-        \\  aVeryBigNameWithLotsOfLettersHereRightNow       This happens to be a very very long description on how to use a very specific piece of software create by a very specific human being (sometimes human).
-        \\  nameForSomething                                Just a brief description of a sorts
-        \\  short                                           A
-        \\  d                                               grapefruit
-    , HelpFmt(Spec, .{ .blockDelimiter = "" }).commands());
+    , HelpFmt(Spec, .{}).commands().?);
 }
 
 test "options" {
     const t = std.testing;
+    try t.expectEqual(null, HelpFmt(struct {}, .{}).options());
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --posX
+    , HelpFmt(struct {
+        posX: i32 = undefined,
+    }, .{ .blockDelimiter = "" }).options().?);
     const Spec = struct {
         posX: ?i32 = null,
         posY: ?i32 = null,
@@ -651,7 +617,7 @@ test "options" {
         \\  -n2, --name2                                                        a pol of names
         \\  --name3 (null)                                                      a pol of names
         \\  --names ([][]u8)                                                    a pol of names
-    , HelpFmt(Spec, .{}).options());
+    , HelpFmt(Spec, .{}).options().?);
     try t.expectEqualStrings(
         \\Options:
         \\  -x, --posX (?i32 = null)
@@ -681,7 +647,7 @@ test "options" {
     , HelpFmt(Spec, .{
         .blockDelimiter = "",
         .optionsBreakline = true,
-    }).options());
+    }).options().?);
 }
 
 test "help" {
