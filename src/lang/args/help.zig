@@ -3,9 +3,8 @@ const GroupMatchConfig = @import("validate.zig").GroupMatchConfig;
 
 pub const HelpConf = struct {
     indent: u4 = 2,
-    blockDelimiter: []const u8 = "\n",
-    descSpaces: u4 = 4,
-    nDescSpaces: u2 = 2,
+    headerDelimiter: []const u8 = "\n",
+    columnSpace: u4 = 4,
     simpleTypes: bool = false,
     optionsBreakline: bool = false,
     groupMatchHint: bool = true,
@@ -15,17 +14,15 @@ pub const HelpConf = struct {
 pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
     return struct {
         const Help: HelpData(Spec) = if (@hasDecl(Spec, "Help")) rt: {
-            if (@TypeOf(Spec.Help) != HelpData(Spec)) @compileError(std.fmt.comptimePrint("Spec.Help of type {s} is not of type HelpData(Spec)", .{@typeName(@TypeOf(Spec.Help))}));
+            if (@TypeOf(Spec.Help) != HelpData(Spec)) @compileError(std.fmt.comptimePrint(
+                "Spec.Help of type {s} is not of type HelpData(Spec)",
+                .{@typeName(@TypeOf(Spec.Help))},
+            ));
             break :rt Spec.Help;
         } else .{};
         const Verb = if (@hasDecl(Spec, "Verb")) Spec.Verb else void;
-        const HasShort = if (@hasDecl(Spec, "Short")) true else false;
         const GroupMatch: GroupMatchConfig(Spec) = if (@hasDecl(Spec, "GroupMatch")) Spec.GroupMatch else .{};
         const INDENT: [conf.indent]u8 = @splat(' ');
-
-        const Visitor = struct {
-            visited: []const type,
-        };
 
         pub fn usage() ?[]const u8 {
             return comptime rt: {
@@ -35,8 +32,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 for (usageList[1..]) |item| {
                     usageText = usageText ++ "\n" ++ usageTemplate ++ item;
                 }
-                const final = usageText;
-                break :rt final;
+                break :rt usageText;
             };
         }
 
@@ -49,20 +45,18 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 while (byLine.next()) |line| {
                     descText = descText ++ "\n" ++ INDENT ++ line;
                 }
-                const final = descText;
-                break :rt final;
+                break :rt descText;
             };
         }
 
         pub fn examples() ?[]const u8 {
             return comptime rt: {
                 const exampleList = Help.examples orelse break :rt null;
-                var examplesText: []const u8 = "Examples:\n" ++ conf.blockDelimiter ++ INDENT ++ exampleList[0];
+                var examplesText: []const u8 = "Examples:\n" ++ conf.headerDelimiter ++ INDENT ++ exampleList[0];
                 for (exampleList[1..]) |item| {
                     examplesText = examplesText ++ "\n" ++ INDENT ++ item;
                 }
-                const final = examplesText;
-                break :rt final;
+                break :rt examplesText;
             };
         }
 
@@ -81,11 +75,11 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        pub fn displacement(comptime fields: anytype) usize {
+        pub fn columnDelimiter(comptime fields: anytype) usize {
             return comptime rt: {
                 var disp: usize = columnSize(fields) -| 1;
                 disp += conf.indent;
-                disp = ((disp / conf.descSpaces) + conf.nDescSpaces) * conf.descSpaces;
+                disp = ((disp / conf.columnSpace) + 2) * conf.columnSpace;
                 break :rt disp;
             };
         }
@@ -106,18 +100,18 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 const enumFields = @typeInfo(@typeInfo(Verb).@"union".tag_type.?).@"enum".fields;
                 if (enumFields.len == 0) break :rt null;
 
-                const disp = displacement(enumFields);
+                const columDelim = columnDelimiter(enumFields);
 
                 var commandText: []const u8 = "Commands:";
                 if (GroupMatch.mandatoryVerb) {
                     commandText = commandText ++ " [Required]";
                 }
-                commandText = commandText ++ "\n" ++ conf.blockDelimiter;
+                commandText = commandText ++ "\n" ++ conf.headerDelimiter;
                 for (enumFields, 0..) |f, i| {
                     commandText = commandText ++ INDENT ++ f.name;
 
                     if (verbShortDesc(f.name)) |verbDesc| {
-                        const dispDelta = disp - f.name.len;
+                        const dispDelta = columDelim - f.name.len;
                         const displacementText: [dispDelta]u8 = @splat(' ');
                         commandText = commandText ++ displacementText ++ verbDesc;
                     }
@@ -126,27 +120,41 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         commandText = commandText ++ "\n";
                     }
                 }
-                const final = commandText;
-                break :rt final;
+                break :rt commandText;
             };
         }
 
-        pub fn formatDefaultValue(T: type, defaultValue: T) []const u8 {
-            // TODO: format [][]u8 and so on
-            const fmt = switch (T) {
-                []const u8, []u8 => "'{s}'",
-                ?[]const u8, ?[]u8 => if (defaultValue == null) "{?}" else "'{?s}'",
-                else => "{any}",
+        pub fn formatDefaultValue(comptime T: type, comptime defaultValue: T) []const u8 {
+            return comptime switch (@typeInfo(T)) {
+                .float => std.fmt.comptimePrint("{d}", .{defaultValue}),
+                .pointer => |ptr| rv: {
+                    if (ptr.child == u8) {
+                        break :rv std.fmt.comptimePrint("'{s}'", .{defaultValue});
+                    }
+                    var valueText: []const u8 = if (conf.simpleTypes) "[" else "{";
+                    for (defaultValue, 0..) |value, i| {
+                        valueText = valueText ++ formatDefaultValue(ptr.child, value);
+                        if (i < defaultValue.len - 1) {
+                            valueText = valueText ++ ", ";
+                        }
+                    }
+                    break :rv valueText ++ if (conf.simpleTypes) "]" else "}";
+                },
+                .optional => |opt| rv: {
+                    if (defaultValue == null) break :rv "null" else {
+                        break :rv formatDefaultValue(opt.child, defaultValue.?);
+                    }
+                },
+                else => std.fmt.comptimePrint("{any}", .{defaultValue}),
             };
-
-            return std.fmt.comptimePrint(fmt, .{defaultValue});
         }
 
         pub fn shorthand(
-            comptime shortFields: []const std.builtin.Type.StructField,
+            comptime shortFieldsOpt: ?[]const std.builtin.Type.StructField,
             comptime field: std.builtin.Type.StructField,
         ) ?[]const u8 {
             return comptime rt: {
+                const shortFields = shortFieldsOpt orelse break :rt null;
                 for (shortFields) |shortField| {
                     if (std.mem.eql(u8, field.name, @tagName(shortField.defaultValue() orelse @compileError("Short defined with no default value")))) {
                         break :rt "-" ++ shortField.name;
@@ -156,7 +164,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        pub fn simpleTypeTranslation(T: type) []const u8 {
+        pub fn simpleTypeTranslation(comptime T: type) []const u8 {
             return comptime rt: {
                 var typeText: []const u8 = "";
                 var Tt = T;
@@ -166,7 +174,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     .pointer => |ptr| {
                         Tt = ptr.child;
                         if (Tt == u8) {
-                            typeText = typeText ++ "[]string";
+                            typeText = typeText ++ "string";
                         } else {
                             typeText = typeText ++ "[]";
                             continue :rfd @typeInfo(Tt);
@@ -180,12 +188,11 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     },
                     else => typeText = typeText ++ @typeName(Tt),
                 }
-                const final = typeText;
-                break :rt final;
+                break :rt typeText;
             };
         }
 
-        pub fn zigTypeTranslation(T: type) []const u8 {
+        pub fn zigTypeTranslation(comptime T: type) []const u8 {
             return comptime rt: {
                 var typeText: []const u8 = "";
                 var Tt = T;
@@ -201,14 +208,14 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         Tt = opt.child;
                         continue :rfd @typeInfo(Tt);
                     },
+                    // TODO: get only the last token for struct/complex type name translation
                     else => typeText = typeText ++ @typeName(Tt),
                 }
-                const final = typeText;
-                break :rt final;
+                break :rt typeText;
             };
         }
 
-        pub fn translateType(T: type) []const u8 {
+        pub fn translateType(comptime T: type) []const u8 {
             return comptime if (conf.simpleTypes) simpleTypeTranslation(T) else zigTypeTranslation(T);
         }
 
@@ -216,10 +223,9 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             comptime field: std.builtin.Type.StructField,
         ) ?[]const u8 {
             return comptime rt: {
-                if (Help.optionsDescription == null) break :rt null;
-                for (Help.optionsDescription.?) |desc| {
-                    if (!std.mem.eql(u8, desc.field, field.name)) continue;
-
+                const descriptions = Help.optionsDescription orelse break :rt null;
+                for (descriptions) |desc| {
+                    if (!std.mem.eql(u8, @tagName(desc.field), field.name)) continue;
                     if (!desc.typeHint and !desc.defaultHint) break :rt null;
 
                     var hint: []const u8 = "(";
@@ -230,6 +236,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     // NOTE: https://github.com/ziglang/zig/issues/18047#issuecomment-1818265581
                     // Apparently not IB but would keep an eye on this
                     const defaultAvailable = if (field.default_value_ptr) |ptr| ptr != @as(*const anyopaque, @ptrCast(&@as(field.type, undefined))) else false;
+
                     if (desc.typeHint and desc.defaultHint and defaultAvailable) {
                         hint = hint ++ " = ";
                     }
@@ -244,6 +251,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
         }
 
         // TODO: test group match info
+        // TODO: optional?
         fn groupInfo(comptime name: []const u8, T: type, group: T) T {
             return comptime rt: {
                 var result: T = &.{};
@@ -271,15 +279,14 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         result = result ++ "--" ++ @tagName(item);
                     }
                 }
-                const final = result;
-                break :rt final;
+                break :rt result;
             };
         }
 
-        pub fn groupMatchInfo(comptime name: []const u8) []const u8 {
+        pub fn groupMatchInfo(comptime name: []const u8) ?[]const u8 {
             return comptime rt: {
-                if (!conf.groupMatchHint) break :rt "";
-                if (!@hasDecl(Spec, "GroupMatch")) break :rt "";
+                if (!conf.groupMatchHint) break :rt null;
+                if (!@hasDecl(Spec, "GroupMatch")) break :rt null;
 
                 var required = false;
                 for (Spec.GroupMatch.required) |req| {
@@ -311,9 +318,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         rules = rules ++ "[Excludes: " ++ exclText ++ "] ";
                     }
                 }
-
-                const final: []const u8 = rules;
-                break :rt final;
+                break :rt rules;
             };
         }
 
@@ -321,51 +326,65 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             return comptime rt: {
                 const fields = std.meta.fields(Spec);
                 if (fields.len == 0) break :rt null;
-                const OptShortFields: ?[]const std.builtin.Type.StructField = if (HasShort) std.meta.fields(@TypeOf(Spec.Short)) else null;
+                const OptShortFields: ?[]const std.builtin.Type.StructField = if (@hasDecl(Spec, "Short")) std.meta.fields(@TypeOf(Spec.Short)) else null;
 
-                var lines: [fields.len][]const u8 = undefined;
+                var optionPieces: [fields.len][]const u8 = undefined;
                 for (fields, 0..) |field, i| {
-                    var line: []const u8 = "";
-                    if (OptShortFields) |ShortFields| {
-                        if (shorthand(ShortFields, field)) |shand| {
-                            line = line ++ shand ++ ", ";
-                        }
+                    var optionPiece: []const u8 = "";
+                    if (shorthand(OptShortFields, field)) |shand| {
+                        optionPiece = optionPiece ++ shand ++ ", ";
                     }
-                    line = line ++ "--" ++ field.name;
+
+                    optionPiece = optionPiece ++ "--" ++ field.name;
 
                     if (typeHint(field)) |tpHint| {
-                        line = line ++ " " ++ tpHint;
+                        optionPiece = optionPiece ++ " " ++ tpHint;
                     }
-                    lines[i] = line;
+                    optionPieces[i] = optionPiece;
                 }
 
-                var optionsText: []const u8 = "Options:\n" ++ conf.blockDelimiter;
-                const disp = displacement(lines);
+                var optionsText: []const u8 = "Options:\n" ++ conf.headerDelimiter;
+                const columDelim = columnDelimiter(optionPieces);
                 const innerBlock: [conf.indent * 2]u8 = @splat(' ');
-                for (fields, &lines, 0..) |field, line, i| {
-                    optionsText = optionsText ++ INDENT ++ line;
+
+                for (fields, &optionPieces, 0..) |field, optionPiece, i| {
+                    optionsText = optionsText ++ INDENT ++ optionPiece;
+                    // TODO: build config on the fly for field based on config
+                    // config will enable default typehint / default hint
+                    // with not description
                     if (Help.optionsDescription) |descriptions| for (
                         descriptions,
                     ) |desc| {
-                        if (!std.mem.eql(u8, desc.field, field.name)) continue;
+                        if (!std.mem.eql(u8, @tagName(desc.field), field.name)) continue;
 
                         const displacementText: []const u8 = if (conf.optionsBreakline) rv: {
                             break :rv "\n" ++ innerBlock;
                         } else rv: {
-                            const displacementDelta = disp - line.len;
+                            const displacementDelta = columDelim - optionPiece.len;
                             const displacementText: [displacementDelta]u8 = @splat(' ');
                             break :rv &displacementText;
                         };
 
+                        // TODO: work more here
                         const rules = groupMatchInfo(field.name);
-                        optionsText = optionsText ++ displacementText ++ rules ++ desc.description;
-                        if (conf.optionsBreakline) {
+
+                        if (rules != null or desc.description != null) {
+                            optionsText = optionsText ++ displacementText;
+                            if (rules) |vRules| {
+                                optionsText = optionsText ++ vRules;
+                            }
+                            if (desc.description) |vDesc| {
+                                optionsText = optionsText ++ vDesc;
+                            }
+                        }
+
+                        if (conf.optionsBreakline and i < fields.len - 1) {
                             optionsText = optionsText ++ "\n";
                         }
                         break;
                     };
 
-                    if (i != fields.len - 1) {
+                    if (i < fields.len - 1) {
                         optionsText = optionsText ++ "\n";
                     }
                 }
@@ -377,7 +396,9 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
         pub fn help() []const u8 {
             return comptime rt: {
                 var helpText: []const u8 = "";
+                // TODO: add footer
                 const pieces: []const []const u8 = &.{
+                    // TODO: trickle down opts
                     usage().?,
                     description().?,
                     examples() orelse "",
@@ -400,26 +421,27 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 }
 
 pub fn HelpData(T: type) type {
-    const SpecEnum = std.meta.FieldEnum(T);
     return struct {
-        // TODO: use ?
+        const SpecEnum = std.meta.FieldEnum(T);
         usage: ?[]const []const u8 = null,
         description: ?[]const u8 = null,
         shortDescription: ?[]const u8 = null,
         examples: ?[]const []const u8 = null,
         optionsDescription: ?[]const FieldDesc = null,
-        footer: []const u8 = &.{},
+        footer: ?[]const u8 = null,
 
         pub const FieldDesc = struct {
-            field: []const u8,
-            description: []const u8,
+            field: SpecEnum,
+            description: ?[]const u8 = null,
             defaultHint: bool = true,
             typeHint: bool = true,
 
-            pub fn init(comptime field: SpecEnum, description: []const u8) @This() {
-                return comptime .{
-                    .field = @tagName(field),
+            pub fn init(field: @Type(.enum_literal), description: ?[]const u8, defaultHint: bool, typeHint: bool) @This() {
+                return .{
+                    .field = field,
                     .description = description,
+                    .defaultHint = defaultHint,
+                    .typeHint = typeHint,
                 };
             }
         };
@@ -485,7 +507,7 @@ test "examples" {
         \\Examples:
         \\  prog --help
         \\  prog --verbose help --help
-    , HelpFmt(Spec, .{ .blockDelimiter = "" }).examples().?);
+    , HelpFmt(Spec, .{ .headerDelimiter = "" }).examples().?);
 }
 
 test "commands" {
@@ -497,7 +519,7 @@ test "commands" {
     , HelpFmt(struct {
         pub const A = struct {};
         pub const Verb = union(enum) { a: A };
-    }, .{ .blockDelimiter = "" }).commands().?);
+    }, .{ .headerDelimiter = "" }).commands().?);
     const Spec = struct {
         pub const A = struct {
             pub const Help: HelpData(@This()) = .{
@@ -538,117 +560,310 @@ test "commands" {
     , HelpFmt(Spec, .{}).commands().?);
 }
 
-test "options" {
+test "options basic" {
     const t = std.testing;
     try t.expectEqual(null, HelpFmt(struct {}, .{}).options());
+
     try t.expectEqualStrings(
         \\Options:
-        \\  --posX
+        \\  --posZ
+    , HelpFmt(struct {
+        posZ: i32 = undefined,
+    }, .{ .headerDelimiter = "" }).options().?);
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  -x, --posX (i32)        position Z
     , HelpFmt(struct {
         posX: i32 = undefined,
-    }, .{ .blockDelimiter = "" }).options().?);
-    const Spec = struct {
-        posX: ?i32 = null,
-        posY: ?i32 = null,
-        len: usize = 0,
-        ranges: []const []const usize = &.{
-            &.{ 0, 0 },
-            &.{ 1, 1 },
-            &.{ 2, 2 },
-        },
-        name: []const u8 = "placeholder",
-        name2: ?[]const u8 = "placeholder",
-        name3: ?[]const u8 = null,
-        names: []const []const u8 = &.{
-            "aname",
-            "bname",
-        },
-
-        pub const Short = .{
-            .x = .posX,
-            .y = .posY,
-            .l = .len,
-            .rS = .ranges,
-            .n = .name,
-            .n2 = .name2,
+        pub const Short = .{ .x = .posX };
+        const HelpThis = HelpData(@This());
+        pub const Help: HelpThis = .{
+            .optionsDescription = &.{
+                // NOTE: getting weird issues with field enum recognition
+                HelpThis.FieldDesc.init(.posX, "position Z", true, true),
+            },
         };
-
-        const SpecHelpData = HelpData(@This());
-        pub const Help: SpecHelpData = .{
-            .optionsDescription = &.{ SpecHelpData.FieldDesc.init(
-                .posX,
-                "X position",
-            ), SpecHelpData.FieldDesc.init(
-                .posY,
-                "Y position",
-            ), SpecHelpData.FieldDesc.init(
-                .len,
-                "length of whatever this is",
-            ), SpecHelpData.FieldDesc.init(
-                .ranges,
-                "range list",
-            ), SpecHelpData.FieldDesc.init(
-                .name,
-                "a name",
-            ), .{
-                .field = @tagName(.name2),
-                .description = "a pol of names",
-                .typeHint = false,
-                .defaultHint = false,
-            }, .{
-                .field = @tagName(.name3),
-                .description = "a pol of names",
-                .typeHint = false,
-            }, .{
-                .field = @tagName(.names),
-                .description = "a pol of names",
-                .defaultHint = false,
-            } },
-        };
-    };
+    }, .{ .headerDelimiter = "" }).options().?);
     try t.expectEqualStrings(
         \\Options:
-        \\
-        \\  -x, --posX (?i32 = null)                                            X position
-        \\  -y, --posY (?i32 = null)                                            Y position
-        \\  -l, --len (usize = 0)                                               length of whatever this is
-        \\  -rS, --ranges ([][]usize = { { 0, 0 }, { 1, 1 }, { 2, 2 } })        range list
-        \\  -n, --name ([]u8 = 'placeholder')                                   a name
-        \\  -n2, --name2                                                        a pol of names
-        \\  --name3 (null)                                                      a pol of names
-        \\  --names ([][]u8)                                                    a pol of names
-    , HelpFmt(Spec, .{}).options().?);
+        \\  -x, --posX (i32 = 1)
+        \\    position Z
+    , HelpFmt(struct {
+        posX: i32 = 1,
+        pub const Short = .{ .x = .posX };
+        const HelpThis = HelpData(@This());
+        pub const Help: HelpThis = .{
+            .optionsDescription = &.{
+                // NOTE: getting weird issues with field enum recognition
+                HelpThis.FieldDesc.init(.posX, "position Z", true, true),
+            },
+        };
+    }, .{ .headerDelimiter = "", .optionsBreakline = true }).options().?);
     try t.expectEqualStrings(
         \\Options:
-        \\  -x, --posX (?i32 = null)
-        \\    X position
-        \\
-        \\  -y, --posY (?i32 = null)
-        \\    Y position
-        \\
-        \\  -l, --len (usize = 0)
-        \\    length of whatever this is
-        \\
-        \\  -rS, --ranges ([][]usize = { { 0, 0 }, { 1, 1 }, { 2, 2 } })
-        \\    range list
-        \\
-        \\  -n, --name ([]u8 = 'placeholder')
-        \\    a name
-        \\
-        \\  -n2, --name2
-        \\    a pol of names
-        \\
-        \\  --name3 (null)
-        \\    a pol of names
-        \\
-        \\  --names ([][]u8)
-        \\    a pol of names
-        \\
-    , HelpFmt(Spec, .{
-        .blockDelimiter = "",
-        .optionsBreakline = true,
-    }).options().?);
+        \\  -x, --posX (i32)
+    , HelpFmt(struct {
+        posX: i32 = 1,
+        pub const Short = .{ .x = .posX };
+        const HelpThis = HelpData(@This());
+        pub const Help: HelpThis = .{
+            .optionsDescription = &.{
+                // NOTE: getting weird issues with field enum recognition
+                HelpThis.FieldDesc.init(.posX, null, false, true),
+            },
+        };
+    }, .{ .headerDelimiter = "" }).options().?);
+    try t.expectEqualStrings(
+        \\Options:
+        \\  -x, --posX (1)
+    , HelpFmt(struct {
+        posX: i32 = 1,
+        pub const Short = .{ .x = .posX };
+        const HelpThis = HelpData(@This());
+        pub const Help: HelpThis = .{
+            .optionsDescription = &.{
+                // NOTE: getting weird issues with field enum recognition
+                HelpThis.FieldDesc.init(.posX, null, true, false),
+            },
+        };
+    }, .{ .headerDelimiter = "" }).options().?);
+    try t.expectEqualStrings(
+        \\Options:
+        \\  -x, --posX
+    , HelpFmt(struct {
+        posX: i32 = 1,
+        pub const Short = .{ .x = .posX };
+        const HelpThis = HelpData(@This());
+        pub const Help: HelpThis = .{
+            .optionsDescription = &.{
+                // NOTE: getting weird issues with field enum recognition
+                HelpThis.FieldDesc.init(.posX, null, false, false),
+            },
+        };
+    }, .{ .headerDelimiter = "" }).options().?);
 }
+
+test "options ints" {
+    const t = std.testing;
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --posX (i1)
+        \\  --posY (i2 = -1)
+        \\  --posZ (?i1 = null)
+    , HelpFmt(struct {
+        posX: i1 = undefined,
+        posY: i2 = -1,
+        posZ: ?i1 = null,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .posX },
+                .{ .field = .posY },
+                .{ .field = .posZ },
+            },
+        };
+    }, .{ .headerDelimiter = "" }).options().?);
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --posX (int)
+        \\  --posZ (?int = null)
+    , HelpFmt(struct {
+        posX: i32 = undefined,
+        posZ: ?i1 = null,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .posX },
+                .{ .field = .posZ },
+            },
+        };
+    }, .{ .headerDelimiter = "", .simpleTypes = true }).options().?);
+}
+
+test "options floats" {
+    const t = std.testing;
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --posX (f32)
+        \\  --posY (f32 = -1.11)
+        \\  --posZ (?f64 = 4.41)
+    , HelpFmt(struct {
+        posX: f32 = undefined,
+        posY: f32 = -1.11,
+        posZ: ?f64 = 4.41,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .posX },
+                .{ .field = .posY },
+                .{ .field = .posZ },
+            },
+        };
+    }, .{ .headerDelimiter = "" }).options().?);
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --posX (float)
+        \\  --posZ (?float = null)
+    , HelpFmt(struct {
+        posX: f32 = undefined,
+        posZ: ?f64 = null,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .posX },
+                .{ .field = .posZ },
+            },
+        };
+    }, .{ .headerDelimiter = "", .simpleTypes = true }).options().?);
+}
+
+test "options string" {
+    const t = std.testing;
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --nameA ([]u8)
+        \\  --nameB ([]u8 = 'name')
+        \\  --nameC (?[]u8 = 'name2')
+        \\  --nameD (?[]u8 = null)
+    , HelpFmt(struct {
+        nameA: []const u8 = undefined,
+        nameB: []const u8 = "name",
+        nameC: ?[]u8 = @as([]u8, @constCast(@ptrCast("name2"))),
+        nameD: ?[]const u8 = null,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .nameA },
+                .{ .field = .nameB },
+                .{ .field = .nameC },
+                .{ .field = .nameD },
+            },
+        };
+    }, .{ .headerDelimiter = "" }).options().?);
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --nameA (string)
+        \\  --nameB (string = 'name')
+        \\  --nameC (?string = 'name2')
+        \\  --nameD (?string = null)
+    , HelpFmt(struct {
+        nameA: []const u8 = undefined,
+        nameB: []const u8 = "name",
+        nameC: ?[]u8 = @as([]u8, @constCast(@ptrCast("name2"))),
+        nameD: ?[]const u8 = null,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .nameA },
+                .{ .field = .nameB },
+                .{ .field = .nameC },
+                .{ .field = .nameD },
+            },
+        };
+    }, .{ .headerDelimiter = "", .simpleTypes = true }).options().?);
+}
+
+test "options arrays" {
+    const t = std.testing;
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --names ([][]u8 = {'name1', 'name2'})
+        \\  --nbers ([]usize = {1, 2, 3})
+        \\  --floats ([]f32 = {1.1, 2.2, 3.3})
+        \\  --ranges ([][]usize = {{1, 2}, {3, 4}})
+        \\  --optNames (?[][]u8 = {'name1', 'name2'})
+        \\  --optNbers (?[]usize = {1, 2, 3})
+        \\  --optFloats (?[]f32 = {1.1, 2.2, 3.3})
+        \\  --optRanges (?[][]usize = {{1, 2}, {3, 4}})
+        \\  --namesOpt ([]?[]u8 = {'name1', null})
+        \\  --nbersOpt ([]?usize = {1, 2, null})
+        \\  --floatsOpt ([]?f32 = {1.1, 2.2, null})
+        \\  --rangesOpt ([]?[]usize = {{1, 2}, null})
+        \\  --rangesNOpt ([][]?usize = {{1, 2}, {3, null}})
+    , HelpFmt(struct {
+        names: []const []const u8 = &.{ "name1", "name2" },
+        nbers: []const usize = &.{ 1, 2, 3 },
+        floats: []const f32 = &.{ 1.1, 2.2, 3.3 },
+        ranges: []const []const usize = &.{ &.{ 1, 2 }, &.{ 3, 4 } },
+        optNames: ?[]const []const u8 = &.{ "name1", "name2" },
+        optNbers: ?[]const usize = &.{ 1, 2, 3 },
+        optFloats: ?[]const f32 = &.{ 1.1, 2.2, 3.3 },
+        optRanges: ?[]const []const usize = &.{ &.{ 1, 2 }, &.{ 3, 4 } },
+        namesOpt: []const ?[]const u8 = &.{ "name1", null },
+        nbersOpt: []const ?usize = &.{ 1, 2, null },
+        floatsOpt: []const ?f32 = &.{ 1.1, 2.2, null },
+        rangesOpt: []const ?[]const usize = &.{ &.{ 1, 2 }, null },
+        rangesNOpt: []const []const ?usize = &.{ &.{ 1, 2 }, &.{ 3, null } },
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .names },
+                .{ .field = .nbers },
+                .{ .field = .floats },
+                .{ .field = .ranges },
+                .{ .field = .optNames },
+                .{ .field = .optNbers },
+                .{ .field = .optFloats },
+                .{ .field = .optRanges },
+                .{ .field = .namesOpt },
+                .{ .field = .nbersOpt },
+                .{ .field = .floatsOpt },
+                .{ .field = .rangesOpt },
+                .{ .field = .rangesNOpt },
+            },
+        };
+    }, .{ .headerDelimiter = "" }).options().?);
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --names ([]string = ['name1', 'name2'])
+        \\  --nbers ([]int = [1, 2, 3])
+        \\  --floats ([]float = [1.1, 2.2, 3.3])
+        \\  --ranges ([][]int = [[1, 2], [3, 4]])
+        \\  --optNames (?[]string = ['name1', 'name2'])
+        \\  --optNbers (?[]int = [1, 2, 3])
+        \\  --optFloats (?[]float = [1.1, 2.2, 3.3])
+        \\  --optRanges (?[][]int = [[1, 2], [3, 4]])
+        \\  --namesOpt ([]?string = ['name1', null])
+        \\  --nbersOpt ([]?int = [1, 2, null])
+        \\  --floatsOpt ([]?float = [1.1, 2.2, null])
+        \\  --rangesOpt ([]?[]int = [[1, 2], null])
+        \\  --rangesNOpt ([][]?int = [[1, 2], [3, null]])
+    , HelpFmt(struct {
+        names: []const []const u8 = &.{ "name1", "name2" },
+        nbers: []const usize = &.{ 1, 2, 3 },
+        floats: []const f32 = &.{ 1.1, 2.2, 3.3 },
+        ranges: []const []const usize = &.{ &.{ 1, 2 }, &.{ 3, 4 } },
+        optNames: ?[]const []const u8 = &.{ "name1", "name2" },
+        optNbers: ?[]const usize = &.{ 1, 2, 3 },
+        optFloats: ?[]const f32 = &.{ 1.1, 2.2, 3.3 },
+        optRanges: ?[]const []const usize = &.{ &.{ 1, 2 }, &.{ 3, 4 } },
+        namesOpt: []const ?[]const u8 = &.{ "name1", null },
+        nbersOpt: []const ?usize = &.{ 1, 2, null },
+        floatsOpt: []const ?f32 = &.{ 1.1, 2.2, null },
+        rangesOpt: []const ?[]const usize = &.{ &.{ 1, 2 }, null },
+        rangesNOpt: []const []const ?usize = &.{ &.{ 1, 2 }, &.{ 3, null } },
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .names },
+                .{ .field = .nbers },
+                .{ .field = .floats },
+                .{ .field = .ranges },
+                .{ .field = .optNames },
+                .{ .field = .optNbers },
+                .{ .field = .optFloats },
+                .{ .field = .optRanges },
+                .{ .field = .namesOpt },
+                .{ .field = .nbersOpt },
+                .{ .field = .floatsOpt },
+                .{ .field = .rangesOpt },
+                .{ .field = .rangesNOpt },
+            },
+        };
+    }, .{ .headerDelimiter = "", .simpleTypes = true }).options().?);
+}
+
+// TODO: test other types (enum, union, struct)
+// TODO: test groupmatch
+// TODO: wrap up helper test
 
 test "help" {
     const t = std.testing;
@@ -666,9 +881,12 @@ test "help" {
             };
 
             const MatchHelp = HelpData(@This());
-            pub const Help: MatchHelp = .{ .usage = &.{"seeksub ... match"}, .description = "Matches based on options at the top-level. This performs no mutation or replacement, it's simply a dry-run.", .shortDescription = "Match-only operation. This is a dry-run with no replacement.", .optionsDescription = &.{
-                MatchHelp.FieldDesc.init(.@"match-n", "N-match stop for each file if set."),
-            } };
+            pub const Help: MatchHelp = .{
+                .usage = &.{"seeksub ... match"},
+                .description = "Matches based on options at the top-level. This performs no mutation or replacement, it's simply a dry-run.",
+                .shortDescription = "Match-only operation. This is a dry-run with no replacement.",
+                .optionsDescription = &.{MatchHelp.FieldDesc.init(.@"match-n", "N-match stop for each file if set.", true, true)},
+            };
         };
 
         pub const Diff = struct {
@@ -684,7 +902,7 @@ test "help" {
                 .description = "Matches based on options at the top-level and then performs a replacement over matches, providing a diff return but not actually mutating the files.",
                 .shortDescription = "Dry-runs replacement. No mutation is performed.",
                 .optionsDescription = &.{
-                    DiffHelp.FieldDesc.init(.replace, "Replace match on all files using this PCRE2 regex."),
+                    DiffHelp.FieldDesc.init(.replace, "Replace match on all files using this PCRE2 regex.", true, true),
                 },
             };
 
@@ -708,8 +926,11 @@ test "help" {
                 .description = "Matches based on options at the top-level and then performs a replacement over matches. This is mutate the files.",
                 .shortDescription = "Replaces based on match and replace PCRE2 regexes over all files.",
                 .optionsDescription = &.{
-                    ApplyHelp.FieldDesc.init(.replace, "Replace match on all files using this PCRE2 regex."),
-                    ApplyHelp.FieldDesc.init(.trace, "Trace mutations"),
+                    .{
+                        .field = .replace,
+                        .description = "Replace match on all files using this PCRE2 regex.",
+                    },
+                    .{ .field = .trace, .description = "Trace mutations" },
                 },
             };
 
@@ -736,13 +957,19 @@ test "help" {
             .usage = &.{"seeksub [options] [command] ..."},
             .description = "CLI tool to match, diff and apply regex in bulk using PCRE2. One of the main features of this CLI is the ability to seek byte ranges before matching or replacing.",
             .optionsDescription = &.{
-                SpecHelp.FieldDesc.init(.match, "PCRE2 Regex to match on all files."),
-                SpecHelp.FieldDesc.init(.files, "File path list to run matches on."),
-                SpecHelp.FieldDesc.init(
-                    .byteRanges,
-                    "Range of bytes for n files, top-level array length has to be of (len <= files.len) and will be applied sequentially over files.",
-                ),
-                SpecHelp.FieldDesc.init(.verbose, "Verbose mode."),
+                .{
+                    .field = .match,
+                    .description = "PCRE2 Regex to match on all files.",
+                },
+                .{
+                    .field = .files,
+                    .description = "File path list to run matches on.",
+                },
+                .{
+                    .field = .byteRanges,
+                    .description = "Range of bytes for n files, top-level array length has to be of (len <= files.len) and will be applied sequentially over files.",
+                },
+                .{ .field = .verbose, .description = "Verbose mode." },
             },
         };
 
@@ -751,10 +978,10 @@ test "help" {
             .mandatoryVerb = true,
         };
     };
-    std.debug.print("{s}", .{HelpFmt(Spec, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
-    std.debug.print("{s}", .{HelpFmt(Spec.Match, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
-    std.debug.print("{s}", .{HelpFmt(Spec.Diff, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
-    std.debug.print("{s}", .{HelpFmt(Spec.Apply, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
+    std.debug.print("{s}\n", .{HelpFmt(Spec, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
+    std.debug.print("{s}\n", .{HelpFmt(Spec.Match, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
+    std.debug.print("{s}\n", .{HelpFmt(Spec.Diff, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
+    std.debug.print("{s}\n", .{HelpFmt(Spec.Apply, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
     _ = t;
     // try t.expectEqualStrings("", HelpFmt(Spec, .{ .simpleTypes = true, .optionsBreakline = true }).help());
 }

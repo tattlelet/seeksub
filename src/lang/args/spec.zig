@@ -109,6 +109,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                 _ = cursor.peek() orelse return;
             }
 
+            // TODO: used FixedBuffer backed by arena, only the last verb copies
             var positionals = try std.ArrayList([]const u8).initCapacity(self.arena.allocator(), 4);
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
@@ -132,6 +133,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                 try positionals.append(item);
             }
             try self.parseVerb(&positionals);
+            // TODO: smarter empty handling
             self.positionals = try positionals.toOwnedSlice();
 
             if (comptime SpecTracker != void) try self.tracker.validate();
