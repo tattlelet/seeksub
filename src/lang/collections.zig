@@ -294,3 +294,105 @@ pub fn ArrayCursor(T: type) type {
         }
     };
 }
+
+pub fn ReverseTokenIterator(comptime T: type, comptime delimiter_type: std.mem.DelimiterType) type {
+    return struct {
+        buffer: []const T,
+        delimiter: switch (delimiter_type) {
+            .sequence, .any => []const T,
+            .scalar => T,
+        },
+        index: usize,
+
+        const Self = @This();
+
+        /// Returns a slice of the current token, or null if tokenization is
+        /// complete, and advances to the next token.
+        pub fn next(self: *Self) ?[]const T {
+            const result = self.peek() orelse return null;
+            self.index -= result.len;
+            return result;
+        }
+
+        /// Returns a slice of the current token, or null if tokenization is
+        /// complete. Does not advance to the next token.
+        pub fn peek(self: *Self) ?[]const T {
+            // move to beginning of token
+            while (self.index > 0 and self.isDelimiter(self.index)) : (self.index -= switch (delimiter_type) {
+                .sequence => self.delimiter.len,
+                .any, .scalar => 1,
+            }) {}
+            const end = self.index;
+            if (end == 0) {
+                return null;
+            }
+
+            // move to end of token
+            var start = end;
+            while (start > 0 and !self.isDelimiter(start)) : (start -= 1) {}
+
+            return self.buffer[start..end];
+        }
+
+        /// Returns a slice of the remaining bytes. Does not affect iterator state.
+        pub fn rest(self: Self) []const T {
+            // move to beginning of token
+            var index: usize = self.index;
+            while (index > 0 and self.isDelimiter(index)) : (index -= switch (delimiter_type) {
+                .sequence => self.delimiter.len,
+                .any, .scalar => 1,
+            }) {}
+            return self.buffer[0..index];
+        }
+
+        /// Resets the iterator to the initial token.
+        pub fn reset(self: *Self) void {
+            self.index = self.buffer.len;
+        }
+
+        fn isDelimiter(self: Self, index: usize) bool {
+            switch (delimiter_type) {
+                .sequence => return std.mem.endsWith(T, self.buffer[0..index], self.delimiter),
+                .any => {
+                    const item = self.buffer[index - 1];
+                    for (self.delimiter) |delimiter_item| {
+                        if (item == delimiter_item) {
+                            return true;
+                        }
+                    }
+                    return false;
+                },
+                .scalar => return self.buffer[index - 1] == self.delimiter,
+            }
+        }
+    };
+}
+
+test "reverse tokenizer" {
+    const t = std.testing;
+    const s: []const u8 = "conf.type.text.banana";
+    var tokenizer = ReverseTokenIterator(u8, .scalar){
+        .buffer = s,
+        .delimiter = '.',
+        .index = s.len,
+    };
+
+    try t.expectEqualStrings("banana", tokenizer.next().?);
+    try t.expectEqualStrings("text", tokenizer.next().?);
+    try t.expectEqualStrings("type", tokenizer.next().?);
+    try t.expectEqualStrings("conf", tokenizer.next().?);
+    try t.expectEqual(null, tokenizer.next());
+
+    const s2: []const u8 = "conf.-.type.-.text.-.banana";
+    var tokenizer2 = ReverseTokenIterator(u8, .sequence){
+        .buffer = s2,
+        .delimiter = ".-.",
+        .index = s2.len,
+    };
+
+    try t.expectEqualStrings("banana", tokenizer2.next().?);
+    try t.expectEqualStrings("text", tokenizer2.next().?);
+    try t.expectEqualStrings("type", tokenizer2.next().?);
+    try t.expectEqualStrings("conf", tokenizer2.next().?);
+    try t.expectEqual(null, tokenizer2.next());
+}
