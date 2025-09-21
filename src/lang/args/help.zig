@@ -9,7 +9,6 @@ pub const HelpConf = struct {
     columnSpace: u4 = 4,
     simpleTypes: bool = false,
     optionsBreakline: bool = false,
-    groupMatchHint: bool = true,
 };
 
 pub const ComptSb = struct {
@@ -49,7 +48,6 @@ pub const ComptSb = struct {
     }
 };
 
-// TODO: add GroupMatch checks for help
 pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
     return struct {
         const Help: HelpData(Spec) = if (@hasDecl(Spec, "Help")) rt: {
@@ -277,10 +275,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                             "Short defined with no default value",
                         ),
                     );
-                    if (std.mem.eql(u8, field.name, tag)) break :rt ComptSb.initTup(.{
-                        "-",
-                        shortField.name,
-                    }).s;
+                    if (std.mem.eql(u8, field.name, tag)) break :rt ComptSb.initTup(.{ "-", shortField.name }).s;
                 }
                 break :rt null;
             };
@@ -301,7 +296,6 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         }
                     },
                     .optional => |opt| {
-                        // TODO: consider groupmatch before including ?
                         b.append("?");
                         Tt = opt.child;
                         continue :rfd @typeInfo(Tt);
@@ -324,7 +318,6 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         continue :rfd @typeInfo(Tt);
                     },
                     .optional => |opt| {
-                        // TODO: consider groupmatch before including ?
                         b.append("?");
                         Tt = opt.child;
                         continue :rfd @typeInfo(Tt);
@@ -366,29 +359,20 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        fn groupInfo(comptime name: []const u8, comptime T: type, comptime group: T) T {
-            return comptime rt: {
-                var result: T = &.{};
-                outer: for (group) |groupBlk| {
-                    for (groupBlk) |item| {
-                        if (std.mem.eql(u8, @tagName(item), name)) {
-                            result = result ++ @as(T, &.{groupBlk});
-                            continue :outer;
-                        }
-                    }
-                }
-                break :rt result;
-            };
-        }
-
         fn groupToArgsText(comptime name: []const u8, comptime group: anytype) ?[]const u8 {
+            @setEvalBranchQuota(5545);
             return comptime rt: {
                 var b = ComptSb.init("");
                 for (group) |groupBlk| {
-                    for (groupBlk) |item| {
-                        if (std.mem.eql(u8, @tagName(item), name)) continue;
-                        if (b.s.len > 0) b.append(", ");
-                        b.appendAll(.{ "--", @tagName(item) });
+                    for (groupBlk, 0..) |item, idxSelf| {
+                        if (std.mem.eql(u8, @tagName(item), name)) {
+                            for (groupBlk, 0..) |toAdd, i| {
+                                if (idxSelf == i) continue;
+                                if (b.s.len > 0) b.append(", ");
+                                b.appendAll(.{ "--", @tagName(toAdd) });
+                            }
+                            break;
+                        }
                     }
                 }
                 break :rt if (b.s.len > 0) b.s else null;
@@ -403,24 +387,21 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
         pub fn groupMatchInfo(comptime name: []const u8) ?[]const u8 {
             return comptime rt: {
-                if (!conf.groupMatchHint) break :rt null;
                 if (!@hasDecl(Spec, "GroupMatch")) break :rt null;
 
-                const inclusive = groupInfo(name, @TypeOf(GroupMatch.mutuallyInclusive), GroupMatch.mutuallyInclusive);
-
-                const exclusive = groupInfo(name, @TypeOf(GroupMatch.mutuallyExclusive), GroupMatch.mutuallyExclusive);
-
-                var b = ComptSb.init(if (isRequired(name)) "[Required] " else "");
-                if (groupToArgsText(name, inclusive)) |inclText| b.appendAll(.{
+                var b = ComptSb.init(if (isRequired(name)) "[Required]" else "");
+                if (groupToArgsText(name, GroupMatch.mutuallyInclusive)) |inclText| b.appendAll(.{
+                    if (b.s.len > 0) " " else "",
                     "[Requires: ",
                     inclText,
-                    "] ",
+                    "]",
                 });
 
-                if (groupToArgsText(name, exclusive)) |exclText| b.appendAll(.{
+                if (groupToArgsText(name, GroupMatch.mutuallyExclusive)) |exclText| b.appendAll(.{
+                    if (b.s.len > 0) " " else "",
                     "[Excludes: ",
                     exclText,
-                    "] ",
+                    "]",
                 });
 
                 break :rt b.s;
@@ -429,9 +410,12 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
         pub fn options() ?[]const u8 {
             return comptime rt: {
+                @setEvalBranchQuota(100000);
                 const fields = std.meta.fields(Spec);
                 if (fields.len == 0) break :rt null;
                 const OptShortFields: ?[]const btType.StructField = if (@hasDecl(Spec, "Short")) std.meta.fields(@TypeOf(Spec.Short)) else null;
+
+                const KV = struct { []const u8, usize };
 
                 var optionPieces: [fields.len][]const u8 = undefined;
                 for (fields, 0..) |field, i| {
@@ -445,37 +429,42 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     optionPieces[i] = piece.s;
                 }
 
+                const optsSize = if (Help.optionsDescription) |descriptions| descriptions.len else 0;
+                var optsIndxKv: [optsSize]KV = undefined;
+                if (Help.optionsDescription) |descriptions| for (descriptions, 0..) |desc, i| {
+                    optsIndxKv[i] = .{ @tagName(desc.field), i };
+                };
+                const optIdx = std.static_string_map.StaticStringMap(usize).initComptime(optsIndxKv);
+
                 var b = ComptSb.initTup(.{ "Options:\n", conf.headerDelimiter });
                 const columDelim = columnDelimiter(optionPieces);
                 const innerBlock: [conf.indent * 2]u8 = @splat(' ');
 
                 for (fields, &optionPieces, 0..) |field, optionPiece, i| {
+                    defer if (i < fields.len - 1) b.append("\n");
                     b.appendAll(.{ INDENT, optionPiece });
+                    if (Help.optionsDescription == null) continue;
 
-                    // TODO: build config on the fly for field based on config
-                    // config will enable default typehint / default hint
-                    // with not description
-                    if (Help.optionsDescription) |descriptions| for (descriptions) |desc| {
-                        if (!std.mem.eql(u8, @tagName(desc.field), field.name)) continue;
+                    const optI = optIdx.get(field.name) orelse continue;
+                    const desc = Help.optionsDescription.?[optI];
 
-                        const displacement: []const u8 = if (conf.optionsBreakline) "\n" ++ innerBlock else &@as(
-                            [columDelim - optionPiece.len]u8,
-                            @splat(' '),
-                        );
+                    const displacement: []const u8 = if (conf.optionsBreakline) "\n" ++ innerBlock else &@as(
+                        [columDelim - optionPiece.len]u8,
+                        @splat(' '),
+                    );
 
-                        const rules = groupMatchInfo(field.name);
+                    const rules = if (desc.groupMatchHint) groupMatchInfo(field.name) else null;
 
-                        if (rules != null or desc.description != null) {
-                            b.append(displacement);
-                            if (rules) |vRules| b.append(vRules);
-                            if (desc.description) |vDesc| b.append(vDesc);
-                        }
+                    if (rules != null or desc.description != null) {
+                        b.append(displacement);
+                        if (rules) |vRules| b.append(vRules);
+                        if (desc.description) |vDesc| b.appendAll(.{
+                            if (rules != null) " " else "",
+                            vDesc,
+                        });
+                    }
 
-                        if (conf.optionsBreakline and i < fields.len - 1) b.append("\n");
-                        break;
-                    };
-
-                    if (i < fields.len - 1) b.append("\n");
+                    if (conf.optionsBreakline and i < fields.len - 1) b.append("\n");
                 }
                 break :rt b.s;
             };
@@ -483,34 +472,76 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
         pub fn help() []const u8 {
             return comptime rt: {
-                var helpText: []const u8 = "";
-                // TODO: add footer
-                const pieces: []const []const u8 = &.{
-                    // TODO: trickle down opts
-                    usage().?,
-                    description().?,
-                    examples() orelse "",
-                    commands() orelse "",
-                    options() orelse "",
+                var b = ComptSb.init("");
+                const pieces: []const ?[]const u8 = &.{
+                    usage(),
+                    description(),
+                    examples(),
+                    commands(),
+                    options(),
+                    Help.footer,
                 };
-                for (pieces, 0..) |piece, i| {
-                    if (piece.len > 1) {
-                        var breakline: []const u8 = "\n";
-                        if (i < pieces.len - 1) {
-                            breakline = breakline ++ "\n";
-                        }
-                        helpText = helpText ++ piece ++ breakline;
-                    }
+                var addLines = 0;
+                for (pieces) |pieceOpt| {
+                    const piece = pieceOpt orelse continue;
+
+                    const breakline = ComptSb.init("");
+                    if (addLines > 0) breakline.append("\n\n");
+                    b.appendAll(.{ breakline.s, piece });
+                    addLines += 1;
                 }
-                break :rt helpText;
+                break :rt b.s;
             };
         }
     };
 }
 
+pub fn FieldEnum(comptime T: type) type {
+    const field_infos = std.meta.fields(T);
+
+    if (field_infos.len == 0) {
+        return @Type(.{
+            .@"enum" = .{
+                .tag_type = u0,
+                .fields = &.{},
+                .decls = &.{},
+                .is_exhaustive = true,
+            },
+        });
+    }
+
+    if (@typeInfo(T) == .@"union") {
+        if (@typeInfo(T).@"union".tag_type) |tag_type| {
+            for (std.enums.values(tag_type), 0..) |v, i| {
+                if (@intFromEnum(v) != i) break; // enum values not consecutive
+                if (!std.mem.eql(u8, @tagName(v), field_infos[i].name)) break; // fields out of order
+            } else {
+                return tag_type;
+            }
+        }
+    }
+
+    var enumFields: [field_infos.len]std.builtin.Type.EnumField = undefined;
+    var decls = [_]std.builtin.Type.Declaration{};
+    inline for (field_infos, 0..) |field, i| {
+        enumFields[i] = .{
+            .name = field.name ++ "",
+            .value = i,
+        };
+    }
+    return @Type(.{
+        .@"enum" = .{
+            .tag_type = std.math.IntFittingRange(0, field_infos.len),
+            .fields = &enumFields,
+            .decls = &decls,
+            .is_exhaustive = true,
+        },
+    });
+}
+
 pub fn HelpData(T: type) type {
     return struct {
-        const SpecEnum = std.meta.FieldEnum(T);
+        const SpecEnum = FieldEnum(T);
         usage: ?[]const []const u8 = null,
         description: ?[]const u8 = null,
         shortDescription: ?[]const u8 = null,
@@ -523,6 +554,7 @@ pub fn HelpData(T: type) type {
             description: ?[]const u8 = null,
             defaultHint: bool = true,
             typeHint: bool = true,
+            groupMatchHint: bool = true,
         };
     };
 }
@@ -652,6 +684,7 @@ test "options basic" {
 
     try t.expectEqualStrings(
         \\Options:
+        \\
         \\  -x, --posX (i32)        position X
         \\  --posY (u17)            position Y
     , HelpFmt(struct {
@@ -665,71 +698,97 @@ test "options basic" {
                 .{ .field = .posY, .description = "position Y" },
             },
         };
-    }, .{ .headerDelimiter = "" }).options().?);
+    }, .{}).options().?);
     try t.expectEqualStrings(
         \\Options:
         \\  -x, --posX (u1 = 0)
         \\    position X
-        \\
-        \\  -y, --posY (bool = false)
-        \\    position Y
     , HelpFmt(struct {
         posX: u1 = 0,
-        posY: bool = false,
-        pub const Short = .{ .x = .posX, .y = .posY };
+        pub const Short = .{ .x = .posX };
         const HelpThis = HelpData(@This());
         pub const Help: HelpThis = .{
             .optionsDescription = &.{
                 .{ .field = .posX, .description = "position X" },
-                .{ .field = .posY, .description = "position Y" },
             },
         };
     }, .{ .headerDelimiter = "", .optionsBreakline = true }).options().?);
     try t.expectEqualStrings(
         \\Options:
         \\  --posX (usize)
-        \\  --posY (usize)
     , HelpFmt(struct {
         posX: usize = 3,
-        posY: usize = 5,
         const HelpThis = HelpData(@This());
         pub const Help: HelpThis = .{
             .optionsDescription = &.{
                 .{ .field = .posX, .defaultHint = false },
-                .{ .field = .posY, .defaultHint = false },
             },
         };
     }, .{ .headerDelimiter = "" }).options().?);
     try t.expectEqualStrings(
         \\Options:
-        \\  --posX (1.1)
-        \\  --posY (-1.1)
+        \\  --posX (-1.1)
     , HelpFmt(struct {
-        posX: f32 = 1.1,
-        posY: f64 = -1.1,
+        posX: f32 = -1.1,
         const HelpThis = HelpData(@This());
         pub const Help: HelpThis = .{
             .optionsDescription = &.{
                 .{ .field = .posX, .typeHint = false },
-                .{ .field = .posY, .typeHint = false },
             },
         };
     }, .{ .headerDelimiter = "" }).options().?);
     try t.expectEqualStrings(
         \\Options:
         \\  --posX
-        \\  --posY
     , HelpFmt(struct {
         posX: f32 = 1.1,
-        posY: f64 = -1.1,
         const HelpThis = HelpData(@This());
         pub const Help: HelpThis = .{
             .optionsDescription = &.{
                 .{ .field = .posX, .typeHint = false, .defaultHint = false },
-                .{ .field = .posY, .typeHint = false, .defaultHint = false },
             },
         };
     }, .{ .headerDelimiter = "" }).options().?);
+}
+
+test "options bool" {
+    const t = std.testing;
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --b1 (bool)
+        \\  --b2 (bool = false)
+        \\  --b3 (?bool = null)
+    , HelpFmt(struct {
+        b1: bool = undefined,
+        b2: bool = false,
+        b3: ?bool = null,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .b1 },
+                .{ .field = .b2 },
+                .{ .field = .b3 },
+            },
+        };
+    }, .{ .headerDelimiter = "" }).options().?);
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --b1 (bool)
+        \\  --b2 (bool = false)
+        \\  --b3 (?bool = null)
+    , HelpFmt(struct {
+        b1: bool = undefined,
+        b2: bool = false,
+        b3: ?bool = null,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .b1 },
+                .{ .field = .b2 },
+                .{ .field = .b3 },
+            },
+        };
+    }, .{ .headerDelimiter = "", .simpleTypes = true }).options().?);
 }
 
 test "options ints" {
@@ -990,16 +1049,16 @@ test "options union" {
 
     try t.expectEqualStrings(
         \\Options:
-        \\  --unionA (U = U{ .a = A{ .x = -1, .y = 'name', .z = null, .w = {'asdas', null} } })
+        \\  --unionA (U = U{ .a = A{ .x = -1, .name = 'name', .z = null, .arr = {'asdas', null} } })
         \\  --unionB (U = U{ .b = B{ .y = 2 } })
     , HelpFmt(struct {
         unionA: U = .{ .a = .{ .x = -1 } },
         unionB: U = .{ .b = .{ .y = 2 } },
         pub const A = struct {
             x: i32,
-            y: []const u8 = "name",
+            name: []const u8 = "name",
             z: ?usize = null,
-            w: ?[]const ?[]const u8 = &.{
+            arr: ?[]const ?[]const u8 = &.{
                 "asdas",
                 null,
             },
@@ -1021,16 +1080,16 @@ test "options union" {
 
     try t.expectEqualStrings(
         \\Options:
-        \\  --unionA (U = { 'a': { 'x': -1, 'y': 'name', 'z': null, 'w': ['asdas', null] } })
+        \\  --unionA (U = { 'a': { 'x': -1, 'name': 'name', 'z': null, 'arr': ['asdas', null] } })
         \\  --unionB (U = { 'b': { 'y': 2 } })
     , HelpFmt(struct {
         unionA: U = .{ .a = .{ .x = -1 } },
         unionB: U = .{ .b = .{ .y = 2 } },
         pub const A = struct {
             x: i32,
-            y: []const u8 = "name",
+            name: []const u8 = "name",
             z: ?usize = null,
-            w: ?[]const ?[]const u8 = &.{
+            arr: ?[]const ?[]const u8 = &.{
                 "asdas",
                 null,
             },
@@ -1117,10 +1176,420 @@ test "options struct" {
     }, .{ .headerDelimiter = "", .simpleTypes = true }).options().?);
 }
 
-test "groupmatch info" {}
+test "groupmatch info" {
+    const t = std.testing;
 
-// TODO: test groupmatch
-// TODO: wrap up helper test
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --n1
+        \\    [Required]
+        \\
+        \\  --n2
+        \\    [Required]
+        \\
+        \\  --a1
+        \\    [Required] [Requires: --a2, --a6, --a3, --a7] [Excludes: --a5, --a8]
+        \\
+        \\  --a2
+        \\    [Requires: --a1, --a6]
+        \\
+        \\  --a3
+        \\    [Requires: --a1, --a7]
+        \\
+        \\  --a4
+        \\    [Requires: --a5, --a8]
+        \\
+        \\  --a5
+        \\    [Requires: --a4, --a8] [Excludes: --a1, --a8]
+        \\
+        \\  --a6
+        \\    [Requires: --a1, --a2]
+        \\
+        \\  --a7
+        \\    [Requires: --a1, --a3]
+        \\
+        \\  --a8
+        \\    [Requires: --a4, --a5] [Excludes: --a1, --a5]
+        \\
+        \\  --b1
+        \\    [Required] [Requires: --b5, --b8] [Excludes: --b2, --b6, --b3, --b7]
+        \\
+        \\  --b2
+        \\    [Excludes: --b1, --b6]
+        \\
+        \\  --b3
+        \\    [Excludes: --b1, --b7]
+        \\
+        \\  --b4
+        \\    [Excludes: --b5, --b8]
+        \\
+        \\  --b5
+        \\    [Requires: --b1, --b8] [Excludes: --b4, --b8]
+        \\
+        \\  --b6
+        \\    [Excludes: --b1, --b2]
+        \\
+        \\  --b7
+        \\    [Excludes: --b1, --b3]
+        \\
+        \\  --b8
+        \\    [Requires: --b1, --b5] [Excludes: --b4, --b5]
+    , HelpFmt(struct {
+        n1: u32 = undefined,
+        n2: u32 = undefined,
+        a1: u32 = undefined,
+        a2: u32 = undefined,
+        a3: u32 = undefined,
+        a4: u32 = undefined,
+        a5: u32 = undefined,
+        a6: u32 = undefined,
+        a7: u32 = undefined,
+        a8: u32 = undefined,
+        b1: u32 = undefined,
+        b2: u32 = undefined,
+        b3: u32 = undefined,
+        b4: u32 = undefined,
+        b5: u32 = undefined,
+        b6: u32 = undefined,
+        b7: u32 = undefined,
+        b8: u32 = undefined,
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .mutuallyInclusive = &.{
+                &.{ .a1, .a2, .a6 },
+                &.{ .a1, .a3, .a7 },
+                &.{ .a4, .a5, .a8 },
+                &.{ .b1, .b5, .b8 },
+            },
+            .mutuallyExclusive = &.{
+                &.{ .a1, .a5, .a8 },
+                &.{ .b1, .b2, .b6 },
+                &.{ .b1, .b3, .b7 },
+                &.{ .b4, .b5, .b8 },
+            },
+            .required = &.{ .n1, .n2, .a1, .b1 },
+        };
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .n1, .typeHint = false, .defaultHint = false },
+                .{ .field = .n2, .typeHint = false, .defaultHint = false },
+                .{ .field = .a1, .typeHint = false, .defaultHint = false },
+                .{ .field = .a2, .typeHint = false, .defaultHint = false },
+                .{ .field = .a3, .typeHint = false, .defaultHint = false },
+                .{ .field = .a4, .typeHint = false, .defaultHint = false },
+                .{ .field = .a5, .typeHint = false, .defaultHint = false },
+                .{ .field = .a6, .typeHint = false, .defaultHint = false },
+                .{ .field = .a7, .typeHint = false, .defaultHint = false },
+                .{ .field = .a8, .typeHint = false, .defaultHint = false },
+                .{ .field = .b1, .typeHint = false, .defaultHint = false },
+                .{ .field = .b2, .typeHint = false, .defaultHint = false },
+                .{ .field = .b3, .typeHint = false, .defaultHint = false },
+                .{ .field = .b4, .typeHint = false, .defaultHint = false },
+                .{ .field = .b5, .typeHint = false, .defaultHint = false },
+                .{ .field = .b6, .typeHint = false, .defaultHint = false },
+                .{ .field = .b7, .typeHint = false, .defaultHint = false },
+                .{ .field = .b8, .typeHint = false, .defaultHint = false },
+            },
+        };
+    }, .{ .headerDelimiter = "", .optionsBreakline = true }).options().?);
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --n1
+        \\    [Required] n1 desc
+        \\
+        \\  --n2
+    , HelpFmt(struct {
+        n1: u32 = undefined,
+        n2: u32 = undefined,
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .required = &.{ .n1, .n2 },
+        };
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .n1, .description = "n1 desc", .typeHint = false, .defaultHint = false },
+                .{ .field = .n2, .groupMatchHint = false, .typeHint = false, .defaultHint = false },
+            },
+        };
+    }, .{ .headerDelimiter = "", .optionsBreakline = true }).options().?);
+}
+
+test "help" {
+    const t = std.testing;
+    try t.expectEqualStrings("", HelpFmt(
+        struct {},
+        .{ .headerDelimiter = "" },
+    ).help());
+
+    try t.expectEqualStrings(
+        \\Usage: test [options] [commands] ...
+    , HelpFmt(struct {
+        pub const Help: HelpData(@This()) = .{
+            .usage = &.{"test [options] [commands] ..."},
+        };
+    }, .{ .headerDelimiter = "" }).help());
+
+    try t.expectEqualStrings(
+        \\  Some description about test
+    , HelpFmt(struct {
+        pub const Help: HelpData(@This()) = .{
+            .description = "Some description about test",
+        };
+    }, .{ .headerDelimiter = "" }).help());
+
+    try t.expectEqualStrings(
+        \\Usage: test [options] [commands] ...
+        \\
+        \\  Some description about test
+    , HelpFmt(struct {
+        pub const Help: HelpData(@This()) = .{
+            .usage = &.{"test [options] [commands] ..."},
+            .description = "Some description about test",
+        };
+    }, .{ .headerDelimiter = "" }).help());
+
+    try t.expectEqualStrings(
+        \\Usage: test [options] [commands] ...
+        \\
+        \\  Some description about test
+        \\
+        \\Examples:
+        \\
+        \\  test --verbose match 1 1
+        \\  test --verbose match 2 1
+    , HelpFmt(struct {
+        pub const Help: HelpData(@This()) = .{
+            .usage = &.{"test [options] [commands] ..."},
+            .description = "Some description about test",
+            .examples = &.{
+                "test --verbose match 1 1",
+                "test --verbose match 2 1",
+            },
+        };
+    }, .{}).help());
+
+    try t.expectEqualStrings(
+        \\Options:
+        \\  --i1 (i32 = 0)      i1 desc
+    , HelpFmt(struct {
+        i1: i32 = 0,
+        pub const Help: HelpData(@This()) = .{
+            .optionsDescription = &.{
+                .{ .field = .i1, .description = "i1 desc" },
+            },
+        };
+    }, .{ .headerDelimiter = "" }).help());
+
+    try t.expectEqualStrings(
+        \\Usage: test [options] [commands] ...
+        \\
+        \\  Some description about test
+        \\
+        \\Examples:
+        \\
+        \\  test --verbose match 1 1
+        \\  test --verbose match 2 1
+        \\
+        \\Options:
+        \\
+        \\  -i, --i1 (i32 = 0)      [Required] i1 desc
+    , HelpFmt(struct {
+        i1: i32 = 0,
+        pub const Short = .{ .i = .i1 };
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .required = &.{.i1},
+        };
+        pub const Help: HelpData(@This()) = .{
+            .usage = &.{"test [options] [commands] ..."},
+            .description = "Some description about test",
+            .examples = &.{
+                "test --verbose match 1 1",
+                "test --verbose match 2 1",
+            },
+            .optionsDescription = &.{
+                .{ .field = .i1, .description = "i1 desc" },
+            },
+        };
+    }, .{}).help());
+
+    try t.expectEqualStrings(
+        \\Commands:
+        \\  match       matches args
+        \\  trace       trace-matches args
+    , HelpFmt(struct {
+        pub const Match = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "matches args",
+            };
+        };
+        pub const Trace = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "trace-matches args",
+            };
+        };
+        pub const Verb = union(enum) {
+            match: Match,
+            trace: Trace,
+        };
+    }, .{ .headerDelimiter = "" }).help());
+
+    try t.expectEqualStrings(
+        \\Usage: test [options] [commands] ...
+        \\
+        \\  Some description about test
+        \\
+        \\Examples:
+        \\
+        \\  test --verbose match 1 1
+        \\  test --verbose match 2 1
+        \\
+        \\Commands: [Required]
+        \\
+        \\  match       matches args
+        \\  trace       trace-matches args
+    , HelpFmt(struct {
+        pub const Match = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "matches args",
+            };
+        };
+        pub const Trace = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "trace-matches args",
+            };
+        };
+        pub const Verb = union(enum) {
+            match: Match,
+            trace: Trace,
+        };
+        pub const Short = .{ .i = .i1 };
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .mandatoryVerb = true,
+        };
+        pub const Help: HelpData(@This()) = .{
+            .usage = &.{"test [options] [commands] ..."},
+            .description = "Some description about test",
+            .examples = &.{
+                "test --verbose match 1 1",
+                "test --verbose match 2 1",
+            },
+        };
+    }, .{}).help());
+
+    try t.expectEqualStrings(
+        \\Usage: test [options] [commands] ...
+        \\
+        \\  Some description about test
+        \\
+        \\Examples:
+        \\
+        \\  test --verbose match 1 1
+        \\  test --verbose match 2 1
+        \\
+        \\Commands: [Required]
+        \\
+        \\  match       matches args
+        \\  trace       trace-matches args
+        \\
+        \\Options:
+        \\
+        \\  -i, --i1 (i32 = 0)      [Required] i1 desc
+    , HelpFmt(struct {
+        i1: i32 = 0,
+        pub const Match = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "matches args",
+            };
+        };
+        pub const Trace = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "trace-matches args",
+            };
+        };
+        pub const Verb = union(enum) {
+            match: Match,
+            trace: Trace,
+        };
+        pub const Short = .{ .i = .i1 };
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .mandatoryVerb = true,
+            .required = &.{.i1},
+        };
+        pub const Help: HelpData(@This()) = .{
+            .usage = &.{"test [options] [commands] ..."},
+            .description = "Some description about test",
+            .examples = &.{
+                "test --verbose match 1 1",
+                "test --verbose match 2 1",
+            },
+            .optionsDescription = &.{
+                .{ .field = .i1, .description = "i1 desc" },
+            },
+        };
+    }, .{}).help());
+
+    try t.expectEqualStrings(
+        \\This is a footer, it gets added as typed
+    , HelpFmt(struct {
+        pub const Help: HelpData(@This()) = .{
+            .footer = "This is a footer, it gets added as typed",
+        };
+    }, .{ .headerDelimiter = "" }).help());
+
+    try t.expectEqualStrings(
+        \\Usage: test [options] [commands] ...
+        \\
+        \\  Some description about test
+        \\
+        \\Examples:
+        \\
+        \\  test --verbose match 1 1
+        \\  test --verbose match 2 1
+        \\
+        \\Commands: [Required]
+        \\
+        \\  match       matches args
+        \\  trace       trace-matches args
+        \\
+        \\Options:
+        \\
+        \\  -i, --i1 (int = 0)      [Required] i1 desc
+        \\
+        \\This is a footer, it gets added as typed
+    , HelpFmt(struct {
+        i1: i32 = 0,
+        pub const Match = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "matches args",
+            };
+        };
+        pub const Trace = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "trace-matches args",
+            };
+        };
+        pub const Verb = union(enum) {
+            match: Match,
+            trace: Trace,
+        };
+        pub const Short = .{ .i = .i1 };
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .mandatoryVerb = true,
+            .required = &.{.i1},
+        };
+        pub const Help: HelpData(@This()) = .{
+            .usage = &.{"test [options] [commands] ..."},
+            .description = "Some description about test",
+            .examples = &.{
+                "test --verbose match 1 1",
+                "test --verbose match 2 1",
+            },
+            .optionsDescription = &.{
+                .{ .field = .i1, .description = "i1 desc" },
+            },
+            .footer = "This is a footer, it gets added as typed",
+        };
+    }, .{ .simpleTypes = true }).help());
+}
 
 // test "help" {
 //     const t = std.testing;
@@ -1137,12 +1606,13 @@ test "groupmatch info" {}
 //                 .n = .@"match-n",
 //             };
 //
-//             const MatchHelp = HelpData(@This());
-//             pub const Help: MatchHelp = .{
+//             pub const Help: HelpData(@This()) = .{
 //                 .usage = &.{"seeksub ... match"},
 //                 .description = "Matches based on options at the top-level. This performs no mutation or replacement, it's simply a dry-run.",
 //                 .shortDescription = "Match-only operation. This is a dry-run with no replacement.",
-//                 .optionsDescription = &.{MatchHelp.FieldDesc.init(.@"match-n", "N-match stop for each file if set.", true, true)},
+//                 .optionsDescription = &.{
+//                     .{ .field = .@"match-n", .description = "N-match stop for each file if set." },
+//                 },
 //             };
 //         };
 //
@@ -1153,13 +1623,12 @@ test "groupmatch info" {}
 //                 .r = .replace,
 //             };
 //
-//             const DiffHelp = HelpData(@This());
-//             pub const Help: DiffHelp = .{
+//             pub const Help: HelpData(@This()) = .{
 //                 .usage = &.{"seeksub ... diff [options]"},
 //                 .description = "Matches based on options at the top-level and then performs a replacement over matches, providing a diff return but not actually mutating the files.",
 //                 .shortDescription = "Dry-runs replacement. No mutation is performed.",
 //                 .optionsDescription = &.{
-//                     DiffHelp.FieldDesc.init(.replace, "Replace match on all files using this PCRE2 regex.", true, true),
+//                     .{ .field = .replace, .description = "Replace match on all files using this PCRE2 regex." },
 //                 },
 //             };
 //
@@ -1177,16 +1646,12 @@ test "groupmatch info" {}
 //                 .tt = .trace,
 //             };
 //
-//             pub const ApplyHelp = HelpData(@This());
-//             pub const Help: ApplyHelp = .{
+//             pub const Help: HelpData(@This()) = .{
 //                 .usage = &.{"seeksub ... apply [options]"},
 //                 .description = "Matches based on options at the top-level and then performs a replacement over matches. This is mutate the files.",
 //                 .shortDescription = "Replaces based on match and replace PCRE2 regexes over all files.",
 //                 .optionsDescription = &.{
-//                     .{
-//                         .field = .replace,
-//                         .description = "Replace match on all files using this PCRE2 regex.",
-//                     },
+//                     .{ .field = .replace, .description = "Replace match on all files using this PCRE2 regex." },
 //                     .{ .field = .trace, .description = "Trace mutations" },
 //                 },
 //             };
@@ -1209,23 +1674,13 @@ test "groupmatch info" {}
 //             .v = .verbose,
 //         };
 //
-//         const SpecHelp = HelpData(@This());
-//         pub const Help: SpecHelp = .{
+//         pub const Help: HelpData(@This()) = .{
 //             .usage = &.{"seeksub [options] [command] ..."},
 //             .description = "CLI tool to match, diff and apply regex in bulk using PCRE2. One of the main features of this CLI is the ability to seek byte ranges before matching or replacing.",
 //             .optionsDescription = &.{
-//                 .{
-//                     .field = .match,
-//                     .description = "PCRE2 Regex to match on all files.",
-//                 },
-//                 .{
-//                     .field = .files,
-//                     .description = "File path list to run matches on.",
-//                 },
-//                 .{
-//                     .field = .byteRanges,
-//                     .description = "Range of bytes for n files, top-level array length has to be of (len <= files.len) and will be applied sequentially over files.",
-//                 },
+//                 .{ .field = .match, .description = "PCRE2 Regex to match on all files." },
+//                 .{ .field = .files, .description = "File path list to run matches on." },
+//                 .{ .field = .byteRanges, .description = "Range of bytes for n files, top-level array length has to be of (len <= files.len) and will be applied sequentially over files." },
 //                 .{ .field = .verbose, .description = "Verbose mode." },
 //             },
 //         };
