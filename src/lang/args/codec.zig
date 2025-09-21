@@ -1,9 +1,7 @@
 const std = @import("std");
 const coll = @import("../collections.zig");
-const meta = @import("../meta.zig");
 const argIter = @import("iterator.zig");
 const Allocator = std.mem.Allocator;
-const FieldEnum = std.meta.FieldEnum;
 const AtDepthArrayTokenizer = argIter.AtDepthArrayTokenizer;
 const TstArgCursor = argIter.TstArgCursor;
 
@@ -28,7 +26,7 @@ pub fn ensureType(
 }
 
 pub fn ensureCodec(comptime PtrT: type) void {
-    const T = meta.ptrTypeToChild(PtrT);
+    const T = std.meta.Child(PtrT);
     comptime ensureTypeTag(T, .@"struct");
     comptime if (!std.meta.hasMethod(T, "supports")) @compileError(std.fmt.comptimePrint(
         "Type {s} is not a codec - it's missing supports method",
@@ -114,9 +112,9 @@ pub const PrimitiveCodec = struct {
         comptime tag: anytype,
         allocator: *const Allocator,
         cursor: *CursorT,
-    ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
+    ) (Error || std.meta.Child(@TypeOf(codec)).Error)!T {
         comptime ensureCodec(@TypeOf(codec));
-        if (comptime meta.ptrTypeToChild(@TypeOf(codec)).supports(T, tag)) {
+        if (comptime std.meta.Child(@TypeOf(codec)).supports(T, tag)) {
             return try codec.parseByType(T, tag, allocator, cursor);
         }
 
@@ -153,7 +151,7 @@ pub const PrimitiveCodec = struct {
         comptime tag: anytype,
         allocator: *const Allocator,
         cursor: *CursorT,
-    ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
+    ) (Error || std.meta.Child(@TypeOf(codec)).Error)!T {
         comptime ensureTypeTag(T, .pointer);
         const PtrT = comptime @typeInfo(T).pointer;
         const ArrayT = comptime PtrT.child;
@@ -186,7 +184,7 @@ pub const PrimitiveCodec = struct {
         comptime tag: anytype,
         allocator: *const Allocator,
         cursor: *CursorT,
-    ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
+    ) (Error || std.meta.Child(@TypeOf(codec)).Error)!T {
         comptime ensureTypeTag(T, .optional);
         const Tt = comptime @typeInfo(T).optional.child;
 
@@ -314,7 +312,7 @@ pub fn ArgCodec(Spec: type) type {
             comptime tag: SpecFieldEnum,
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!T {
+        ) (Error || std.meta.Child(@TypeOf(codec)).Error)!T {
             comptime ensureCodec(@TypeOf(codec));
             if (comptime !supports(T, tag)) {
                 return try PrimitiveCodec.parseByType(codec, T, tag, allocator, cursor);
@@ -335,7 +333,7 @@ pub fn ArgCodec(Spec: type) type {
             comptime tag: std.meta.FieldEnum(Spec),
             allocator: *const Allocator,
             cursor: *CursorT,
-        ) (Error || meta.ptrTypeToChild(@TypeOf(codec)).Error)!@FieldType(Spec, @tagName(tag)) {
+        ) (Error || std.meta.Child(@TypeOf(codec)).Error)!@FieldType(Spec, @tagName(tag)) {
             const tagT = comptime @FieldType(Spec, @tagName(tag));
             comptime ensureTypeTag(tagT, .optional);
 

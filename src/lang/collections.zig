@@ -1,125 +1,6 @@
 const std = @import("std");
-const trait = @import("trait.zig");
 const Allocator = std.mem.Allocator;
 const SinglyLinkedList = std.SinglyLinkedList;
-
-pub fn SinglyLinkedQueue(comptime T: type) type {
-    return struct {
-        start: ?*Node = null,
-        end: ?*Node = null,
-        len: usize = 0,
-        allocator: *const Allocator,
-
-        pub const Node = struct {
-            data: T,
-            next: ?*Node = null,
-
-            pub fn init(allocator: *const Allocator, data: T) !*@This() {
-                const self = try allocator.create(@This());
-                self.next = null;
-                self.data = data;
-                return self;
-            }
-
-            pub fn deinit(self: *@This(), allocator: *const Allocator) void {
-                allocator.destroy(self);
-                self.next = undefined;
-                self.data = undefined;
-                self.* = undefined;
-            }
-        };
-
-        pub fn append(self: *@This(), data: T) !void {
-            const node = try Node.init(self.allocator, data);
-
-            self.len += 1;
-            if (self.end) |prevNode| {
-                prevNode.next = node;
-                self.end = node;
-            } else {
-                self.end = node;
-                if (self.start == null) self.start = node;
-            }
-        }
-
-        pub fn pop(self: *@This()) ?T {
-            if (self.start) |sNode| {
-                defer sNode.deinit(self.allocator);
-                self.len -= 1;
-                self.start = sNode.next;
-                return sNode.data;
-            }
-            return null;
-        }
-    };
-}
-
-pub fn SinglyLinkedStack(comptime T: type) type {
-    return struct {
-        start: ?*Node = null,
-        len: usize = 0,
-
-        pub const Node = struct {
-            data: T,
-            next: ?*Node = null,
-
-            pub fn init(allocator: *const Allocator, data: T) !*@This() {
-                const self = try allocator.create(@This());
-                self.next = null;
-                self.data = data;
-                return self;
-            }
-
-            pub fn deinit(self: *@This(), allocator: *const Allocator) void {
-                allocator.destroy(self);
-                self.next = undefined;
-                self.data = undefined;
-                self.* = undefined;
-            }
-        };
-
-        pub fn prepend(self: *@This(), allocator: *const Allocator, data: T) !void {
-            const node = try Node.init(allocator, data);
-
-            self.len += 1;
-            if (self.start) |prevNode| {
-                node.next = prevNode;
-
-                self.start = node;
-            } else {
-                self.start = node;
-            }
-        }
-
-        pub fn pop(self: *@This()) ?T {
-            if (self.start) |sNode| {
-                self.len -= 1;
-                self.start = sNode.next;
-                return sNode.data;
-            }
-            return null;
-        }
-
-        pub fn peek(self: *@This()) ?T {
-            return if (self.start) |sNode| sNode.data else null;
-        }
-    };
-}
-
-pub fn Iterator(T: type) type {
-    return struct {
-        concrete: *anyopaque,
-        vtable: *VTable,
-
-        pub const VTable = struct {
-            next: *const fn (*anyopaque) ?T = undefined,
-        };
-
-        pub fn next(self: *@This()) ?T {
-            return self.vtable.next(self.concrete);
-        }
-    };
-}
 
 pub fn Cursor(T: type) type {
     return struct {
@@ -180,85 +61,6 @@ pub fn UnitCursor(T: type) type {
         pub fn next(cursor: *anyopaque) ?[]const u8 {
             _ = cursor;
             return null;
-        }
-    };
-}
-
-pub fn DFSCursor(T: type) type {
-    return struct {
-        stackQ: *SinglyLinkedStack(*SinglyLinkedQueue(T)),
-        traits: *const struct {
-            cursor: *Cursor(T),
-        },
-
-        pub fn init(allocator: *const Allocator, stackQ: *SinglyLinkedStack(*SinglyLinkedQueue(T))) !*@This() {
-            var self = try allocator.create(@This());
-            self.traits = try trait.newTraitTable(allocator, self, .{
-                (try trait.extend(
-                    allocator,
-                    Cursor(T),
-                    self,
-                )).new(),
-            });
-            self.stackQ = stackQ;
-            return self;
-        }
-
-        pub fn destroy(self: *@This(), allocator: *const Allocator) void {
-            trait.destroyTraits(allocator, self);
-        }
-
-        pub fn next(self: *@This()) ?[:0]const u8 {
-            const stack = self.stackQ;
-            while (stack.peek() != null) : (_ = stack.pop()) {
-                if (stack.peek()) |q| {
-                    const optValue = q.pop();
-                    if (optValue == null) continue;
-                    defer if (q.len == 0) {
-                        _ = stack.pop();
-                    };
-                    return optValue;
-                }
-            } else return null;
-        }
-
-        pub fn prependQueue(self: *@This(), allocator: *const Allocator, queue: *SinglyLinkedQueue(T)) Allocator.Error!void {
-            try self.stackQ.prepend(allocator, queue);
-        }
-    };
-}
-
-pub fn QueueCursor(T: type) type {
-    return struct {
-        queue: *SinglyLinkedQueue(T),
-
-        pub fn init(queue: *SinglyLinkedQueue(T)) @This() {
-            return .{
-                .queue = queue,
-            };
-        }
-
-        pub fn asCursor(self: *const @This()) Cursor(T) {
-            return .{
-                .curr = null,
-                .ptr = @constCast(self),
-                .vtable = &.{
-                    .next = next,
-                },
-            };
-        }
-
-        pub fn next(cursor: *anyopaque) ?[:0]const u8 {
-            const self: *const @This() = @alignCast(@ptrCast(cursor));
-            return self.queue.pop();
-        }
-
-        pub fn queueItem(self: *const @This(), item: T) Allocator.Error!void {
-            try self.queue.append(item);
-        }
-
-        pub fn len(self: *const @This()) usize {
-            return self.queue.len;
         }
     };
 }
@@ -396,3 +198,40 @@ test "reverse tokenizer" {
     try t.expectEqualStrings("conf", tokenizer2.next().?);
     try t.expectEqual(null, tokenizer2.next());
 }
+
+pub const ComptSb = struct {
+    s: []const u8,
+
+    pub fn init(s: []const u8) *@This() {
+        var b: @This() = .{
+            .s = s,
+        };
+        return &b;
+    }
+
+    pub fn initTup(tup: anytype) *@This() {
+        var b = init("");
+        b.appendAll(tup);
+        return b;
+    }
+
+    pub fn append(self: *@This(), piece: []const u8) void {
+        self.s = self.s ++ piece;
+    }
+
+    pub fn appendAll(self: *@This(), tup: anytype) void {
+        for (tup) |item| {
+            self.s = self.s ++ item;
+        }
+    }
+
+    pub fn prepend(self: *@This(), piece: []const u8) void {
+        self.s = piece ++ self.s;
+    }
+
+    pub fn prependAll(self: *@This(), tup: anytype) void {
+        for (tup) |*item| {
+            self.s = item ++ self.s;
+        }
+    }
+};

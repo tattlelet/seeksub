@@ -50,7 +50,7 @@ pub fn SpecResponse(comptime Spec: type) type {
         fn SpecVerbsErrors() type {
             comptime var errors = error{};
             for (@typeInfo(SpecUnionVerbs()).@"union".fields) |field| {
-                errors = errors || meta.ptrTypeToChild(field.type).Error;
+                errors = errors || std.meta.Child(field.type).Error;
             }
             return errors;
         }
@@ -87,6 +87,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             var self = try allocator.create(@This());
             self.arena = arena;
             self.codec = .{};
+            // TODO: test undefined
             self.options = .{};
             self.program = null;
             self.positionals = null;
@@ -110,16 +111,16 @@ pub fn SpecResponse(comptime Spec: type) type {
             }
 
             // TODO: used FixedBuffer backed by arena, only the last verb copies
-            var positionals = try std.ArrayList([]const u8).initCapacity(self.arena.allocator(), 4);
+            var positionals = try std.ArrayListUnmanaged([]const u8).initCapacity(self.arena.allocator(), 4);
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
-                    try positionals.append("-");
-                    continue;
+                    try positionals.append(self.arena.allocator(), "-");
                 } else if (arg.len == 2 and std.mem.eql(u8, "--", arg)) {
                     break;
                 } else if (arg.len >= 1 and arg[0] != '-') {
-                    cursor.stackItem(arg);
-                    break;
+                    if (!try self.parseVerb(arg, cursor)) {
+                        try positionals.append(self.arena.allocator(), arg);
+                    }
                 } else if (arg.len == 0) {
                     continue;
                 } else {
@@ -130,45 +131,38 @@ pub fn SpecResponse(comptime Spec: type) type {
 
             // TODO: parse tuple
             while (cursor.next()) |item| {
-                try positionals.append(item);
+                try positionals.append(self.arena.allocator(), item);
             }
-            try self.parseVerb(&positionals);
-            // TODO: smarter empty handling
-            self.positionals = try positionals.toOwnedSlice();
+
+            self.positionals = try positionals.toOwnedSlice(self.arena.allocator());
 
             if (comptime SpecTracker != void) try self.tracker.validate();
         }
 
         fn parseVerb(
             self: *@This(),
-            positionals: *std.ArrayList([]const u8),
-        ) Error!void {
-            if (comptime VerbT == void) return;
-            if (positionals.items.len == 0) return;
+            arg: []const u8,
+            cursor: *CursorT,
+        ) Error!bool {
+            if (comptime VerbT == void) return false;
 
-            const verbArg = positionals.items[0];
             inline for (@typeInfo(Spec.Verb).@"union".fields) |f| {
-                if (std.mem.eql(u8, f.name, verbArg)) {
+                if (std.mem.eql(u8, f.name, arg)) {
+                    // TODO: can we reuse this arena?
                     const verbR = try SpecResponse(f.type).init(&self.arena.child_allocator);
-
-                    const unmanaged = positionals.moveToUnmanaged();
-                    var arrCursor = coll.ArrayCursor([]const u8).init(
-                        unmanaged.items,
-                        1,
-                    );
-                    var vCursor = arrCursor.asCursor();
-                    try verbR.parseInner(&vCursor, false);
+                    try verbR.parseInner(cursor, false);
                     self.verb = @unionInit(VerbT, f.name, verbR);
                     if (comptime SpecTracker != void) self.tracker.parsedVerb();
-                    return;
+                    return true;
                 }
             }
+            return false;
         }
 
         fn namedToken(self: *@This(), offset: usize, arg: []const u8, cursor: *CursorT) Error!void {
             var splitValue: ?[]const u8 = null;
             var slice: []const u8 = arg[offset..];
-            const optValueIdx = std.mem.indexOf(u8, slice, "=");
+            const optValueIdx = std.mem.indexOfScalar(u8, slice, '=');
 
             if (optValueIdx) |i| {
                 splitValue = slice[i + 1 ..];
@@ -190,14 +184,18 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         fn shortArg(self: *@This(), arg: []const u8, cursor: *CursorT) Error!void {
-            if (comptime @typeInfo(FieldEnum(Spec)).@"enum".fields.len == 0) return Error.UnknownArgumentName;
             if (comptime !@hasDecl(Spec, "Short")) return Error.MissingShorthandMetadata;
+            // NOTE: Short will result in fields[] with the enum_literal undone
+            // with enum_literal as a key, unfortunately there's no enforcement for it to be
+            // fieldEnum(Spec)
+            const ShortFields = std.meta.fields(@TypeOf(Spec.Short));
+            if (comptime ShortFields.len == 0) return Error.UnknownArgumentName;
 
             var start: usize = 0;
             var end: usize = @min(2, arg.len);
             var noneCursor = coll.UnitCursor([]const u8).asNoneCursor();
             while (end <= arg.len) {
-                ret: inline for (std.meta.fields(@TypeOf(Spec.Short))) |s| {
+                ret: inline for (ShortFields) |s| {
                     if (std.mem.eql(u8, s.name, arg[start..end])) {
                         const tag = @tagName(s.defaultValue() orelse return Error.MissingShorthandLink);
                         try self.namedArg(
@@ -227,13 +225,10 @@ pub fn SpecResponse(comptime Spec: type) type {
 
             inline for (fields) |f| {
                 if (std.mem.eql(u8, f.name, arg)) {
-                    const tag = comptime (meta.stringToEnum(SpecEnumFields, f.name) orelse @compileError(std.fmt.comptimePrint(
-                        "Spec: {s}, Field: {s} - could no translate field to tag",
-                        .{ @typeName(Spec), f.name },
-                    )));
+                    const tag: SpecEnumFields = @enumFromInt(f.value);
 
                     @field(self.options, f.name) = try self.codec.parseByType(
-                        @FieldType(Spec, @tagName(tag)),
+                        @FieldType(Spec, f.name),
                         tag,
                         &self.arena.allocator(),
                         cursor,
@@ -490,27 +485,46 @@ test "parse kvargs" {
 }
 
 test "parse positionals" {
-    const base = &std.testing.allocator;
+    const t = std.testing;
+    const base = &t.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
     const allocator = &arena.allocator();
 
     const r1 = try tstParse(allocator, "program positional1 positional2 positional3", struct {});
     defer r1.deinit();
-    const r2 = try tstParse(allocator, "program --test positional1 positional2 positional3", struct { @"test": bool = false });
-    defer r2.deinit();
-    const r3 = try tstParse(allocator, "program -- --test positional1 positional2 positional3", struct { @"test": bool = false });
-    defer r3.deinit();
-
-    try std.testing.expect(r2.options.@"test");
-    try std.testing.expect(!r3.options.@"test");
-
     const expectedPositionals: []const []const u8 = &.{ "positional1", "positional2", "positional3" };
     try std.testing.expectEqualDeep(expectedPositionals, r1.positionals);
+
+    const r2 = try tstParse(allocator, "program --test positional1 positional2 positional3", struct { @"test": bool = false });
+    defer r2.deinit();
+    try std.testing.expect(r2.options.@"test");
     try std.testing.expectEqualDeep(expectedPositionals, r2.positionals);
 
+    const r3 = try tstParse(allocator, "program -- --test positional1 positional2 positional3", struct { @"test": bool = false });
+    defer r3.deinit();
+    try std.testing.expect(!r3.options.@"test");
     const expectSkip: []const []const u8 = &.{ "--test", "positional1", "positional2", "positional3" };
     try std.testing.expectEqualDeep(expectSkip, r3.positionals);
+
+    const r4 = try tstParse(
+        allocator,
+        "program --test - pos1 verb1 pos2 pos3",
+        struct {
+            @"test": bool = false,
+            pub const Verb1 = struct {};
+            pub const Verb = union(enum) { verb1: Verb1 };
+        },
+    );
+    defer r4.deinit();
+
+    // const expectSkip2: []const []const u8 = &.{ "--test", "positional1", "positional2", "positional3" };
+    try std.testing.expect(r4.options.@"test");
+
+    const expectL1Pos: []const []const u8 = &.{ "-", "pos1" };
+    try std.testing.expectEqualDeep(expectL1Pos, r4.positionals.?);
+    const expectL2Pos: []const []const u8 = &.{ "pos2", "pos3" };
+    try std.testing.expectEqualDeep(expectL2Pos, r4.verb.?.verb1.positionals.?);
 }
 
 test "parse verb" {

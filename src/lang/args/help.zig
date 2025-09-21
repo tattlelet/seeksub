@@ -1,5 +1,6 @@
 const std = @import("std");
-const col = @import("../collections.zig");
+const coll = @import("../collections.zig");
+const meta = @import("../meta.zig");
 const GroupMatchConfig = @import("validate.zig").GroupMatchConfig;
 const btType = std.builtin.Type;
 
@@ -9,43 +10,6 @@ pub const HelpConf = struct {
     columnSpace: u4 = 4,
     simpleTypes: bool = false,
     optionsBreakline: bool = false,
-};
-
-pub const ComptSb = struct {
-    s: []const u8,
-
-    pub fn init(s: []const u8) *@This() {
-        var b: @This() = .{
-            .s = s,
-        };
-        return &b;
-    }
-
-    pub fn initTup(tup: anytype) *@This() {
-        var b = init("");
-        b.appendAll(tup);
-        return b;
-    }
-
-    pub fn append(self: *@This(), piece: []const u8) void {
-        self.s = self.s ++ piece;
-    }
-
-    pub fn appendAll(self: *@This(), tup: anytype) void {
-        for (tup) |item| {
-            self.s = self.s ++ item;
-        }
-    }
-
-    pub fn prepend(self: *@This(), piece: []const u8) void {
-        self.s = piece ++ self.s;
-    }
-
-    pub fn prependAll(self: *@This(), tup: anytype) void {
-        for (tup) |*item| {
-            self.s = item ++ self.s;
-        }
-    }
 };
 
 pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
@@ -66,7 +30,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 const usageList = Help.usage orelse break :rt null;
                 const usageTemplate = "Usage: ";
 
-                var b = ComptSb.initTup(.{ usageTemplate, usageList[0] });
+                var b = coll.ComptSb.initTup(.{ usageTemplate, usageList[0] });
                 for (usageList[1..]) |item| b.appendAll(.{ "\n", usageTemplate, item });
                 break :rt b.s;
             };
@@ -77,7 +41,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 const desc = Help.description orelse break :rt null;
                 var byLine = std.mem.tokenizeScalar(u8, desc, '\n');
 
-                var b = ComptSb.initTup(.{
+                var b = coll.ComptSb.initTup(.{
                     INDENT,
                     byLine.next() orelse unreachable,
                 });
@@ -89,7 +53,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
         pub fn examples() ?[]const u8 {
             return comptime rt: {
                 const exampleList = Help.examples orelse break :rt null;
-                var b = ComptSb.initTup(.{
+                var b = coll.ComptSb.initTup(.{
                     "Examples:\n",
                     conf.headerDelimiter,
                     INDENT,
@@ -124,7 +88,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        fn verbShortDesc(comptime name: []const u8) ?[]const u8 {
+        pub fn verbShortDesc(comptime name: []const u8) ?[]const u8 {
             return comptime rt: {
                 const T = std.meta.TagPayloadByName(Verb, name);
                 if (!@hasDecl(T, "Help")) break :rt null;
@@ -142,7 +106,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
                 const columDelim = columnDelimiter(enumFields);
 
-                var b = ComptSb.init("Commands:");
+                var b = coll.ComptSb.init("Commands:");
                 if (GroupMatch.mandatoryVerb) b.append(" [Required]");
 
                 b.appendAll(.{ "\n", conf.headerDelimiter });
@@ -165,7 +129,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
         pub fn formatType(comptime T: type) []const u8 {
             return comptime rt: {
                 const tag = @typeName(T);
-                var tokenizer: col.ReverseTokenIterator(u8, .scalar) = .{
+                var tokenizer: coll.ReverseTokenIterator(u8, .scalar) = .{
                     .buffer = tag,
                     .delimiter = '.',
                     .index = tag.len,
@@ -174,22 +138,16 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        pub fn isUndefined(field: std.builtin.Type.StructField) bool {
-            // NOTE: https://github.com/ziglang/zig/issues/18047#issuecomment-1818265581
-            // Apparently not IB but would keep an eye on this
-            return comptime field.default_value_ptr != null and field.default_value_ptr.? == @as(*const anyopaque, @ptrCast(&@as(field.type, undefined)));
-        }
-
         pub fn formatStruct(comptime T: type, comptime defaultValue: T) []const u8 {
             return comptime rv: {
                 const fields = std.meta.fields(T);
-                var b = ComptSb.initTup(.{
+                var b = coll.ComptSb.initTup(.{
                     if (conf.simpleTypes) "" else formatType(T),
                     "{ ",
                 });
                 var addComma = false;
                 for (fields, 0..) |field, i| {
-                    if (isUndefined(field)) continue;
+                    if (meta.isUndefined(field)) continue;
 
                     if (addComma) {
                         addComma = false;
@@ -227,7 +185,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         break :rv std.fmt.comptimePrint("'{s}'", .{defaultValue});
                     }
 
-                    var b = ComptSb.init(if (conf.simpleTypes) "[" else "{");
+                    var b = coll.ComptSb.init(if (conf.simpleTypes) "[" else "{");
                     for (defaultValue, 0..) |value, i| {
                         b.append(formatDefaultValue(ptr.child, value));
                         if (i < defaultValue.len - 1) {
@@ -244,7 +202,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 .@"enum" => formatType(T) ++ "." ++ @tagName(defaultValue),
                 .@"struct" => formatStruct(T, defaultValue),
                 .@"union" => switch (defaultValue) {
-                    inline else => |e| ComptSb.initTup(.{
+                    inline else => |e| coll.ComptSb.initTup(.{
                         if (conf.simpleTypes) "" else formatType(T),
                         "{ ",
                         if (conf.simpleTypes) "" else ".",
@@ -275,7 +233,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                             "Short defined with no default value",
                         ),
                     );
-                    if (std.mem.eql(u8, field.name, tag)) break :rt ComptSb.initTup(.{ "-", shortField.name }).s;
+                    if (std.mem.eql(u8, field.name, tag)) break :rt coll.ComptSb.initTup(.{ "-", shortField.name }).s;
                 }
                 break :rt null;
             };
@@ -283,7 +241,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
         pub fn simpleTypeTranslation(comptime T: type) []const u8 {
             return comptime rt: {
-                var b = ComptSb.init("");
+                var b = coll.ComptSb.init("");
                 var Tt = T;
                 rfd: switch (@typeInfo(Tt)) {
                     .int => b.append("int"),
@@ -309,7 +267,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
         pub fn zigTypeTranslation(comptime T: type) []const u8 {
             return comptime rt: {
-                var b = ComptSb.init("");
+                var b = coll.ComptSb.init("");
                 var Tt = T;
                 rfd: switch (@typeInfo(Tt)) {
                     .pointer => |ptr| {
@@ -342,14 +300,14 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     if (!std.mem.eql(u8, @tagName(desc.field), field.name)) continue;
                     if (!desc.typeHint and !desc.defaultHint) break :rt null;
 
-                    var b = ComptSb.init("(");
+                    var b = coll.ComptSb.init("(");
                     if (desc.typeHint) b.append(translateType(field.type));
 
-                    if (desc.typeHint and desc.defaultHint and !isUndefined(field)) {
+                    if (desc.typeHint and desc.defaultHint and !meta.isUndefined(field)) {
                         b.append(" = ");
                     }
 
-                    if (desc.defaultHint and !isUndefined(field)) {
+                    if (desc.defaultHint and !meta.isUndefined(field)) {
                         b.append(formatDefaultValue(field.type, field.defaultValue().?));
                     }
                     b.append(")");
@@ -359,10 +317,9 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        fn groupToArgsText(comptime name: []const u8, comptime group: anytype) ?[]const u8 {
-            @setEvalBranchQuota(5545);
+        pub fn groupToArgsText(comptime name: []const u8, comptime group: anytype) ?[]const u8 {
             return comptime rt: {
-                var b = ComptSb.init("");
+                var b = coll.ComptSb.init("");
                 for (group) |groupBlk| {
                     for (groupBlk, 0..) |item, idxSelf| {
                         if (std.mem.eql(u8, @tagName(item), name)) {
@@ -389,7 +346,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             return comptime rt: {
                 if (!@hasDecl(Spec, "GroupMatch")) break :rt null;
 
-                var b = ComptSb.init(if (isRequired(name)) "[Required]" else "");
+                var b = coll.ComptSb.init(if (isRequired(name)) "[Required]" else "");
                 if (groupToArgsText(name, GroupMatch.mutuallyInclusive)) |inclText| b.appendAll(.{
                     if (b.s.len > 0) " " else "",
                     "[Requires: ",
@@ -419,7 +376,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
                 var optionPieces: [fields.len][]const u8 = undefined;
                 for (fields, 0..) |field, i| {
-                    var piece = ComptSb.init("");
+                    var piece = coll.ComptSb.init("");
                     if (shorthand(OptShortFields, field)) |shand| piece.appendAll(.{ shand, ", " });
 
                     piece.appendAll(.{ "--", field.name });
@@ -436,7 +393,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 };
                 const optIdx = std.static_string_map.StaticStringMap(usize).initComptime(optsIndxKv);
 
-                var b = ComptSb.initTup(.{ "Options:\n", conf.headerDelimiter });
+                var b = coll.ComptSb.initTup(.{ "Options:\n", conf.headerDelimiter });
                 const columDelim = columnDelimiter(optionPieces);
                 const innerBlock: [conf.indent * 2]u8 = @splat(' ');
 
@@ -472,7 +429,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
         pub fn help() []const u8 {
             return comptime rt: {
-                var b = ComptSb.init("");
+                var b = coll.ComptSb.init("");
                 const pieces: []const ?[]const u8 = &.{
                     usage(),
                     description(),
@@ -485,7 +442,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 for (pieces) |pieceOpt| {
                     const piece = pieceOpt orelse continue;
 
-                    const breakline = ComptSb.init("");
+                    const breakline = coll.ComptSb.init("");
                     if (addLines > 0) breakline.append("\n\n");
                     b.appendAll(.{ breakline.s, piece });
                     addLines += 1;
@@ -496,52 +453,9 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
     };
 }
 
-pub fn FieldEnum(comptime T: type) type {
-    const field_infos = std.meta.fields(T);
-
-    if (field_infos.len == 0) {
-        return @Type(.{
-            .@"enum" = .{
-                .tag_type = u0,
-                .fields = &.{},
-                .decls = &.{},
-                .is_exhaustive = true,
-            },
-        });
-    }
-
-    if (@typeInfo(T) == .@"union") {
-        if (@typeInfo(T).@"union".tag_type) |tag_type| {
-            for (std.enums.values(tag_type), 0..) |v, i| {
-                if (@intFromEnum(v) != i) break; // enum values not consecutive
-                if (!std.mem.eql(u8, @tagName(v), field_infos[i].name)) break; // fields out of order
-            } else {
-                return tag_type;
-            }
-        }
-    }
-
-    var enumFields: [field_infos.len]std.builtin.Type.EnumField = undefined;
-    var decls = [_]std.builtin.Type.Declaration{};
-    inline for (field_infos, 0..) |field, i| {
-        enumFields[i] = .{
-            .name = field.name ++ "",
-            .value = i,
-        };
-    }
-    return @Type(.{
-        .@"enum" = .{
-            .tag_type = std.math.IntFittingRange(0, field_infos.len),
-            .fields = &enumFields,
-            .decls = &decls,
-            .is_exhaustive = true,
-        },
-    });
-}
-
 pub fn HelpData(T: type) type {
     return struct {
-        const SpecEnum = FieldEnum(T);
+        const SpecEnum = meta.FieldEnum(T);
         usage: ?[]const []const u8 = null,
         description: ?[]const u8 = null,
         shortDescription: ?[]const u8 = null,
