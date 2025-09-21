@@ -16,10 +16,10 @@ pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
     // TODO: optional error collection
     return struct {
-        arena: std.heap.ArenaAllocator,
+        arena: *std.heap.ArenaAllocator,
         codec: SpecCodec,
-        program: ?[]const u8,
         options: Options,
+        program: ?[]const u8,
         // TODO: Move to tuple inside Spec, leverage codec
         positionals: ?[][]const u8,
         verb: if (VerbT != void) ?VerbT else void,
@@ -81,8 +81,14 @@ pub fn SpecResponse(comptime Spec: type) type {
             break :E errors;
         };
 
-        pub fn init(allc: *const Allocator) std.mem.Allocator.Error!*@This() {
-            var arena = std.heap.ArenaAllocator.init(allc.*);
+        pub fn init(allocator: *const Allocator) std.mem.Allocator.Error!*@This() {
+            var arena = try allocator.create(std.heap.ArenaAllocator);
+            arena.* = std.heap.ArenaAllocator.init(allocator.*);
+            _ = &arena;
+            return initArena(arena);
+        }
+
+        pub fn initArena(arena: *std.heap.ArenaAllocator) std.mem.Allocator.Error!*@This() {
             const allocator = arena.allocator();
             var self = try allocator.create(@This());
             self.arena = arena;
@@ -147,8 +153,7 @@ pub fn SpecResponse(comptime Spec: type) type {
 
             inline for (@typeInfo(Spec.Verb).@"union".fields) |f| {
                 if (std.mem.eql(u8, f.name, arg)) {
-                    // TODO: can we reuse this arena?
-                    const verbR = try SpecResponse(f.type).init(&self.arena.child_allocator);
+                    const verbR = try SpecResponse(f.type).initArena(self.arena);
                     try verbR.parseInner(cursor, false);
                     self.verb = @unionInit(VerbT, f.name, verbR);
                     if (comptime SpecTracker != void) self.tracker.parsedVerb();
@@ -242,12 +247,11 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         pub fn deinit(self: *const @This()) void {
-            if (comptime VerbT != void) {
-                if (self.verb) |verbUnion| switch (verbUnion) {
-                    inline else => |verb| verb.deinit(),
-                };
-            }
+            // NOTE: this is not pretty but it allows 1-call tear down
+            const cAllc = self.arena.child_allocator;
+            const arena = self.arena;
             self.arena.deinit();
+            cAllc.destroy(arena);
         }
     };
 }
