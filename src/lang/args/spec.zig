@@ -16,11 +16,17 @@ pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
     // TODO: optional error collection
     return struct {
+        // TODO: allocations were simplified by a lot, can we get rid of arenas?
+        // This will imply we know what Codecs are doing or that Codecs need to know
+        // when something gets freed
+        // in the case of our current codecs, that would be only for [:0]u8, [][]...
+        // Maybe wait for sized fields?
         arena: *std.heap.ArenaAllocator,
         codec: SpecCodec,
         options: Options,
         program: ?[]const u8,
         // TODO: Move to tuple inside Spec, leverage codec
+        // TODO: support sized positionals (both with and without tuples)
         positionals: ?[][]const u8,
         verb: if (VerbT != void) ?VerbT else void,
         tracker: if (SpecTracker != void) SpecTracker else void,
@@ -115,8 +121,12 @@ pub fn SpecResponse(comptime Spec: type) type {
                 _ = cursor.peek() orelse return;
             }
 
-            // TODO: used FixedBuffer backed by arena, only the last verb copies
-            var positionals = try std.ArrayListUnmanaged([]const u8).initCapacity(self.arena.allocator(), 4);
+            var positionals = try std.ArrayListUnmanaged([]const u8).initCapacity(self.arena.allocator(), 8);
+            // This is needed because everything available outside SpecResult is boud
+            // to the arena, however positionals is used as scrap memory
+            // toOwnedSlice will perform another allocation over this, if necessary (len > 0)
+            defer positionals.deinit(self.arena.allocator());
+
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
                     try positionals.append(self.arena.allocator(), "-");
@@ -134,12 +144,10 @@ pub fn SpecResponse(comptime Spec: type) type {
                     try self.namedToken(offset, arg, cursor);
                 };
 
-            // TODO: parse tuple
-            while (cursor.next()) |item| {
-                try positionals.append(self.arena.allocator(), item);
+            while (cursor.next()) |item| try positionals.append(self.arena.allocator(), item);
+            if (positionals.items.len > 0) {
+                self.positionals = try positionals.toOwnedSlice(self.arena.allocator());
             }
-
-            self.positionals = try positionals.toOwnedSlice(self.arena.allocator());
 
             if (comptime SpecTracker != void) try self.tracker.validate();
         }
@@ -247,7 +255,7 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         pub fn deinit(self: *const @This()) void {
-            // NOTE: this is not pretty but it allows 1-call tear down
+            // this is not pretty but it allows 1-call tear down
             const cAllc = self.arena.child_allocator;
             const arena = self.arena;
             self.arena.deinit();
