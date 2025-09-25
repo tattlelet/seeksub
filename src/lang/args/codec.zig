@@ -93,8 +93,10 @@ pub fn ensureCodec(comptime PtrT: type) void {
 pub const PrimitiveCodec = struct {
     pub const Error = error{
         ParseArrayEndOfIterator,
+        ParseArrayBufferValueSizeMismatch,
         ParseOptEndOfIterator,
         ParseStringEndOfIterator,
+        ParseStringBufferValueSizeMismatch,
         ParseEnumEndOfIterator,
         ParseFloatEndOfIterator,
         ParseIntEndOfIterator,
@@ -116,9 +118,16 @@ pub const PrimitiveCodec = struct {
         allocator: *const Allocator,
         cursor: *CursorT,
     ) (Error || std.meta.Child(@TypeOf(codec)).Error)!T {
-        comptime ensureCodec(@TypeOf(codec));
-        if (comptime std.meta.Child(@TypeOf(codec)).supports(T, tag)) {
-            return try codec.parseByType(T, tag, allocator, cursor);
+        const unsupportedMessage: []const u8 = comptime std.fmt.comptimePrint(
+            "Codec: {s} - type {s} not supported by codec",
+            .{ @typeName(@This()), @typeName(T) },
+        );
+
+        if (comptime @TypeOf(codec) != *PrimitiveCodec and @TypeOf(codec) != *const PrimitiveCodec) {
+            comptime ensureCodec(@TypeOf(codec));
+            if (comptime std.meta.Child(@TypeOf(codec)).supports(T, tag)) {
+                return try codec.parseByType(T, tag, allocator, cursor);
+            }
         }
 
         return try switch (@typeInfo(T)) {
@@ -126,26 +135,57 @@ pub const PrimitiveCodec = struct {
             .int => @This().parseInt(T, cursor),
             .float => @This().parseFloat(T, cursor),
             .@"enum" => @This().parseEnum(T, cursor),
-            .pointer => |ptr| if (ptr.child == u8) @This().parseString(
-                T,
-                allocator,
-                cursor,
-            ) else @This().parseArray(
-                codec,
-                T,
-                tag,
-                allocator,
-                cursor,
-            ),
+            .pointer => |ptr| rv: {
+                if (comptime ptr.size == .one) @compileError(unsupportedMessage);
+                if (comptime ptr.child == u8) {
+                    break :rv if (ptr.sentinel()) |_| @This().parseStringZ(
+                        T,
+                        allocator,
+                        cursor,
+                    ) else @This().parseString(T, cursor);
+                } else break :rv @This().parseArray(codec, T, tag, allocator, cursor);
+            },
+            .array => |arr| if (comptime arr.child == u8)
+                @This().parseStringBuffered(
+                    T,
+                    allocator,
+                    cursor,
+                )
+            else
+                @This().parseArrayBuffered(
+                    codec,
+                    T,
+                    tag,
+                    allocator,
+                    cursor,
+                ),
             .optional => @This().parseOpt(codec, T, tag, allocator, cursor),
-            else => @compileError(std.fmt.comptimePrint(
-                "Codec: {s} - type {s} not supported by codec",
-                .{
-                    @typeName(@This()),
-                    @typeName(T),
-                },
-            )),
+            else => @compileError(unsupportedMessage),
         };
+    }
+
+    pub fn parseArrayBuffered(
+        codec: anytype,
+        comptime T: type,
+        comptime tag: anytype,
+        allocator: *const Allocator,
+        cursor: *CursorT,
+    ) (Error || std.meta.Child(@TypeOf(codec)).Error)!T {
+        comptime ensureTypeTag(T, .array);
+        const PtrT = comptime @typeInfo(T).array;
+        const ArrayT = comptime PtrT.child;
+
+        const slice = cursor.next() orelse return Error.ParseArrayEndOfIterator;
+        var arrTokenizer = AtDepthArrayTokenizer.init(slice);
+        var i: usize = 0;
+        var target: T = undefined;
+        while (try arrTokenizer.next()) |token| {
+            if (i >= target.len) return Error.ParseArrayBufferValueSizeMismatch;
+            cursor.stackItem(token);
+            target[i] = try parseByType(codec, ArrayT, tag, allocator, cursor);
+            i += 1;
+        }
+        return target;
     }
 
     pub fn parseArray(
@@ -158,21 +198,24 @@ pub const PrimitiveCodec = struct {
         comptime ensureTypeTag(T, .pointer);
         const PtrT = comptime @typeInfo(T).pointer;
         const ArrayT = comptime PtrT.child;
-        var array = try std.ArrayList(ArrayT).initCapacity(allocator.*, 3);
-        errdefer array.deinit();
+
+        const allc = allocator.*;
+
+        var array = try std.ArrayListUnmanaged(ArrayT).initCapacity(allc, 8);
+        defer array.deinit(allc);
 
         const slice = cursor.next() orelse return Error.ParseArrayEndOfIterator;
         var arrTokenizer = AtDepthArrayTokenizer.init(slice);
         while (try arrTokenizer.next()) |token| {
             cursor.stackItem(token);
-            try array.append(try parseByType(codec, ArrayT, tag, allocator, cursor));
+            try array.append(allc, try parseByType(codec, ArrayT, tag, allocator, cursor));
         }
 
         // ArrayList erases sentinel
         if (PtrT.sentinel()) |sentinel| {
-            return array.toOwnedSliceSentinel(sentinel);
+            return array.toOwnedSliceSentinel(allc, sentinel);
         } else {
-            return array.toOwnedSlice();
+            return array.toOwnedSlice(allc);
         }
     }
 
@@ -200,7 +243,22 @@ pub const PrimitiveCodec = struct {
         }
     }
 
-    pub fn parseString(
+    pub fn parseStringBuffered(
+        comptime T: type,
+        allocator: *const Allocator,
+        cursor: *CursorT,
+    ) Error!T {
+        _ = allocator;
+        comptime ensureTypeTag(T, .array);
+        const Tt = comptime std.meta.Child(T);
+        comptime ensureType(Tt, u8);
+
+        const s = cursor.next() orelse return Error.ParseStringEndOfIterator;
+        if (s.len != @typeInfo(T).array.len) return Error.ParseStringBufferValueSizeMismatch;
+        return @as(*const T, @alignCast(@ptrCast(s.ptr))).*;
+    }
+
+    pub fn parseStringZ(
         comptime T: type,
         allocator: *const Allocator,
         cursor: *CursorT,
@@ -209,15 +267,27 @@ pub const PrimitiveCodec = struct {
         const PtrType = comptime @typeInfo(T).pointer;
         const Tt = comptime std.meta.Child(T);
         comptime ensureType(Tt, u8);
+        const sentinel = comptime PtrType.sentinel().?;
 
         const s = cursor.next() orelse return Error.ParseStringEndOfIterator;
-        if (comptime PtrType.sentinel()) |sentinel| {
-            const newPtr = try allocator.allocSentinel(Tt, s.len, sentinel);
-            @memcpy(newPtr, s);
-            return newPtr;
-        } else {
-            return s;
-        }
+        const newPtr = try allocator.allocSentinel(Tt, s.len, sentinel);
+        @memcpy(newPtr, s);
+        return newPtr;
+    }
+
+    pub fn parseString(
+        comptime T: type,
+        cursor: *CursorT,
+    ) Error!T {
+        comptime ensureTypeTag(T, .pointer);
+        const PtrType = comptime @typeInfo(T).pointer;
+        const Tt = comptime std.meta.Child(T);
+        comptime ensureType(Tt, u8);
+        comptime if (PtrType.sentinel() != null) @compileError(
+            std.fmt.comptimePrint("Sentinel string field sent to string slice parser"),
+        );
+
+        return cursor.next() orelse return Error.ParseStringEndOfIterator;
     }
 
     pub fn parseEnum(
@@ -462,6 +532,38 @@ test "codec parseArray" {
     );
 }
 
+test "codec parse 0 allocation string" {
+    const allocator = &std.testing.allocator;
+    var tstCursor = try TstArgCursor.init(allocator,
+        \\hello
+    );
+    defer tstCursor.deinit();
+    var cursor = tstCursor.asCursor();
+
+    var codec = ArgCodec(struct {
+        s: [5:0]u8 = undefined,
+    }){};
+    try std.testing.expectEqualStrings("hello", &(try codec.parseByType([5:0]u8, .s, allocator, &cursor)));
+}
+
+test "codec parse 0 allocation array" {
+    const allocator = &std.testing.allocator;
+    var tstCursor = try TstArgCursor.init(allocator,
+        \\"[1,2,3,4]"
+        \\null
+    );
+    defer tstCursor.deinit();
+    var cursor = tstCursor.asCursor();
+
+    var codec = ArgCodec(struct {
+        is1: [4]i32 = undefined,
+        is2: ?[4]i32 = undefined,
+    }){};
+
+    try std.testing.expectEqualDeep(@as([]const i32, &.{ 1, 2, 3, 4 }), &(try codec.parseByType([4]i32, .is1, allocator, &cursor)));
+    try std.testing.expectEqual(null, try codec.parseByType(?[4]i32, .is2, allocator, &cursor));
+}
+
 test "codec parseOpt" {
     const baseAllocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(baseAllocator);
@@ -497,7 +599,7 @@ test "codec parseOpt" {
     try std.testing.expectEqual(1, (try codec.parseByTag(.a1, allocator, &cursor)).?);
     try std.testing.expectEqual(null, try codec.parseByTag(.flag1, allocator, &cursor));
     try std.testing.expect((try codec.parseByTag(.flag2, allocator, &cursor)).?);
-    // cursor.consume();
+
     try std.testing.expectError(
         C.Error.ParseOptEndOfIterator,
         codec.parseByTag(.a1, allocator, &cursor),
@@ -555,6 +657,8 @@ test "codec parseString 0 copy for slice" {
     var codec = ArgCodec(Spec){};
     const s = try codec.parseByTag(.s, allocator, &cursor);
 
+    // NOTE: no leak or free happens, this proves we are using the same
+    // data as was allocated for arg cursor
     try std.testing.expectEqualDeep("Hello", s);
 }
 
@@ -596,7 +700,10 @@ test "codec parseEnum" {
 }
 
 test "codec parseFloat" {
-    const allocator = &std.testing.allocator;
+    const baseAllocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(baseAllocator);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
     var tstCursor = try TstArgCursor.init(allocator,
         \\44
         \\-1.2
@@ -616,7 +723,10 @@ test "codec parseFloat" {
 }
 
 test "codec parseInt" {
-    const allocator = &std.testing.allocator;
+    const baseAllocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(baseAllocator);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
     var tstCursor = try TstArgCursor.init(allocator,
         \\44
         \\-1
@@ -636,7 +746,10 @@ test "codec parseInt" {
 }
 
 test "codec parseFlag" {
-    const allocator = &std.testing.allocator;
+    const baseAllocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(baseAllocator);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
     var tstCursor = try TstArgCursor.init(allocator,
         \\true
         \\false

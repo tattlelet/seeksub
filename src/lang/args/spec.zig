@@ -12,22 +12,96 @@ const TstArgCursor = argIter.TstArgCursor;
 const PrimitiveCodec = argCodec.PrimitiveCodec;
 const ArgCodec = argCodec.ArgCodec;
 
+pub fn Positionals(comptime PosT: type) type {
+    return struct {
+        positionals: PosT = undefined,
+        reminder: ?[]const []const u8 = null,
+        i: usize = 0,
+
+        pub const CursorT = coll.Cursor([]const u8);
+        pub const Error = error{
+            ParseNextCalledOnTupleEnd,
+        } || PrimitiveCodec.Error;
+
+        pub fn parseNextType(
+            self: *@This(),
+            allocator: *const Allocator,
+            cursor: *CursorT,
+        ) Error!void {
+            if (self.i >= self.positionals.len) return Error.ParseNextCalledOnTupleEnd;
+            const TupleEnum = std.meta.FieldEnum(PosT);
+            switch (@as(TupleEnum, @enumFromInt(self.i))) {
+                inline else => |idx| {
+                    self.positionals[@intFromEnum(idx)] = try PrimitiveCodec.parseByType(
+                        &PrimitiveCodec{},
+                        @TypeOf(self.positionals[@intFromEnum(idx)]),
+                        .null,
+                        allocator,
+                        cursor,
+                    );
+                    self.i += 1;
+                },
+            }
+        }
+
+        pub fn parseTuple(self: *@This(), allocator: *const Allocator, cursor: *CursorT) Error!void {
+            inline for (0..@typeInfo(PosT).@"struct".fields.len) |_| {
+                try self.parseNextType(allocator, cursor);
+            }
+        }
+
+        pub fn parseReminder(self: *@This(), allocator: *const Allocator, cursor: *CursorT) Error!void {
+            if (cursor.peek() == null) return;
+            self.reminder = try PrimitiveCodec.parseArray(
+                &PrimitiveCodec{},
+                []const []const u8,
+                .null,
+                allocator,
+                cursor,
+            );
+        }
+    };
+}
+
+test "parse positionals tuple" {
+    const t = std.testing;
+    const base = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    const PosT = struct { i32, bool, [3]u4 };
+    var pos: Positionals(PosT) = .{};
+
+    var cursor = try TstArgCursor.init(allocator,
+        \\-13
+        \\false
+        \\"[1,2,3]"
+        \\hello
+        \\world!
+    );
+    var c = cursor.asCursor();
+
+    pos.parseTuple(allocator, &c) catch |E| std.debug.print("{s}\n", .{@errorName(E)});
+    pos.parseReminder(allocator, &c) catch |E| std.debug.print("{s}\n", .{@errorName(E)});
+
+    try t.expectEqual(-13, pos.positionals[0]);
+    try t.expectEqual(false, pos.positionals[1]);
+    try t.expectEqualDeep(@as([]const u4, &.{ 1, 2, 3 }), &pos.positionals[2]);
+    // const expect: []const []const u8 = &.{ "hello", "world!" };
+    // try t.expectEqualDeep(expect, pos.reminder.?);
+}
+
 pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
     // TODO: optional error collection
     return struct {
-        // TODO: allocations were simplified by a lot, can we get rid of arenas?
-        // This will imply we know what Codecs are doing or that Codecs need to know
-        // when something gets freed
-        // in the case of our current codecs, that would be only for [:0]u8, [][]...
-        // Maybe wait for sized fields?
-        arena: *std.heap.ArenaAllocator,
+        arena: std.heap.ArenaAllocator,
         codec: SpecCodec,
         options: Options,
         program: ?[]const u8,
-        // TODO: Move to tuple inside Spec, leverage codec
         // TODO: support sized positionals (both with and without tuples)
-        positionals: ?[][]const u8,
+        positionals: PosT,
         verb: if (VerbT != void) ?VerbT else void,
         tracker: if (SpecTracker != void) SpecTracker else void,
 
@@ -35,7 +109,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             const VerbUnion = @typeInfo(Spec.Verb).@"union";
             comptime var newUnionFields: [VerbUnion.fields.len]std.builtin.Type.UnionField = undefined;
             for (VerbUnion.fields, 0..) |f, i| {
-                const newSpecR = *const SpecResponse(f.type);
+                const newSpecR = SpecResponse(f.type);
                 newUnionFields[i] = .{
                     .name = f.name,
                     .type = newSpecR,
@@ -56,15 +130,15 @@ pub fn SpecResponse(comptime Spec: type) type {
         fn SpecVerbsErrors() type {
             comptime var errors = error{};
             for (@typeInfo(SpecUnionVerbs()).@"union".fields) |field| {
-                errors = errors || std.meta.Child(field.type).Error;
+                errors = errors || field.type.Error;
             }
             return errors;
         }
 
         const Options = Spec;
         const CursorT = coll.Cursor([]const u8);
-        // Inner union element is a ptr
         const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
+        const PosT = if (@hasDecl(Spec, "Positional")) @TypeOf(Spec.Positional) else ?[][]const u8;
         const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
         const SpecTracker = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
         const SpecEnumFields = std.meta.FieldEnum(Spec);
@@ -87,24 +161,16 @@ pub fn SpecResponse(comptime Spec: type) type {
             break :E errors;
         };
 
-        pub fn init(allocator: *const Allocator) std.mem.Allocator.Error!*@This() {
-            var arena = try allocator.create(std.heap.ArenaAllocator);
-            arena.* = std.heap.ArenaAllocator.init(allocator.*);
-            _ = &arena;
-            return initArena(arena);
-        }
-
-        pub fn initArena(arena: *std.heap.ArenaAllocator) std.mem.Allocator.Error!*@This() {
-            const allocator = arena.allocator();
-            var self = try allocator.create(@This());
-            self.arena = arena;
-            self.codec = .{};
-            self.options = .{};
-            self.program = null;
-            self.positionals = null;
-            if (comptime VerbT != void) self.verb = null;
-            if (comptime SpecTracker != void) self.tracker = .{};
-            return self;
+        pub fn init(baseAllc: Allocator) @This() {
+            return .{
+                .arena = std.heap.ArenaAllocator.init(baseAllc),
+                .codec = .{},
+                .options = .{},
+                .program = null,
+                .positionals = if (@typeInfo(PosT) == .optional) null else Spec.Positional,
+                .verb = if (comptime VerbT != void) null else {},
+                .tracker = if (comptime SpecTracker != void) .{} else {},
+            };
         }
 
         // TODO: test all error returns
@@ -113,28 +179,25 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         fn parseInner(self: *@This(), cursor: *CursorT, comptime parseProgram: bool) Error!void {
-            self.positionals = null;
             if (comptime parseProgram) {
                 self.program = cursor.next();
                 if (self.program == null) return;
             } else {
                 _ = cursor.peek() orelse return;
             }
+            const allocator = self.arena.allocator();
 
-            var positionals = try std.ArrayListUnmanaged([]const u8).initCapacity(self.arena.allocator(), 8);
-            // This is needed because everything available outside SpecResult is boud
-            // to the arena, however positionals is used as scrap memory
-            // toOwnedSlice will perform another allocation over this, if necessary (len > 0)
-            defer positionals.deinit(self.arena.allocator());
+            var positionals = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 8);
+            defer if (positionals.capacity > 0) positionals.deinit(allocator);
 
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
-                    try positionals.append(self.arena.allocator(), "-");
+                    try positionals.append(allocator, "-");
                 } else if (arg.len == 2 and std.mem.eql(u8, "--", arg)) {
                     break;
                 } else if (arg.len >= 1 and arg[0] != '-') {
                     if (!try self.parseVerb(arg, cursor)) {
-                        try positionals.append(self.arena.allocator(), arg);
+                        try positionals.append(allocator, arg);
                     }
                 } else if (arg.len == 0) {
                     continue;
@@ -144,9 +207,11 @@ pub fn SpecResponse(comptime Spec: type) type {
                     try self.namedToken(offset, arg, cursor);
                 };
 
-            while (cursor.next()) |item| try positionals.append(self.arena.allocator(), item);
-            if (positionals.items.len > 0) {
-                self.positionals = try positionals.toOwnedSlice(self.arena.allocator());
+            if (comptime PosT != void) {
+                while (cursor.next()) |item| try positionals.append(allocator, item);
+                if (positionals.items.len > 0) {
+                    self.positionals = try positionals.toOwnedSlice(allocator);
+                }
             }
 
             if (comptime SpecTracker != void) try self.tracker.validate();
@@ -161,7 +226,7 @@ pub fn SpecResponse(comptime Spec: type) type {
 
             inline for (@typeInfo(Spec.Verb).@"union".fields) |f| {
                 if (std.mem.eql(u8, f.name, arg)) {
-                    const verbR = try SpecResponse(f.type).initArena(self.arena);
+                    var verbR = SpecResponse(f.type).init(self.arena.child_allocator);
                     try verbR.parseInner(cursor, false);
                     self.verb = @unionInit(VerbT, f.name, verbR);
                     if (comptime SpecTracker != void) self.tracker.parsedVerb();
@@ -171,6 +236,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             return false;
         }
 
+        // TODO: test k=
         fn namedToken(self: *@This(), offset: usize, arg: []const u8, cursor: *CursorT) Error!void {
             var splitValue: ?[]const u8 = null;
             var slice: []const u8 = arg[offset..];
@@ -200,7 +266,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             // NOTE: Short will result in fields[] with the enum_literal undone
             // with enum_literal as a key, unfortunately there's no enforcement for it to be
             // fieldEnum(Spec)
-            const ShortFields = std.meta.fields(@TypeOf(Spec.Short));
+            const ShortFields = comptime std.meta.fields(@TypeOf(Spec.Short));
             if (comptime ShortFields.len == 0) return Error.UnknownArgumentName;
 
             var start: usize = 0;
@@ -232,8 +298,8 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         fn namedArg(self: *@This(), arg: []const u8, cursor: *CursorT) Error!void {
-            const fields = @typeInfo(SpecEnumFields).@"enum".fields;
-            if (fields.len == 0) return Error.UnknownArgumentName;
+            const fields = comptime @typeInfo(SpecEnumFields).@"enum".fields;
+            if (comptime fields.len == 0) return Error.UnknownArgumentName;
 
             inline for (fields) |f| {
                 if (std.mem.eql(u8, f.name, arg)) {
@@ -255,24 +321,22 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         pub fn deinit(self: *const @This()) void {
-            // this is not pretty but it allows 1-call tear down
-            const cAllc = self.arena.child_allocator;
-            const arena = self.arena;
+            if (comptime VerbT != void) if (self.verb) |hasVerb| switch (hasVerb) {
+                inline else => |v| v.deinit(),
+            };
             self.arena.deinit();
-            cAllc.destroy(arena);
         }
     };
 }
 
-pub fn tstParseSpec(allocator: *const Allocator, cursor: *coll.Cursor([]const u8), Spec: type) !*const SpecResponse(Spec) {
-    var response = try SpecResponse(Spec).init(allocator);
-    errdefer response.deinit();
+pub fn tstParseSpec(allocator: Allocator, cursor: *coll.Cursor([]const u8), Spec: type) !SpecResponse(Spec) {
+    var response = SpecResponse(Spec).init(allocator);
     try response.parse(cursor);
     return response;
 }
 
-fn tstParse(allocator: *const Allocator, data: [:0]const u8, Spec: type) !*const SpecResponse(Spec) {
-    var tstCursor = try TstArgCursor.init(allocator, data);
+fn tstParse(allocator: Allocator, data: [:0]const u8, Spec: type) !SpecResponse(Spec) {
+    var tstCursor = try TstArgCursor.init(&allocator, data);
     var cursor = tstCursor.asCursor();
     return try tstParseSpec(allocator, &cursor, Spec);
 }
@@ -281,7 +345,7 @@ test "empty args with default" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const r = try tstParse(allocator, "", struct {
         flag: bool = false,
@@ -294,7 +358,7 @@ test "program only" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const r = try tstParse(allocator, "program", struct {});
     try std.testing.expectEqualStrings("program", r.program.?);
@@ -304,7 +368,7 @@ test "parse named" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const r = try tstParse(allocator, "program --cool-flag", struct { @"cool-flag": bool = false });
     const r2 = try tstParse(allocator, "program --cool-flag true", struct { @"cool-flag": bool = false });
@@ -323,7 +387,7 @@ test "parsed chained flags" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const Spec = struct {
         t1: bool = undefined,
@@ -352,7 +416,7 @@ test "parse short arg" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const Spec = struct {
         something: bool = false,
@@ -382,7 +446,7 @@ test "parse different types" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const Spec = struct {
         o1: bool = undefined,
@@ -392,6 +456,7 @@ test "parse different types" {
         e: Animal = undefined,
         s1: []const u8 = undefined,
         s2: [:0]const u8 = undefined,
+        pres1: [2]u8 = undefined,
         au1: []const u1 = undefined,
         au32: []const u32 = undefined,
         ai32: []const i32 = undefined,
@@ -418,6 +483,7 @@ test "parse different types" {
         \\--e dog
         \\--s1 Hello
         \\--s2 "Hello World"
+        \\--pres1 Hi
         \\--au1 [1,0,1,0]
         \\--au32=[32,23,133,99,10]
         \\--ai32 "[-1, -44, 22222, -1]"
@@ -441,6 +507,7 @@ test "parse different types" {
     try std.testing.expectEqual(Spec.Animal.dog, r1.options.e);
     try std.testing.expectEqualStrings("Hello", r1.options.s1);
     try std.testing.expectEqualStrings("Hello World", r1.options.s2);
+    try std.testing.expectEqualStrings("Hi", &r1.options.pres1);
     try std.testing.expectEqualDeep(&[_]u1{ 1, 0, 1, 0 }, r1.options.au1);
     try std.testing.expectEqualDeep(&[_]u32{ 32, 23, 133, 99, 10 }, r1.options.au32);
     try std.testing.expectEqualDeep(&[_]i32{ -1, -44, 22222, -1 }, r1.options.ai32);
@@ -464,7 +531,7 @@ test "parse kvargs" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const Spec = struct {
         something: bool = false,
@@ -477,6 +544,10 @@ test "parse kvargs" {
     };
 
     const r1 = try tstParse(allocator, "program -s=true --super-something=true", Spec);
+    try std.testing.expectError(
+        SpecResponse(Spec).Error.ArgEqualSplitNotConsumed,
+        tstParse(allocator, "program -s= --super-something=true", Spec),
+    );
 
     try std.testing.expectEqual(true, r1.options.something);
     try std.testing.expectEqual(true, r1.options.@"super-something");
@@ -487,7 +558,7 @@ test "parse positionals" {
     const base = &t.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const r1 = try tstParse(allocator, "program positional1 positional2 positional3", struct {});
     const expectedPositionals: []const []const u8 = &.{ "positional1", "positional2", "positional3" };
@@ -522,7 +593,7 @@ test "parse verb" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const Spec = struct {
         verbose: ?bool = null,
@@ -572,10 +643,10 @@ test "parse verb" {
 
 // TODO: move to example
 test "parse with custom codec" {
-    const base = &std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(base.*);
+    const base = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
     const Spec = struct {
         i: i32 = undefined,
         i2: i32 = undefined,
@@ -679,10 +750,10 @@ test "parse with custom codec" {
 
 // TODO: move to example
 test "parse verb with custom codec" {
-    const base = &std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(base.*);
+    const base = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const Spec = struct {
         verbose: ?bool = null,
@@ -740,7 +811,7 @@ test "parse verb with custom codec" {
                     crsor: *CodecIn.CursorT,
                 ) Error!Tx {
                     _ = self;
-                    const file = try PrimitiveCodec.parseString(Tx, allc, crsor);
+                    const file = try PrimitiveCodec.parseString(Tx, crsor);
                     if (std.mem.indexOf(u8, file, "/") != null) return Error.UnsupportedPathInFileName;
 
                     var fullPath = try allc.alloc(u8, 19 + file.len);
@@ -793,7 +864,7 @@ test "validate require" {
     const base = &std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(base.*);
     defer arena.deinit();
-    const allocator = &arena.allocator();
+    const allocator = arena.allocator();
 
     const Spec = struct {
         i: i32 = undefined,
@@ -825,9 +896,8 @@ test "validate require" {
 }
 
 test "parsed spec cleanup with verb" {
-    const allocator = &std.testing.allocator;
-
-    var tstCursor = try TstArgCursor.init(allocator,
+    const allocator = std.testing.allocator;
+    var tstCursor = try TstArgCursor.init(&allocator,
         \\program
         \\--verbose
         \\copy

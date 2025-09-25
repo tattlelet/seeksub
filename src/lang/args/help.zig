@@ -246,6 +246,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 rfd: switch (@typeInfo(Tt)) {
                     .int => b.append("int"),
                     .float => b.append("float"),
+                    // TODO: handle array
                     .pointer => |ptr| {
                         Tt = ptr.child;
                         if (Tt == u8) b.append("string") else {
@@ -270,6 +271,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 var b = coll.ComptSb.init("");
                 var Tt = T;
                 rfd: switch (@typeInfo(Tt)) {
+                    // TODO: handle array
                     .pointer => |ptr| {
                         Tt = ptr.child;
                         b.append("[]");
