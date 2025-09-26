@@ -12,15 +12,26 @@ const TstArgCursor = argIter.TstArgCursor;
 const PrimitiveCodec = argCodec.PrimitiveCodec;
 const ArgCodec = argCodec.ArgCodec;
 
-pub fn Positionals(comptime PosT: type) type {
+// TODO: split and add more tests
+pub fn PositionalOf(comptime PosT: type, comptime Reminder: type, default: Reminder) type {
     return struct {
-        positionals: PosT = undefined,
-        reminder: ?[]const []const u8 = null,
-        i: usize = 0,
+        tuple: PosT = if (PosT == void) {} else undefined,
+        reminder: Reminder = default,
+        list: InnerList = if (InnerList != void) undefined else {},
+        tupIdx: usize = 0,
+        reminderIdx: usize = 0,
 
+        pub const Positional = struct {
+            tuple: PosT,
+            reminder: Reminder,
+        };
+
+        const InnerList = if (reminderT() == .pointer) std.ArrayListUnmanaged(remindChildT()) else void;
         pub const CursorT = coll.Cursor([]const u8);
         pub const Error = error{
             ParseNextCalledOnTupleEnd,
+            ReminderBufferShorterThanArgs,
+            ParseNextCalledForEmptyPositional,
         } || PrimitiveCodec.Error;
 
         pub fn parseNextType(
@@ -28,37 +39,108 @@ pub fn Positionals(comptime PosT: type) type {
             allocator: *const Allocator,
             cursor: *CursorT,
         ) Error!void {
-            if (self.i >= self.positionals.len) return Error.ParseNextCalledOnTupleEnd;
+            if (comptime PosT == void and Reminder == void) return Error.ParseNextCalledForEmptyPositional;
+            if (comptime Reminder == void) {
+                if (self.tupIdx >= self.tuple.len) return Error.ParseNextCalledOnTupleEnd;
+            } else {
+                if (PosT == void or self.tupIdx >= self.tuple.len) {
+                    if (reminderT() == .array) {
+                        try self.nextReminderBuffered(allocator, cursor);
+                    } else {
+                        try self.nextReminder(allocator, cursor);
+                    }
+                    return;
+                }
+            }
             const TupleEnum = std.meta.FieldEnum(PosT);
-            switch (@as(TupleEnum, @enumFromInt(self.i))) {
+            switch (@as(TupleEnum, @enumFromInt(self.tupIdx))) {
                 inline else => |idx| {
-                    self.positionals[@intFromEnum(idx)] = try PrimitiveCodec.parseByType(
+                    self.tuple[@intFromEnum(idx)] = try PrimitiveCodec.parseByType(
                         &PrimitiveCodec{},
-                        @TypeOf(self.positionals[@intFromEnum(idx)]),
+                        @TypeOf(self.tuple[@intFromEnum(idx)]),
                         .null,
                         allocator,
                         cursor,
                     );
-                    self.i += 1;
+                    self.tupIdx += 1;
                 },
             }
         }
 
-        pub fn parseTuple(self: *@This(), allocator: *const Allocator, cursor: *CursorT) Error!void {
-            inline for (0..@typeInfo(PosT).@"struct".fields.len) |_| {
-                try self.parseNextType(allocator, cursor);
-            }
+        fn reminderT() std.builtin.Type {
+            const unsupportedMessage = comptime std.fmt.comptimePrint(
+                "Unsupported Reminder type {s}, it has to be a collection",
+                .{@typeName(Reminder)},
+            );
+            return comptime rfd: switch (@typeInfo(Reminder)) {
+                .optional => |opt| switch (@typeInfo(opt.child)) {
+                    .array, .pointer => continue :rfd @typeInfo(opt.child),
+                    else => @compileError(unsupportedMessage),
+                },
+                .array => |arr| @typeInfo(@Type(.{ .array = arr })),
+                .pointer => |ptr| @typeInfo(@Type(.{ .pointer = ptr })),
+                .void => @typeInfo(void),
+                else => @compileError(unsupportedMessage),
+            };
         }
 
-        pub fn parseReminder(self: *@This(), allocator: *const Allocator, cursor: *CursorT) Error!void {
-            if (cursor.peek() == null) return;
-            self.reminder = try PrimitiveCodec.parseArray(
+        fn remindChildT() type {
+            return rfd: switch (@typeInfo(Reminder)) {
+                .optional => |opt| continue :rfd @typeInfo(opt.child),
+                .array => |arr| std.meta.Child(@Type(.{ .array = arr })),
+                .pointer => |ptr| std.meta.Child(@Type(.{ .pointer = ptr })),
+                else => @compileError(std.fmt.comptimePrint(
+                    "Unsupported Reminder type {s}, it has to be a collection",
+                    .{@typeName(Reminder)},
+                )),
+            };
+        }
+
+        fn nextReminderBuffered(self: *@This(), allocator: *const Allocator, cursor: *CursorT) Error!void {
+            _ = cursor.peek() orelse return;
+
+            if (self.reminderIdx >= self.reminder.len) return Error.ReminderBufferShorterThanArgs;
+
+            self.reminder[self.reminderIdx] = try PrimitiveCodec.parseByType(
                 &PrimitiveCodec{},
-                []const []const u8,
+                remindChildT(),
                 .null,
                 allocator,
                 cursor,
             );
+            self.reminderIdx += 1;
+        }
+
+        fn nextReminder(self: *@This(), allc: *const Allocator, cursor: *CursorT) Error!void {
+            if (cursor.peek() == null) return;
+
+            const allocator = allc.*;
+            if (self.reminderIdx == 0) {
+                if (comptime InnerList == void) {
+                    @compileLog(remindChildT());
+                    @compileError("Unsupported call to nextReminder with non inner list");
+                } else {
+                    self.list = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 8);
+                }
+            }
+
+            const result = try PrimitiveCodec.parseByType(
+                &PrimitiveCodec{},
+                remindChildT(),
+                .null,
+                allc,
+                cursor,
+            );
+
+            try self.list.append(allocator, result);
+            self.reminderIdx += 1;
+        }
+
+        pub fn finish(self: *@This(), allocator: *const Allocator) std.mem.Allocator.Error!Positional {
+            return .{
+                .tuple = self.tuple,
+                .reminder = if (InnerList != void) try self.list.toOwnedSlice(allocator.*) else self.reminder,
+            };
         }
     };
 }
@@ -71,7 +153,7 @@ test "parse positionals tuple" {
     const allocator = &arena.allocator();
 
     const PosT = struct { i32, bool, [3]u4 };
-    var pos: Positionals(PosT) = .{};
+    var pos: PositionalOf(PosT, [2][]const u8, undefined) = .{};
 
     var cursor = try TstArgCursor.init(allocator,
         \\-13
@@ -82,14 +164,22 @@ test "parse positionals tuple" {
     );
     var c = cursor.asCursor();
 
-    pos.parseTuple(allocator, &c) catch |E| std.debug.print("{s}\n", .{@errorName(E)});
-    pos.parseReminder(allocator, &c) catch |E| std.debug.print("{s}\n", .{@errorName(E)});
+    try pos.parseNextType(allocator, &c);
+    try t.expectEqual(-13, pos.tuple[0]);
+    try pos.parseNextType(allocator, &c);
+    try t.expectEqual(false, pos.tuple[1]);
+    try pos.parseNextType(allocator, &c);
+    try t.expectEqualDeep(@as([]const u4, &.{ 1, 2, 3 }), &pos.tuple[2]);
+    try pos.parseNextType(allocator, &c);
+    try pos.parseNextType(allocator, &c);
+    const expect: []const []const u8 = &.{ "hello", "world!" };
+    try t.expectEqualDeep(expect, &pos.reminder);
 
-    try t.expectEqual(-13, pos.positionals[0]);
-    try t.expectEqual(false, pos.positionals[1]);
-    try t.expectEqualDeep(@as([]const u4, &.{ 1, 2, 3 }), &pos.positionals[2]);
-    // const expect: []const []const u8 = &.{ "hello", "world!" };
-    // try t.expectEqualDeep(expect, pos.reminder.?);
+    var pos2: PositionalOf(void, void, {}) = .{};
+    _ = &pos2;
+    const p = try pos2.finish(&std.testing.allocator);
+    try t.expectEqual({}, p.reminder);
+    try t.expectEqual({}, p.tuple);
 }
 
 pub fn SpecResponse(comptime Spec: type) type {
@@ -100,8 +190,7 @@ pub fn SpecResponse(comptime Spec: type) type {
         codec: SpecCodec,
         options: Options,
         program: ?[]const u8,
-        // TODO: support sized positionals (both with and without tuples)
-        positionals: PosT,
+        positionals: PosT.Positional,
         verb: if (VerbT != void) ?VerbT else void,
         tracker: if (SpecTracker != void) SpecTracker else void,
 
@@ -138,7 +227,12 @@ pub fn SpecResponse(comptime Spec: type) type {
         const Options = Spec;
         const CursorT = coll.Cursor([]const u8);
         const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
-        const PosT = if (@hasDecl(Spec, "Positional")) @TypeOf(Spec.Positional) else ?[][]const u8;
+        const PosT = if (@hasDecl(Spec, "Positional")) Spec.Positional else PositionalOf(
+            void,
+            ?[]const []const u8,
+            null,
+        );
+
         const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
         const SpecTracker = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
         const SpecEnumFields = std.meta.FieldEnum(Spec);
@@ -158,6 +252,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                 SpecCodec.Error;
             errors = errors || if (VerbT != void) SpecVerbsErrors() else error{};
             errors = errors || if (SpecTracker != void) SpecTracker.Error else error{};
+            errors = errors || PosT.Error;
             break :E errors;
         };
 
@@ -167,7 +262,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                 .codec = .{},
                 .options = .{},
                 .program = null,
-                .positionals = if (@typeInfo(PosT) == .optional) null else Spec.Positional,
+                .positionals = undefined,
                 .verb = if (comptime VerbT != void) null else {},
                 .tracker = if (comptime SpecTracker != void) .{} else {},
             };
@@ -185,19 +280,19 @@ pub fn SpecResponse(comptime Spec: type) type {
             } else {
                 _ = cursor.peek() orelse return;
             }
-            const allocator = self.arena.allocator();
-
-            var positionals = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 8);
-            defer if (positionals.capacity > 0) positionals.deinit(allocator);
+            const allocator = &self.arena.allocator();
+            var positionalOf = PosT{};
 
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
-                    try positionals.append(allocator, "-");
+                    cursor.stackItem(arg);
+                    try positionalOf.parseNextType(allocator, cursor);
                 } else if (arg.len == 2 and std.mem.eql(u8, "--", arg)) {
                     break;
                 } else if (arg.len >= 1 and arg[0] != '-') {
                     if (!try self.parseVerb(arg, cursor)) {
-                        try positionals.append(allocator, arg);
+                        cursor.stackItem(arg);
+                        try positionalOf.parseNextType(allocator, cursor);
                     }
                 } else if (arg.len == 0) {
                     continue;
@@ -207,12 +302,8 @@ pub fn SpecResponse(comptime Spec: type) type {
                     try self.namedToken(offset, arg, cursor);
                 };
 
-            if (comptime PosT != void) {
-                while (cursor.next()) |item| try positionals.append(allocator, item);
-                if (positionals.items.len > 0) {
-                    self.positionals = try positionals.toOwnedSlice(allocator);
-                }
-            }
+            while (cursor.peek()) |_| try positionalOf.parseNextType(allocator, cursor);
+            self.positionals = try positionalOf.finish(allocator);
 
             if (comptime SpecTracker != void) try self.tracker.validate();
         }
@@ -236,7 +327,6 @@ pub fn SpecResponse(comptime Spec: type) type {
             return false;
         }
 
-        // TODO: test k=
         fn namedToken(self: *@This(), offset: usize, arg: []const u8, cursor: *CursorT) Error!void {
             var splitValue: ?[]const u8 = null;
             var slice: []const u8 = arg[offset..];
@@ -380,7 +470,7 @@ test "parse named" {
     try std.testing.expectEqual(false, r3.options.@"cool-flag");
     try std.testing.expectEqual(true, r4.options.@"cool-flag");
     const expected: []const []const u8 = &.{ "something", "else" };
-    try std.testing.expectEqualDeep(expected, r4.positionals);
+    try std.testing.expectEqualDeep(expected, r4.positionals.reminder.?);
 }
 
 test "parsed chained flags" {
@@ -562,16 +652,19 @@ test "parse positionals" {
 
     const r1 = try tstParse(allocator, "program positional1 positional2 positional3", struct {});
     const expectedPositionals: []const []const u8 = &.{ "positional1", "positional2", "positional3" };
-    try std.testing.expectEqualDeep(expectedPositionals, r1.positionals);
+    try std.testing.expectEqual({}, r1.positionals.tuple);
+    try std.testing.expectEqualDeep(expectedPositionals, r1.positionals.reminder.?);
 
     const r2 = try tstParse(allocator, "program --test positional1 positional2 positional3", struct { @"test": bool = false });
     try std.testing.expect(r2.options.@"test");
-    try std.testing.expectEqualDeep(expectedPositionals, r2.positionals);
+    try std.testing.expectEqual({}, r2.positionals.tuple);
+    try std.testing.expectEqualDeep(expectedPositionals, r2.positionals.reminder.?);
 
     const r3 = try tstParse(allocator, "program -- --test positional1 positional2 positional3", struct { @"test": bool = false });
     try std.testing.expect(!r3.options.@"test");
     const expectSkip: []const []const u8 = &.{ "--test", "positional1", "positional2", "positional3" };
-    try std.testing.expectEqualDeep(expectSkip, r3.positionals);
+    try std.testing.expectEqual({}, r3.positionals.tuple);
+    try std.testing.expectEqualDeep(expectSkip, r3.positionals.reminder.?);
 
     const r4 = try tstParse(
         allocator,
@@ -584,9 +677,11 @@ test "parse positionals" {
     );
     try std.testing.expect(r4.options.@"test");
     const expectL1Pos: []const []const u8 = &.{ "-", "pos1" };
-    try std.testing.expectEqualDeep(expectL1Pos, r4.positionals.?);
+    try std.testing.expectEqual({}, r4.positionals.tuple);
+    try std.testing.expectEqualDeep(expectL1Pos, r4.positionals.reminder.?);
     const expectL2Pos: []const []const u8 = &.{ "pos2", "pos3" };
-    try std.testing.expectEqualDeep(expectL2Pos, r4.verb.?.verb1.positionals.?);
+    try std.testing.expectEqual({}, r4.verb.?.verb1.positionals.tuple);
+    try std.testing.expectEqualDeep(expectL2Pos, r4.verb.?.verb1.positionals.reminder.?);
 }
 
 test "parse verb" {
@@ -638,7 +733,7 @@ test "parse verb" {
     try std.testing.expectEqualStrings("file4", r5.verb.?.paste.options.target);
     try std.testing.expectEqual(true, r5.options.verbose);
     const expected: []const []const u8 = &.{"positional1"};
-    try std.testing.expectEqualDeep(expected, r5.verb.?.paste.positionals);
+    try std.testing.expectEqualDeep(expected, r5.verb.?.paste.positionals.reminder.?);
 }
 
 // TODO: move to example
