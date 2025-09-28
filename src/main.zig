@@ -4,7 +4,10 @@ const PositionalOf = @import("lang/args/spec.zig").PositionalOf;
 const Cursor = @import("lang/collections.zig").Cursor;
 
 pub const Args = struct {
-    ranges: [4][2]u7 = undefined,
+    arg1: []const u8 = undefined,
+    arg2: []const u8 = undefined,
+    flag1: bool = false,
+    flag2: bool = true,
 
     pub const Positional = PositionalOf(void, void, {});
 };
@@ -19,10 +22,10 @@ pub fn AsCursor(comptime T: type) type {
 }
 
 pub fn main() !void {
-    var buff: [@alignOf(Args) * 500]u8 = undefined;
-    var fx = std.heap.FixedBufferAllocator.init(&buff);
-    const allocator = fx.allocator();
-    // const allocator = std.heap.page_allocator;
+    // var buff: [@alignOf(Args) * 500]u8 = undefined;
+    // var fx = std.heap.FixedBufferAllocator.init(&buff);
+    // const allocator = fx.allocator();
+    const allocator = std.heap.page_allocator;
 
     const t0 = std.time.nanoTimestamp();
     var argIter = try std.process.argsWithAllocator(allocator);

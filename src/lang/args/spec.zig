@@ -12,7 +12,7 @@ const TstArgCursor = argIter.TstArgCursor;
 const PrimitiveCodec = argCodec.PrimitiveCodec;
 const ArgCodec = argCodec.ArgCodec;
 
-// TODO: split and add more tests
+// TODO: track tuple
 pub fn PositionalOf(comptime PosT: type, comptime Reminder: type, default: Reminder) type {
     return struct {
         tuple: PosT = if (PosT == void) {} else undefined,
@@ -136,7 +136,7 @@ pub fn PositionalOf(comptime PosT: type, comptime Reminder: type, default: Remin
             self.reminderIdx += 1;
         }
 
-        pub fn finish(self: *@This(), allocator: *const Allocator) std.mem.Allocator.Error!Positional {
+        pub fn collect(self: *@This(), allocator: *const Allocator) std.mem.Allocator.Error!Positional {
             return .{
                 .tuple = self.tuple,
                 .reminder = if (InnerList != void) try self.list.toOwnedSlice(allocator.*) else self.reminder,
@@ -164,20 +164,107 @@ test "parse positionals tuple" {
     );
     var c = cursor.asCursor();
 
-    try pos.parseNextType(allocator, &c);
-    try t.expectEqual(-13, pos.tuple[0]);
-    try pos.parseNextType(allocator, &c);
-    try t.expectEqual(false, pos.tuple[1]);
-    try pos.parseNextType(allocator, &c);
-    try t.expectEqualDeep(@as([]const u4, &.{ 1, 2, 3 }), &pos.tuple[2]);
-    try pos.parseNextType(allocator, &c);
-    try pos.parseNextType(allocator, &c);
-    const expect: []const []const u8 = &.{ "hello", "world!" };
-    try t.expectEqualDeep(expect, &pos.reminder);
+    while (c.peek()) |_| try pos.parseNextType(allocator, &c);
 
-    var pos2: PositionalOf(void, void, {}) = .{};
-    _ = &pos2;
-    const p = try pos2.finish(&std.testing.allocator);
+    const p = try pos.collect(&std.testing.allocator);
+
+    try t.expectEqual(-13, p.tuple[0]);
+    try t.expectEqual(false, p.tuple[1]);
+    try t.expectEqualDeep(@as([]const u4, &.{ 1, 2, 3 }), &p.tuple[2]);
+    const expect: []const []const u8 = &.{ "hello", "world!" };
+    try t.expectEqualDeep(expect, &p.reminder);
+}
+
+test "parse buffered reminder" {
+    const t = std.testing;
+    const base = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    var pos: PositionalOf(void, [2][]const u8, undefined) = .{};
+
+    var cursor = try TstArgCursor.init(allocator,
+        \\hello
+        \\world!
+        \\ha!
+    );
+    var c = cursor.asCursor();
+    for (0..2) |_| try pos.parseNextType(allocator, &c);
+
+    const p = try pos.collect(&std.testing.allocator);
+    try t.expectEqual({}, p.tuple);
+    const expect: []const []const u8 = &.{ "hello", "world!" };
+    try t.expectEqualDeep(expect, &p.reminder);
+    try t.expectError(@TypeOf(pos).Error.ReminderBufferShorterThanArgs, pos.parseNextType(allocator, &c));
+}
+
+test "parse dynamic reminder" {
+    const t = std.testing;
+    const allocator = &std.testing.allocator;
+
+    var pos: PositionalOf(void, []const []const u8, undefined) = .{};
+    var cursor = try TstArgCursor.init(allocator,
+        \\hello
+        \\world!
+        \\ha!
+    );
+    defer cursor.deinit();
+    var c = cursor.asCursor();
+
+    while (c.peek()) |_| try pos.parseNextType(allocator, &c);
+
+    const p = try pos.collect(&std.testing.allocator);
+    defer allocator.free(p.reminder);
+
+    try t.expectEqual({}, p.tuple);
+    const expect: []const []const u8 = &.{ "hello", "world!", "ha!" };
+    try t.expectEqualDeep(expect, p.reminder);
+}
+
+test "parse tuple only" {
+    const t = std.testing;
+    const base = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    const PosT = struct { i32, bool, [3]u4 };
+    var pos: PositionalOf(PosT, void, {}) = .{};
+
+    var cursor = try TstArgCursor.init(allocator,
+        \\-13
+        \\false
+        \\"[1,2,3]"
+        \\hello
+    );
+    var c = cursor.asCursor();
+
+    for (0..3) |_| try pos.parseNextType(allocator, &c);
+
+    const p = try pos.collect(&std.testing.allocator);
+
+    try t.expectEqual(-13, p.tuple[0]);
+    try t.expectEqual(false, p.tuple[1]);
+    try t.expectEqualDeep(@as([]const u4, &.{ 1, 2, 3 }), &p.tuple[2]);
+    try t.expectError(@TypeOf(pos).Error.ParseNextCalledOnTupleEnd, pos.parseNextType(allocator, &c));
+    try t.expectEqual({}, p.reminder);
+}
+
+test "parse empty positional" {
+    const t = std.testing;
+    const base = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base);
+    defer arena.deinit();
+    const allocator = &arena.allocator();
+
+    var cursor = try TstArgCursor.init(allocator, "test");
+    var c = cursor.asCursor();
+
+    var pos: PositionalOf(void, void, {}) = .{};
+    try t.expectError(@TypeOf(pos).Error.ParseNextCalledForEmptyPositional, pos.parseNextType(allocator, &c));
+
+    const p = try pos.collect(allocator);
     try t.expectEqual({}, p.reminder);
     try t.expectEqual({}, p.tuple);
 }
@@ -190,7 +277,7 @@ pub fn SpecResponse(comptime Spec: type) type {
         codec: SpecCodec,
         options: Options,
         program: ?[]const u8,
-        positionals: PosT.Positional,
+        positionals: PosOf.Positional,
         verb: if (VerbT != void) ?VerbT else void,
         tracker: if (SpecTracker != void) SpecTracker else void,
 
@@ -227,7 +314,7 @@ pub fn SpecResponse(comptime Spec: type) type {
         const Options = Spec;
         const CursorT = coll.Cursor([]const u8);
         const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
-        const PosT = if (@hasDecl(Spec, "Positional")) Spec.Positional else PositionalOf(
+        const PosOf = if (@hasDecl(Spec, "Positional")) Spec.Positional else PositionalOf(
             void,
             ?[]const []const u8,
             null,
@@ -252,7 +339,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                 SpecCodec.Error;
             errors = errors || if (VerbT != void) SpecVerbsErrors() else error{};
             errors = errors || if (SpecTracker != void) SpecTracker.Error else error{};
-            errors = errors || PosT.Error;
+            errors = errors || PosOf.Error;
             break :E errors;
         };
 
@@ -281,7 +368,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                 _ = cursor.peek() orelse return;
             }
             const allocator = &self.arena.allocator();
-            var positionalOf = PosT{};
+            var positionalOf = PosOf{};
 
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
@@ -303,7 +390,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                 };
 
             while (cursor.peek()) |_| try positionalOf.parseNextType(allocator, cursor);
-            self.positionals = try positionalOf.finish(allocator);
+            self.positionals = try positionalOf.collect(allocator);
 
             if (comptime SpecTracker != void) try self.tracker.validate();
         }
