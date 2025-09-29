@@ -12,7 +12,6 @@ const TstArgCursor = argIter.TstArgCursor;
 const PrimitiveCodec = argCodec.PrimitiveCodec;
 const ArgCodec = argCodec.ArgCodec;
 
-// TODO: track tuple
 pub fn PositionalOf(comptime PosT: type, comptime Reminder: type, default: Reminder) type {
     return struct {
         tuple: PosT = if (PosT == void) {} else undefined,
@@ -52,7 +51,7 @@ pub fn PositionalOf(comptime PosT: type, comptime Reminder: type, default: Remin
                     return;
                 }
             }
-            const TupleEnum = std.meta.FieldEnum(PosT);
+            const TupleEnum = meta.FieldEnum(PosT);
             switch (@as(TupleEnum, @enumFromInt(self.tupIdx))) {
                 inline else => |idx| {
                     self.tuple[@intFromEnum(idx)] = try PrimitiveCodec.parseByType(
@@ -137,9 +136,13 @@ pub fn PositionalOf(comptime PosT: type, comptime Reminder: type, default: Remin
         }
 
         pub fn collect(self: *@This(), allocator: *const Allocator) std.mem.Allocator.Error!Positional {
+            // TODO: required checks
+            const reminder = if (comptime InnerList == void) self.reminder else rv: {
+                break :rv if (self.reminderIdx == 0) &.{} else try self.list.toOwnedSlice(allocator.*);
+            };
             return .{
                 .tuple = self.tuple,
-                .reminder = if (InnerList != void) try self.list.toOwnedSlice(allocator.*) else self.reminder,
+                .reminder = reminder,
             };
         }
     };
@@ -364,9 +367,8 @@ pub fn SpecResponse(comptime Spec: type) type {
             if (comptime parseProgram) {
                 self.program = cursor.next();
                 if (self.program == null) return;
-            } else {
-                _ = cursor.peek() orelse return;
             }
+
             const allocator = &self.arena.allocator();
             var positionalOf = PosOf{};
 

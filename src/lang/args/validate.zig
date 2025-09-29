@@ -188,5 +188,3 @@ test "check required fields" {
     try t.expectEqual({}, try tracker.checkVerb());
     try t.expectEqual({}, try tracker.validate());
 }
-
-// TODO: test partial definitons

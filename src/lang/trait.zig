@@ -5,9 +5,9 @@ const BltType = std.builtin.Type;
 const Allocator = std.mem.Allocator;
 
 inline fn traitTableType(concrete: type) type {
-    return std.meta.Child(std.meta.FieldType(
+    return std.meta.Child(@FieldType(
         meta.ptrTypeToChild(concrete),
-        .traits,
+        @tagName(.traits),
     ));
 }
 

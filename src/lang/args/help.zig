@@ -437,6 +437,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     description(),
                     examples(),
                     commands(),
+                    // TODO: add section for positionals
                     options(),
                     Help.footer,
                 };
@@ -791,7 +792,7 @@ test "options string" {
     , HelpFmt(struct {
         nameA: []const u8 = undefined,
         nameB: []const u8 = "name",
-        nameC: ?[]u8 = @as([]u8, @constCast(@ptrCast("name2"))),
+        nameC: ?[]u8 = @as([]u8, @ptrCast(@constCast("name2"))),
         nameD: ?[]const u8 = null,
         pub const Help: HelpData(@This()) = .{
             .optionsDescription = &.{
@@ -812,7 +813,7 @@ test "options string" {
     , HelpFmt(struct {
         nameA: []const u8 = undefined,
         nameB: []const u8 = "name",
-        nameC: ?[]u8 = @as([]u8, @constCast(@ptrCast("name2"))),
+        nameC: ?[]u8 = @as([]u8, @ptrCast(@constCast("name2"))),
         nameD: ?[]const u8 = null,
         pub const Help: HelpData(@This()) = .{
             .optionsDescription = &.{

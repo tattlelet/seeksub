@@ -29,7 +29,7 @@ pub const TstArgCursor = struct {
     }
 
     pub fn next(cursor: *anyopaque) ?[]const u8 {
-        const self: *@This() = @alignCast(@ptrCast(cursor));
+        const self: *@This() = @ptrCast(@alignCast(cursor));
         return self.iterator.next();
     }
 };
@@ -334,14 +334,14 @@ test "simple array iterator" {
 }
 
 fn tstCollectTokens(allocator: *const Allocator, slice: []const u8) ![]const []const u8 {
-    var result = std.ArrayList([]const u8).init(allocator.*);
+    var result = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator.*, slice.len);
     var tokenizer = AtDepthArrayTokenizer.init(slice);
 
     while (try tokenizer.next()) |item| {
-        try result.append(item);
+        try result.append(allocator.*, item);
     }
 
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(allocator.*);
 }
 
 test "Depth 1 Array tokenizer (non-string)" {
