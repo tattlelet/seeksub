@@ -2,7 +2,7 @@ const std = @import("std");
 const coll = @import("../collections.zig");
 const argIter = @import("iterator.zig");
 const Allocator = std.mem.Allocator;
-const AtDepthArrayTokenizer = argIter.AtDepthArrayTokenizer;
+const AtDepthArrayTokenizer = argIter.AtDepthArrayTokenizer2;
 const TstArgCursor = argIter.TstArgCursor;
 
 pub fn ensureTypeTag(comptime T: type, comptime tag: @Type(.enum_literal)) void {
@@ -255,7 +255,7 @@ pub const PrimitiveCodec = struct {
 
         const s = cursor.next() orelse return Error.ParseStringEndOfIterator;
         if (s.len != @typeInfo(T).array.len) return Error.ParseStringBufferValueSizeMismatch;
-        return @as(*const T, @alignCast(@ptrCast(s.ptr))).*;
+        return @as(*const T, @ptrCast(@alignCast(s.ptr))).*;
     }
 
     pub fn parseStringZ(
