@@ -136,21 +136,17 @@ const DebuArgs = struct {
 };
 
 pub fn main() !void {
+    for (1..1000) |_| {
+        try parse();
+    }
+}
+
+pub fn parse() !void {
     const allocator = std.heap.page_allocator;
 
     const t0 = std.time.nanoTimestamp();
     var argIter = try std.process.argsWithAllocator(allocator);
     defer argIter.deinit();
-    // var argIter: DebuArgs = .{
-    //     .data = &.{
-    //         "program",
-    //         "--match",
-    //         "/\\d+/gi",
-    //         "--byteRanges=[[1,2], [3,4]]",
-    //         "diff",
-    //         // "--replace='helo'",
-    //     },
-    // };
     // const t1 = std.time.nanoTimestamp();
     var result = SpecResponse(Args).init(allocator);
     defer result.deinit();
