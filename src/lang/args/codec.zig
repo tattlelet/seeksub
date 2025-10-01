@@ -2,7 +2,7 @@ const std = @import("std");
 const coll = @import("../collections.zig");
 const argIter = @import("iterator.zig");
 const Allocator = std.mem.Allocator;
-const AtDepthArrayTokenizer = argIter.AtDepthArrayTokenizer2;
+const AtDepthArrayTokenizer = argIter.AtDepthArrayTokenizer;
 const TstArgCursor = argIter.TstArgCursor;
 
 pub fn ensureTypeTag(comptime T: type, comptime tag: @Type(.enum_literal)) void {
