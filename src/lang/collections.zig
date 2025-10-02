@@ -36,12 +36,44 @@ pub fn Cursor(T: type) type {
     };
 }
 
+// NOTE: this is for debugging purposes, it adds an extra layer of indirection
+pub fn AsCursor(comptime T: type) type {
+    return struct {
+        pub fn next(erased: *anyopaque) ?[]const u8 {
+            const cursor: *T = @ptrCast(@alignCast(erased));
+            return cursor.next();
+        }
+    };
+}
+
+pub const DebugCursor = struct {
+    data: []const []const u8,
+    i: usize = 0,
+
+    pub fn next(cursor: *anyopaque) ?[]const u8 {
+        var self: *@This() = @ptrCast(@alignCast(cursor));
+        if (self.i >= self.data.len) return null;
+        defer self.i += 1;
+        return self.data[self.i];
+    }
+
+    pub fn asCursor(self: *@This()) Cursor([]const u8) {
+        return .{
+            .curr = null,
+            .ptr = @ptrCast(self),
+            .vtable = &.{
+                .next = &@This().next,
+            },
+        };
+    }
+};
+
 pub fn UnitCursor(T: type) type {
     return struct {
         pub fn asCursor(item: ?T) Cursor(T) {
             return .{
                 .curr = item,
-                .ptr = @constCast(@ptrCast(&{})),
+                .ptr = @ptrCast(@constCast(&{})),
                 .vtable = &.{
                     .next = @This().next,
                 },
@@ -51,7 +83,7 @@ pub fn UnitCursor(T: type) type {
         pub fn asNoneCursor() Cursor(T) {
             return .{
                 .curr = null,
-                .ptr = @constCast(@ptrCast(&{})),
+                .ptr = @ptrCast(@constCast(&{})),
                 .vtable = &.{
                     .next = @This().next,
                 },
@@ -88,7 +120,7 @@ pub fn ArrayCursor(T: type) type {
         }
 
         pub fn next(cursor: *anyopaque) ?T {
-            var self: *@This() = @alignCast(@ptrCast(cursor));
+            var self: *@This() = @ptrCast(@alignCast(cursor));
             return if (self.i >= self.list.len) null else ret: {
                 defer self.i += 1;
                 break :ret self.list[self.i];

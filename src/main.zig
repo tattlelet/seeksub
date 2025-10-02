@@ -115,34 +115,15 @@ const Args = struct {
     };
 };
 
-pub fn AsCursor(comptime T: type) type {
-    return struct {
-        pub fn next(erased: *anyopaque) ?[]const u8 {
-            const cursor: *T = @ptrCast(@alignCast(erased));
-            return cursor.next();
-        }
-    };
-}
-
-const DebuArgs = struct {
-    data: []const []const u8,
-    i: usize = 0,
-
-    pub fn next(self: *@This()) ?[]const u8 {
-        if (self.i >= self.data.len) return null;
-        defer self.i += 1;
-        return self.data[self.i];
-    }
-};
-
 pub fn main() !void {
-    for (1..1000) |_| {
-        try parse();
-    }
+    // for (1..1000) |_| {
+    try parse();
+    // }
 }
 
 pub fn parse() !void {
-    const allocator = std.heap.page_allocator;
+    var sfba = std.heap.stackFallback(4098, std.heap.page_allocator);
+    const allocator = sfba.get();
 
     const t0 = std.time.nanoTimestamp();
     var argIter = try std.process.argsWithAllocator(allocator);
@@ -156,7 +137,7 @@ pub fn parse() !void {
             .curr = null,
             .ptr = &argIter,
             .vtable = &.{
-                .next = &AsCursor(@TypeOf(argIter)).next,
+                .next = &coll.AsCursor(@TypeOf(argIter)).next,
             },
         };
         break :rv &c;
