@@ -84,7 +84,7 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
             ParseNextCalledOnTupleEnd,
             ReminderBufferShorterThanArgs,
             ParseNextCalledForEmptyPositional,
-        } || PrimitiveCodec.Error;
+        } || CodecT.Error;
 
         pub fn parseNextType(
             self: *@This(),
@@ -95,7 +95,7 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
             if (comptime ReminderT == void) {
                 if (self.tupleCursor >= self.tuple.len) return Error.ParseNextCalledOnTupleEnd;
             } else {
-                if (TupleT == void or self.tupleCursor >= self.tuple.len) {
+                if ((comptime TupleT == void) or self.tupleCursor >= self.tuple.len) {
                     if (reminderT() == .array) {
                         try self.nextReminderBuffered(allocator, cursor);
                     } else {
@@ -107,8 +107,7 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
             const TupleEnum = meta.FieldEnum(TupleT);
             switch (@as(TupleEnum, @enumFromInt(self.tupleCursor))) {
                 inline else => |idx| {
-                    self.tuple[@intFromEnum(idx)] = try PrimitiveCodec.parseByType(
-                        &PrimitiveCodec{},
+                    self.tuple[@intFromEnum(idx)] = try self.codec.parseByType(
                         @TypeOf(self.tuple[@intFromEnum(idx)]),
                         .null,
                         allocator,
@@ -297,4 +296,43 @@ test "parse empty positional" {
     const p = try pos.collect(allocator);
     try t.expectEqual({}, p.reminder);
     try t.expectEqual({}, p.tuple);
+}
+
+test "custom codec doubles i32 tuple input" {
+    const t = std.testing;
+    const allocator = &std.testing.allocator;
+
+    const CustomCodec = struct {
+        pub const Error = error{ InvalidType, ParseIntError } || std.fmt.ParseIntError;
+        pub fn parseByType(
+            self: *const @This(),
+            comptime T: type,
+            _: anytype,
+            allc: *const std.mem.Allocator,
+            cursor: *coll.Cursor([]const u8),
+        ) Error!T {
+            _ = self;
+            _ = allc;
+            if (T != i32) return Error.InvalidType;
+            const s = cursor.next() orelse return Error.ParseIntError;
+            const val: i32 = try std.fmt.parseInt(i32, s, 10);
+            return val * 2;
+        }
+    };
+
+    var pos: PositionalOf(.{
+        .TupleType = struct { i32 },
+        .ReminderType = void,
+        .CodecType = CustomCodec,
+    }) = .{};
+
+    var cursor = coll.DebugCursor{
+        .data = &.{"4"},
+    };
+    var c = cursor.asCursor();
+
+    try pos.parseNextType(allocator, &c);
+    const p = try pos.collect(allocator);
+
+    try t.expectEqual(@as(i32, 8), p.tuple[0]);
 }

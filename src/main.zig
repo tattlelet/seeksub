@@ -126,7 +126,7 @@ pub fn parse() !void {
     const allocator = sfba.get();
 
     const t0 = std.time.nanoTimestamp();
-    var argIter = try std.process.argsWithAllocator(allocator);
+    var argIter = try std.process.args();
     defer argIter.deinit();
     // const t1 = std.time.nanoTimestamp();
     var result = SpecResponse(Args).init(allocator);
