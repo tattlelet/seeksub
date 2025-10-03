@@ -1,22 +1,26 @@
 const std = @import("std");
-const spec = @import("lang/args/spec.zig");
-const help = @import("lang/args/help.zig");
-const validate = @import("lang/args/validate.zig");
-const coll = @import("lang/collections.zig");
+const zpec = @import("zpec");
+const args = zpec.args;
+const spec = args.spec;
+const help = args.help;
+const validate = args.validate;
+const coll = zpec.collections;
 const Cursor = coll.Cursor;
 const ComptSb = coll.ComptSb;
 const HelpData = help.HelpData;
 const HelpFmt = help.HelpFmt;
 const GroupMatchConfig = validate.GroupMatchConfig;
 const SpecResponse = spec.SpecResponse;
-const PositionalOf = spec.PositionalOf;
+const PositionalOf = args.positionals.PositionalOf;
 
 const Args = struct {
     match: []const u8 = undefined,
     byteRanges: ?[]const []const usize = null,
     verbose: bool = false,
 
-    const Positional = PositionalOf(void, void, {});
+    pub const Positional = PositionalOf(.{
+        .TupleType = void,
+    });
 
     pub const Short = .{
         .m = .match,
@@ -116,18 +120,11 @@ const Args = struct {
 };
 
 pub fn main() !void {
-    // for (1..1000) |_| {
-    try parse();
-    // }
-}
-
-pub fn parse() !void {
     var sfba = std.heap.stackFallback(4098, std.heap.page_allocator);
     const allocator = sfba.get();
 
     const t0 = std.time.nanoTimestamp();
-    var argIter = try std.process.args();
-    defer argIter.deinit();
+    var argIter = std.process.args();
     // const t1 = std.time.nanoTimestamp();
     var result = SpecResponse(Args).init(allocator);
     defer result.deinit();
