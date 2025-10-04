@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const lib_mod = b.createModule(.{
+    const zpec = b.addModule("zpec", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -15,12 +15,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe_mod.addImport("zpec", lib_mod);
+    exe_mod.addImport("zpec", zpec);
 
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "zpec",
-        .root_module = lib_mod,
+        .root_module = zpec,
     });
 
     b.installArtifact(lib);
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const lib_unit_tests = b.addTest(.{
-        .root_module = lib_mod,
+        .root_module = zpec,
     });
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
