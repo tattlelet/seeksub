@@ -521,18 +521,12 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        pub fn help() []const u8 {
+        // TODO: expand enum helper
+
+        pub fn baseHelp() []const u8 {
             return comptime rt: {
                 var b = coll.ComptSb.init("");
-                const pieces: []const ?[]const u8 = &.{
-                    usage(),
-                    description(),
-                    examples(),
-                    positionals(),
-                    commands(),
-                    options(),
-                    Help.footer,
-                };
+                const pieces: []const ?[]const u8 = &.{ usage(), description(), examples(), positionals(), commands(), options(), Help.footer };
                 var addLines = 0;
                 for (pieces) |pieceOpt| {
                     const piece = pieceOpt orelse continue;
@@ -543,6 +537,23 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     addLines += 1;
                 }
                 break :rt b.s;
+            };
+        }
+
+        pub fn help() []const u8 {
+            return comptime baseHelp() ++ "\n";
+        }
+
+        pub fn helpForErr(ErrOf: type, E: ErrOf, comptime reason: []const u8) []const u8 {
+            return switch (E) {
+                inline else => |e| comptime rv: {
+                    break :rv coll.ComptSb.initTup(.{
+                        reason,
+                        @errorName(e),
+                        "\n\n",
+                        help(),
+                    }).s;
+                },
             };
         }
     };
@@ -1427,7 +1438,7 @@ test "help" {
     try t.expectEqualStrings("", HelpFmt(
         struct {},
         .{ .headerDelimiter = "" },
-    ).help());
+    ).baseHelp());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1435,7 +1446,7 @@ test "help" {
         pub const Help: HelpData(@This()) = .{
             .usage = &.{"test [options] [commands] ..."},
         };
-    }, .{ .headerDelimiter = "" }).help());
+    }, .{ .headerDelimiter = "" }).baseHelp());
 
     try t.expectEqualStrings(
         \\  Some description about test
@@ -1443,7 +1454,7 @@ test "help" {
         pub const Help: HelpData(@This()) = .{
             .description = "Some description about test",
         };
-    }, .{ .headerDelimiter = "" }).help());
+    }, .{ .headerDelimiter = "" }).baseHelp());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1454,7 +1465,7 @@ test "help" {
             .usage = &.{"test [options] [commands] ..."},
             .description = "Some description about test",
         };
-    }, .{ .headerDelimiter = "" }).help());
+    }, .{ .headerDelimiter = "" }).baseHelp());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1474,7 +1485,7 @@ test "help" {
                 "test --verbose match 2 1",
             },
         };
-    }, .{}).help());
+    }, .{}).baseHelp());
 
     try t.expectEqualStrings(
         \\Options:
@@ -1486,7 +1497,7 @@ test "help" {
                 .{ .field = .i1, .description = "i1 desc" },
             },
         };
-    }, .{ .headerDelimiter = "" }).help());
+    }, .{ .headerDelimiter = "" }).baseHelp());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1518,7 +1529,7 @@ test "help" {
                 .{ .field = .i1, .description = "i1 desc" },
             },
         };
-    }, .{}).help());
+    }, .{}).baseHelp());
 
     try t.expectEqualStrings(
         \\Commands:
@@ -1539,7 +1550,7 @@ test "help" {
             match: Match,
             trace: Trace,
         };
-    }, .{ .headerDelimiter = "" }).help());
+    }, .{ .headerDelimiter = "" }).baseHelp());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1582,7 +1593,7 @@ test "help" {
                 "test --verbose match 2 1",
             },
         };
-    }, .{}).help());
+    }, .{}).baseHelp());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1634,7 +1645,7 @@ test "help" {
                 .{ .field = .i1, .description = "i1 desc" },
             },
         };
-    }, .{}).help());
+    }, .{}).baseHelp());
 
     try t.expectEqualStrings(
         \\This is a footer, it gets added as typed
@@ -1642,7 +1653,7 @@ test "help" {
         pub const Help: HelpData(@This()) = .{
             .footer = "This is a footer, it gets added as typed",
         };
-    }, .{ .headerDelimiter = "" }).help());
+    }, .{ .headerDelimiter = "" }).baseHelp());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1697,7 +1708,7 @@ test "help" {
             },
             .footer = "This is a footer, it gets added as typed",
         };
-    }, .{ .simpleTypes = true }).help());
+    }, .{ .simpleTypes = true }).baseHelp());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1768,5 +1779,21 @@ test "help" {
             },
             .footer = "This is a footer, it gets added as typed",
         };
-    }, .{ .simpleTypes = true }).help());
+    }, .{ .simpleTypes = true }).baseHelp());
+}
+
+test "helpForErr" {
+    const t = std.testing;
+    const Spec = struct {
+        flag: bool,
+    };
+
+    try t.expectEqualStrings(
+        \\Error: Test
+        \\
+        \\Options:
+        \\
+        \\  --flag
+        \\
+    , HelpFmt(Spec, .{}).helpForErr(error{Test}, error{Test}.Test, "Error: "));
 }

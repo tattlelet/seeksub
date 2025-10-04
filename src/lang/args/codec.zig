@@ -25,7 +25,7 @@ pub fn ensureType(
     ));
 }
 
-// TODO: This is not stat useful considering a lot of the methods are
+// TODO: This is not that useful considering a lot of the methods are
 // monoformized and I cant run checks on, while the compiler will definitely complain
 // based on the spec.
 pub fn ensureCodec(comptime PtrT: type) void {

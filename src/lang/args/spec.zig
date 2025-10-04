@@ -98,6 +98,21 @@ pub fn SpecResponse(comptime Spec: type) type {
             };
         }
 
+        pub fn parseArgs(self: *@This()) Error!void {
+            var iter = std.process.args();
+            const cursor = rv: {
+                var c: CursorT = .{
+                    .curr = null,
+                    .ptr = @ptrCast(&iter),
+                    .vtable = &.{
+                        .next = &coll.AsCursor(@TypeOf(iter)).next,
+                    },
+                };
+                break :rv &c;
+            };
+            try self.parse(cursor);
+        }
+
         // TODO: test all error returns
         pub fn parse(self: *@This(), cursor: *CursorT) Error!void {
             try self.parseInner(cursor, true);

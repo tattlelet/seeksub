@@ -8,7 +8,6 @@ const coll = zpec.collections;
 const Cursor = coll.Cursor;
 const ComptSb = coll.ComptSb;
 const HelpData = help.HelpData;
-const HelpFmt = help.HelpFmt;
 const GroupMatchConfig = validate.GroupMatchConfig;
 const SpecResponse = spec.SpecResponse;
 const PositionalOf = args.positionals.PositionalOf;
@@ -117,48 +116,24 @@ const Args = struct {
             .required = &.{.replace},
         };
     };
+
+    pub const HelpFmt = help.HelpFmt(Args, .{ .simpleTypes = true, .optionsBreakline = true });
 };
 
 pub fn main() !void {
     var sfba = std.heap.stackFallback(4098, std.heap.page_allocator);
     const allocator = sfba.get();
 
-    const t0 = std.time.nanoTimestamp();
-    var argIter = std.process.args();
-    // const t1 = std.time.nanoTimestamp();
+    var timer = try std.time.Timer.start();
     var result = SpecResponse(Args).init(allocator);
     defer result.deinit();
-    // const t2 = std.time.nanoTimestamp();
-    var cursor = rv: {
-        var c = Cursor([]const u8){
-            .curr = null,
-            .ptr = &argIter,
-            .vtable = &.{
-                .next = &coll.AsCursor(@TypeOf(argIter)).next,
-            },
-        };
-        break :rv &c;
+    result.parseArgs() catch |E| {
+        try std.fs.File.stderr().writeAll(Args.HelpFmt.helpForErr(
+            @TypeOf(result).Error,
+            E,
+            "Failed with reason: ",
+        ));
     };
-    _ = &cursor;
-    // const t3 = std.time.nanoTimestamp();
 
-    result.parse(cursor) catch |E| {
-        const helpWithReson: []const u8 = switch (E) {
-            inline else => |e| comptime rv: {
-                break :rv ComptSb.initTup(.{
-                    "Execution failure reason: ",
-                    @errorName(e),
-                    "\n\n",
-                    HelpFmt(Args, .{ .simpleTypes = true, .optionsBreakline = true }).help(),
-                    "\n\n",
-                }).s;
-            },
-        };
-        std.log.err("Failure reason: {s}", .{@errorName(E)});
-        try std.fs.File.stderr().writeAll(helpWithReson);
-    };
-    const t4 = std.time.nanoTimestamp();
-
-    std.log.err("parse: {d}ns", .{t4 - t0});
-    // std.log.err("{any}", .{result.options.ranges});
+    std.log.err("parse: {d}ns", .{timer.read()});
 }
