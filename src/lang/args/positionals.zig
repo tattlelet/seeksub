@@ -84,7 +84,13 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
             ParseNextCalledOnTupleEnd,
             ReminderBufferShorterThanArgs,
             ParseNextCalledForEmptyPositional,
-        } || CodecT.Error;
+        } ||
+            CodecT.Error ||
+            CollectError;
+
+        pub const CollectError = error{
+            MissingPositionalField,
+        } || std.mem.Allocator.Error;
 
         pub fn parseNextType(
             self: *@This(),
@@ -156,8 +162,8 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
             self.reminderCursor += 1;
         }
 
-        pub fn collect(self: *@This(), allocator: *const Allocator) std.mem.Allocator.Error!Positionals {
-            // TODO: required checks
+        pub fn collect(self: *@This(), allocator: *const Allocator) CollectError!Positionals {
+            if ((comptime TupleT != void) and self.tupleCursor < self.tuple.len) return CollectError.MissingPositionalField;
             const reminder = if (comptime InnerList == void) self.reminder else rv: {
                 break :rv if (self.reminderCursor == 0) &.{} else try self.list.toOwnedSlice(allocator.*);
             };

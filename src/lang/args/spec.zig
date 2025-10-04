@@ -63,7 +63,7 @@ pub fn SpecResponse(comptime Spec: type) type {
         const Options = Spec;
         const CursorT = coll.Cursor([]const u8);
         const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
-        const PosOf = if (@hasDecl(Spec, "Positional")) Spec.Positional else defaultPositionals();
+        const PosOf = if (@hasDecl(Spec, "Positionals")) Spec.Positionals else defaultPositionals();
         const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
         const SpecTracker = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
         const SpecEnumFields = std.meta.FieldEnum(Spec);
@@ -511,6 +511,26 @@ test "parse positionals" {
     const expectL2Pos: []const []const u8 = &.{ "pos2", "pos3" };
     try std.testing.expectEqual({}, r4.verb.?.verb1.positionals.tuple);
     try std.testing.expectEqualDeep(expectL2Pos, r4.verb.?.verb1.positionals.reminder.?);
+}
+
+test "parse custom positionals" {
+    const t = std.testing;
+    const base = &t.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Spec = struct {
+        pub const Positionals = PositionalOf(.{
+            .TupleType = struct { i32, [2]u8 },
+        });
+    };
+
+    const r1 = try tstParse(allocator, "program 2 ab", Spec);
+    try t.expectEqual(2, r1.positionals.tuple.@"0");
+    try t.expectEqualStrings("ab", &r1.positionals.tuple.@"1");
+
+    try t.expectError(Spec.Positionals.CollectError.MissingPositionalField, tstParse(allocator, "program 2", Spec));
 }
 
 test "parse verb" {
