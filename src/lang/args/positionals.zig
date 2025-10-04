@@ -33,8 +33,8 @@ pub fn PositionalOf(comptime Config: PositionalConfig) type {
 // the only case this allocates in heap is for dynamic arrays or sentinel slices
 pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefault: Config.ReminderType) type {
     return struct {
-        const ReminderT = Config.ReminderType;
-        const TupleT = Config.TupleType;
+        pub const TupleT = Config.TupleType;
+        pub const ReminderT = Config.ReminderType;
         const CodecT = Config.CodecType;
         const InnerList = if (reminderT() == .pointer) std.ArrayListUnmanaged(remindChildT()) else void;
 
@@ -74,7 +74,7 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
         reminderCursor: usize = 0,
         codec: CodecT = .{},
 
-        pub const Positional = struct {
+        pub const Positionals = struct {
             tuple: TupleT,
             reminder: ReminderT,
         };
@@ -156,7 +156,7 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
             self.reminderCursor += 1;
         }
 
-        pub fn collect(self: *@This(), allocator: *const Allocator) std.mem.Allocator.Error!Positional {
+        pub fn collect(self: *@This(), allocator: *const Allocator) std.mem.Allocator.Error!Positionals {
             // TODO: required checks
             const reminder = if (comptime InnerList == void) self.reminder else rv: {
                 break :rv if (self.reminderCursor == 0) &.{} else try self.list.toOwnedSlice(allocator.*);

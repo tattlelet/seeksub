@@ -1,7 +1,9 @@
 const std = @import("std");
 const coll = @import("../collections.zig");
+const PositionalOf = @import("positionals.zig").PositionalOf;
 const meta = @import("../meta.zig");
 const GroupMatchConfig = @import("validate.zig").GroupMatchConfig;
+const DefaultPosT = @import("spec.zig").defaultPositionals();
 const btType = std.builtin.Type;
 
 pub const HelpConf = struct {
@@ -246,7 +248,17 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 rfd: switch (@typeInfo(Tt)) {
                     .int => b.append("int"),
                     .float => b.append("float"),
-                    // TODO: handle array
+                    .array => |arr| {
+                        Tt = arr.child;
+                        if (Tt == u8) b.append("string") else {
+                            b.appendAll(.{
+                                "[",
+                                std.fmt.comptimePrint("{d}", .{arr.len}),
+                                "]",
+                            });
+                            continue :rfd @typeInfo(Tt);
+                        }
+                    },
                     .pointer => |ptr| {
                         Tt = ptr.child;
                         if (Tt == u8) b.append("string") else {
@@ -429,6 +441,86 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
+        pub fn positionals() ?[]const u8 {
+            return comptime rt: {
+                const posDec = Help.positionalsDescription orelse break :rt null;
+
+                const PosT = if (@hasDecl(Spec, "Positionals")) Spec.Positionals else DefaultPosT;
+                if (PosT.TupleT == void and PosT.ReminderT == void) break :rt null;
+
+                var b = coll.ComptSb.initTup(.{ "Positionals:\n", conf.headerDelimiter });
+                const innerBlock: [conf.indent]u8 = @splat(' ');
+
+                var typesCount: usize = if (PosT.TupleT != void) std.meta.fields(PosT.TupleT).len else 0;
+                typesCount += if (PosT.ReminderT != void) 1 else 0;
+
+                var typePieces: [typesCount][]const u8 = undefined;
+                var pieceIdx: usize = 0;
+                if (PosT.TupleT != void) {
+                    for (std.meta.fields(PosT.TupleT)) |field| {
+                        typePieces[pieceIdx] = coll.ComptSb.initTup(.{
+                            "<",
+                            translateType(field.type),
+                            ">",
+                        }).s;
+                        pieceIdx += 1;
+                    }
+                }
+                if (PosT.ReminderT != void) {
+                    typePieces[pieceIdx] = coll.ComptSb.initTup(.{
+                        "<",
+                        translateType(PosT.ReminderT),
+                        ">",
+                    }).s;
+                }
+                const columDelim = columnDelimiter(typePieces);
+
+                if (PosT.TupleT != void) {
+                    const fields = std.meta.fields(PosT.TupleT);
+                    for (0..fields.len) |tupIdx| {
+                        defer if (tupIdx < fields.len - 1) b.append("\n");
+
+                        const tupItemDesc: ?[]const u8 = if (posDec.tuple) |tupDesc| rv: {
+                            if (tupIdx >= tupDesc.len) break :rv null;
+                            break :rv tupDesc[tupIdx];
+                        } else null;
+
+                        const typePiece = typePieces[tupIdx];
+
+                        b.appendAll(.{
+                            innerBlock,
+                            typePiece,
+                            &@as(
+                                [columDelim - typePiece.len]u8,
+                                @splat(' '),
+                            ),
+                            "[Required]",
+                        });
+
+                        if (tupItemDesc) |desc| b.appendAll(.{
+                            " ",
+                            desc,
+                        });
+                    }
+                }
+
+                if (PosT.ReminderT != void) {
+                    if (PosT.TupleT != void) b.append("\n");
+                    const rPiece = typePieces[typePieces.len - 1];
+                    b.appendAll(.{
+                        innerBlock,
+                        rPiece,
+                    });
+                    if (posDec.reminder) |rDesc| b.appendAll(.{ &@as(
+                        [columDelim - rPiece.len]u8,
+                        @splat(' '),
+                    ), rDesc });
+                }
+
+                break :rt b.s;
+            };
+        }
+
         pub fn help() []const u8 {
             return comptime rt: {
                 var b = coll.ComptSb.init("");
@@ -436,8 +528,8 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     usage(),
                     description(),
                     examples(),
+                    positionals(),
                     commands(),
-                    // TODO: add section for positionals
                     options(),
                     Help.footer,
                 };
@@ -462,9 +554,15 @@ pub fn HelpData(T: type) type {
         usage: ?[]const []const u8 = null,
         description: ?[]const u8 = null,
         shortDescription: ?[]const u8 = null,
+        positionalsDescription: ?PositionalDescription = null,
         examples: ?[]const []const u8 = null,
         optionsDescription: ?[]const FieldDesc = null,
         footer: ?[]const u8 = null,
+
+        pub const PositionalDescription = struct {
+            tuple: ?[]const []const u8 = null,
+            reminder: ?[]const u8 = null,
+        };
 
         pub const FieldDesc = struct {
             field: SpecEnum,
@@ -536,6 +634,100 @@ test "examples" {
         \\  prog --help
         \\  prog --verbose help --help
     , HelpFmt(Spec, .{ .headerDelimiter = "" }).examples().?);
+}
+
+test "positionals" {
+    const t = std.testing;
+    try t.expectEqual(null, HelpFmt(struct {}, .{}).examples());
+    const Spec = struct {
+        pub const Positionals = PositionalOf(.{
+            .TupleType = struct { i32, u32 },
+        });
+
+        pub const Help: HelpData(@This()) = .{
+            .positionalsDescription = .{
+                .tuple = &.{
+                    "src number",
+                },
+                .reminder = "file paths",
+            },
+        };
+    };
+    try t.expectEqualStrings(
+        \\Positionals:
+        \\
+        \\    <i32>               [Required] src number
+        \\    <u32>               [Required]
+        \\    <?[][]u8>           file paths
+    , HelpFmt(Spec, .{ .indent = 4 }).positionals().?);
+    try t.expectEqualStrings(
+        \\Positionals:
+        \\  <int>               [Required] src number
+        \\  <int>               [Required]
+        \\  <?[]string>         file paths
+    , HelpFmt(Spec, .{ .headerDelimiter = "", .simpleTypes = true }).positionals().?);
+
+    const SpecWithoutTup = struct {
+        pub const Positionals = PositionalOf(.{});
+
+        pub const Help: HelpData(@This()) = .{
+            .positionalsDescription = .{
+                .reminder = "file paths",
+            },
+        };
+    };
+    try t.expectEqualStrings(
+        \\Positionals:
+        \\
+        \\    <?[][]u8>           file paths
+    , HelpFmt(SpecWithoutTup, .{ .indent = 4 }).positionals().?);
+    try t.expectEqualStrings(
+        \\Positionals:
+        \\  <?[]string>         file paths
+    , HelpFmt(SpecWithoutTup, .{ .headerDelimiter = "", .simpleTypes = true }).positionals().?);
+
+    const SpecWithoutRemind = struct {
+        pub const Positionals = PositionalOf(.{
+            .TupleType = struct { i32, u32 },
+            .ReminderType = void,
+        });
+
+        pub const Help: HelpData(@This()) = .{
+            .positionalsDescription = .{
+                .tuple = &.{
+                    "src number",
+                },
+            },
+        };
+    };
+    try t.expectEqualStrings(
+        \\Positionals:
+        \\
+        \\    <i32>           [Required] src number
+        \\    <u32>           [Required]
+    , HelpFmt(SpecWithoutRemind, .{ .indent = 4 }).positionals().?);
+    try t.expectEqualStrings(
+        \\Positionals:
+        \\  <int>       [Required] src number
+        \\  <int>       [Required]
+    , HelpFmt(SpecWithoutRemind, .{ .headerDelimiter = "", .simpleTypes = true }).positionals().?);
+
+    const SpecWithoutTupEmptyDesc = struct {
+        pub const Positionals = PositionalOf(.{});
+
+        pub const Help: HelpData(@This()) = .{
+            .positionalsDescription = .{},
+        };
+    };
+    try t.expectEqualStrings(
+        \\Positionals:
+        \\
+        \\    <?[][]u8>
+    , HelpFmt(SpecWithoutTupEmptyDesc, .{ .indent = 4 }).positionals().?);
+    try t.expectEqualStrings(
+        \\Positionals:
+        \\  <?[]string>
+    , HelpFmt(SpecWithoutTupEmptyDesc, .{ .headerDelimiter = "", .simpleTypes = true }).positionals().?);
 }
 
 test "commands" {
@@ -1506,111 +1698,75 @@ test "help" {
             .footer = "This is a footer, it gets added as typed",
         };
     }, .{ .simpleTypes = true }).help());
-}
 
-// test "help" {
-//     const t = std.testing;
-//     const Spec = struct {
-//         match: []const u8 = undefined,
-//         files: []const []const u8 = undefined,
-//         byteRanges: ?[]const []const usize = null,
-//         verbose: bool = false,
-//
-//         pub const Match = struct {
-//             @"match-n": ?usize = null,
-//
-//             pub const Short = .{
-//                 .n = .@"match-n",
-//             };
-//
-//             pub const Help: HelpData(@This()) = .{
-//                 .usage = &.{"seeksub ... match"},
-//                 .description = "Matches based on options at the top-level. This performs no mutation or replacement, it's simply a dry-run.",
-//                 .shortDescription = "Match-only operation. This is a dry-run with no replacement.",
-//                 .optionsDescription = &.{
-//                     .{ .field = .@"match-n", .description = "N-match stop for each file if set." },
-//                 },
-//             };
-//         };
-//
-//         pub const Diff = struct {
-//             replace: []const u8 = undefined,
-//
-//             pub const Short = .{
-//                 .r = .replace,
-//             };
-//
-//             pub const Help: HelpData(@This()) = .{
-//                 .usage = &.{"seeksub ... diff [options]"},
-//                 .description = "Matches based on options at the top-level and then performs a replacement over matches, providing a diff return but not actually mutating the files.",
-//                 .shortDescription = "Dry-runs replacement. No mutation is performed.",
-//                 .optionsDescription = &.{
-//                     .{ .field = .replace, .description = "Replace match on all files using this PCRE2 regex." },
-//                 },
-//             };
-//
-//             pub const GroupMatch: GroupMatchConfig(@This()) = .{
-//                 .required = &.{.replace},
-//             };
-//         };
-//
-//         pub const Apply = struct {
-//             replace: []const u8 = undefined,
-//             trace: bool = false,
-//
-//             pub const Short = .{
-//                 .r = .replace,
-//                 .tt = .trace,
-//             };
-//
-//             pub const Help: HelpData(@This()) = .{
-//                 .usage = &.{"seeksub ... apply [options]"},
-//                 .description = "Matches based on options at the top-level and then performs a replacement over matches. This is mutate the files.",
-//                 .shortDescription = "Replaces based on match and replace PCRE2 regexes over all files.",
-//                 .optionsDescription = &.{
-//                     .{ .field = .replace, .description = "Replace match on all files using this PCRE2 regex." },
-//                     .{ .field = .trace, .description = "Trace mutations" },
-//                 },
-//             };
-//
-//             pub const GroupMatch: GroupMatchConfig(@This()) = .{
-//                 .required = &.{.replace},
-//             };
-//         };
-//
-//         pub const Verb = union(enum) {
-//             match: Match,
-//             diff: Diff,
-//             apply: Apply,
-//         };
-//
-//         pub const Short = .{
-//             .m = .match,
-//             .fL = .files,
-//             .bR = .byteRanges,
-//             .v = .verbose,
-//         };
-//
-//         pub const Help: HelpData(@This()) = .{
-//             .usage = &.{"seeksub [options] [command] ..."},
-//             .description = "CLI tool to match, diff and apply regex in bulk using PCRE2. One of the main features of this CLI is the ability to seek byte ranges before matching or replacing.",
-//             .optionsDescription = &.{
-//                 .{ .field = .match, .description = "PCRE2 Regex to match on all files." },
-//                 .{ .field = .files, .description = "File path list to run matches on." },
-//                 .{ .field = .byteRanges, .description = "Range of bytes for n files, top-level array length has to be of (len <= files.len) and will be applied sequentially over files." },
-//                 .{ .field = .verbose, .description = "Verbose mode." },
-//             },
-//         };
-//
-//         pub const GroupMatch: GroupMatchConfig(@This()) = .{
-//             .required = &.{ .match, .files },
-//             .mandatoryVerb = true,
-//         };
-//     };
-//     std.debug.print("{s}\n", .{HelpFmt(Spec, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
-//     std.debug.print("{s}\n", .{HelpFmt(Spec.Match, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
-//     std.debug.print("{s}\n", .{HelpFmt(Spec.Diff, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
-//     std.debug.print("{s}\n", .{HelpFmt(Spec.Apply, .{ .simpleTypes = true, .optionsBreakline = true }).help()});
-//     _ = t;
-//     // try t.expectEqualStrings("", HelpFmt(Spec, .{ .simpleTypes = true, .optionsBreakline = true }).help());
-// }
+    try t.expectEqualStrings(
+        \\Usage: test [options] [commands] ...
+        \\
+        \\  Some description about test
+        \\
+        \\Examples:
+        \\
+        \\  test --verbose match 1 1
+        \\  test --verbose match 2 1
+        \\
+        \\Positionals:
+        \\
+        \\  <[2]int>            [Required] range
+        \\  <string>            [Required] some string
+        \\  <?[]string>         reminder
+        \\
+        \\Commands: [Required]
+        \\
+        \\  match       matches args
+        \\  trace       trace-matches args
+        \\
+        \\Options:
+        \\
+        \\  -i, --i1 (int = 0)      [Required] i1 desc
+        \\
+        \\This is a footer, it gets added as typed
+    , HelpFmt(struct {
+        i1: i32 = 0,
+        pub const Positionals = PositionalOf(.{
+            .TupleType = struct { [2]i32, []const u8 },
+        });
+        pub const Match = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "matches args",
+            };
+        };
+        pub const Trace = struct {
+            pub const Help: HelpData(@This()) = .{
+                .shortDescription = "trace-matches args",
+            };
+        };
+        pub const Verb = union(enum) {
+            match: Match,
+            trace: Trace,
+        };
+        pub const Short = .{ .i = .i1 };
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .mandatoryVerb = true,
+            .required = &.{.i1},
+        };
+        pub const Help: HelpData(@This()) = .{
+            .usage = &.{"test [options] [commands] ..."},
+            .description = "Some description about test",
+            .examples = &.{
+                "test --verbose match 1 1",
+                "test --verbose match 2 1",
+            },
+            .positionalsDescription = .{
+                .tuple = &.{
+                    "range",
+                    "some string",
+                },
+                .reminder = "reminder",
+            },
+            .optionsDescription = &.{
+                .{ .field = .i1, .description = "i1 desc" },
+            },
+            .footer = "This is a footer, it gets added as typed",
+        };
+    }, .{ .simpleTypes = true }).help());
+}

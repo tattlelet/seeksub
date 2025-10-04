@@ -13,6 +13,10 @@ const TstArgCursor = argIter.TstArgCursor;
 const PrimitiveCodec = argCodec.PrimitiveCodec;
 const ArgCodec = argCodec.ArgCodec;
 
+pub fn defaultPositionals() type {
+    return PositionalOf(.{});
+}
+
 pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
     // TODO: optional error collection
@@ -21,7 +25,8 @@ pub fn SpecResponse(comptime Spec: type) type {
         codec: SpecCodec,
         options: Options,
         program: ?[]const u8,
-        positionals: PosOf.Positional,
+        // Grab default if available
+        positionals: PosOf.Positionals,
         verb: if (VerbT != void) ?VerbT else void,
         tracker: if (SpecTracker != void) SpecTracker else void,
 
@@ -58,7 +63,7 @@ pub fn SpecResponse(comptime Spec: type) type {
         const Options = Spec;
         const CursorT = coll.Cursor([]const u8);
         const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
-        const PosOf = if (@hasDecl(Spec, "Positional")) Spec.Positional else PositionalOf(.{});
+        const PosOf = if (@hasDecl(Spec, "Positional")) Spec.Positional else defaultPositionals();
         const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
         const SpecTracker = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
         const SpecEnumFields = std.meta.FieldEnum(Spec);
