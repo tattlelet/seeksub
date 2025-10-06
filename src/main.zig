@@ -48,6 +48,7 @@ const Args = struct {
             .{ .field = .verbose, .description = "Verbose mode." },
         },
     };
+    pub const HelpFmt = help.HelpFmt(@This(), .{ .simpleTypes = true, .optionsBreakline = true });
 
     pub const Match = struct {
         @"match-n": ?usize = null,
@@ -66,6 +67,7 @@ const Args = struct {
                 .{ .field = .@"match-n", .description = "N-match stop for each file if set." },
             },
         };
+        pub const HelpFmt = help.HelpFmt(@This(), .{ .simpleTypes = true, .optionsBreakline = true });
     };
 
     pub const Diff = struct {
@@ -85,6 +87,7 @@ const Args = struct {
                 .{ .field = .replace, .description = "Replace match on all files using this PCRE2 regex." },
             },
         };
+        pub const HelpFmt = help.HelpFmt(@This(), .{ .simpleTypes = true, .optionsBreakline = true });
 
         pub const GroupMatch: GroupMatchConfig(@This()) = .{
             .required = &.{.replace},
@@ -111,13 +114,12 @@ const Args = struct {
                 .{ .field = .trace, .description = "Trace mutations" },
             },
         };
+        pub const HelpFmt = help.HelpFmt(@This(), .{ .simpleTypes = true, .optionsBreakline = true });
 
         pub const GroupMatch: GroupMatchConfig(@This()) = .{
             .required = &.{.replace},
         };
     };
-
-    pub const HelpFmt = help.HelpFmt(Args, .{ .simpleTypes = true, .optionsBreakline = true });
 };
 
 pub fn main() !void {
@@ -127,13 +129,11 @@ pub fn main() !void {
     var timer = try std.time.Timer.start();
     var result = SpecResponse(Args).init(allocator);
     defer result.deinit();
-    result.parseArgs() catch |E| {
-        try std.fs.File.stderr().writeAll(Args.HelpFmt.helpForErr(
-            @TypeOf(result).Error,
-            E,
-            "Failed with reason: ",
-        ));
-    };
+    if (result.parseArgs()) |err| {
+        if (err.message) |message| {
+            try std.fs.File.stderr().writeAll(message);
+        }
+    }
 
     std.log.err("parse: {d}ns", .{timer.read()});
 }

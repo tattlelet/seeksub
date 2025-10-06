@@ -13,13 +13,20 @@ const TstArgCursor = argIter.TstArgCursor;
 const PrimitiveCodec = argCodec.PrimitiveCodec;
 const ArgCodec = argCodec.ArgCodec;
 
+// This ties spec positionals default and helper's
 pub fn defaultPositionals() type {
     return PositionalOf(.{});
 }
 
+pub fn Result(Ok: type, Err: type) type {
+    return union(enum) {
+        Ok: Ok,
+        Err: Err,
+    };
+}
+
 pub fn SpecResponse(comptime Spec: type) type {
     // TODO: validate spec
-    // TODO: optional error collection
     return struct {
         arena: std.heap.ArenaAllocator,
         codec: SpecCodec,
@@ -86,6 +93,20 @@ pub fn SpecResponse(comptime Spec: type) type {
             break :E errors;
         };
 
+        pub const ParseError = struct {
+            err: Error,
+            message: ?[]const u8,
+
+            pub fn ErrOf(err: Error) @This() {
+                return .{
+                    .err = err,
+                    .message = help(err),
+                };
+            }
+
+            // TODO: add diagnostics
+        };
+
         pub fn init(baseAllc: Allocator) @This() {
             return .{
                 .arena = std.heap.ArenaAllocator.init(baseAllc),
@@ -98,7 +119,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             };
         }
 
-        pub fn parseArgs(self: *@This()) Error!void {
+        pub fn parseArgs(self: *@This()) ?ParseError {
             var iter = std.process.args();
             const cursor = rv: {
                 var c: CursorT = .{
@@ -110,65 +131,83 @@ pub fn SpecResponse(comptime Spec: type) type {
                 };
                 break :rv &c;
             };
-            try self.parse(cursor);
+            return self.parseInner(cursor, true);
         }
 
         // TODO: test all error returns
+        // TODO: update tests
         pub fn parse(self: *@This(), cursor: *CursorT) Error!void {
-            try self.parseInner(cursor, true);
+            if (self.parseInner(cursor, true)) |err| {
+                return @as(Error!void, err.err);
+            }
         }
 
-        fn parseInner(self: *@This(), cursor: *CursorT, comptime parseProgram: bool) Error!void {
+        fn parseInner(self: *@This(), cursor: *CursorT, comptime parseProgram: bool) ?ParseError {
             if (comptime parseProgram) {
                 self.program = cursor.next();
-                if (self.program == null) return;
+                if (self.program == null) return null;
             }
 
             const allocator = &self.arena.allocator();
-            var positionalOf = PosOf{};
+            var positionalOf: PosOf = .{};
 
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
                     cursor.stackItem(arg);
-                    try positionalOf.parseNextType(allocator, cursor);
+                    positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
                 } else if (arg.len == 2 and std.mem.eql(u8, "--", arg)) {
                     break;
                 } else if (arg.len >= 1 and arg[0] != '-') {
-                    if (!try self.parseVerb(arg, cursor)) {
-                        cursor.stackItem(arg);
-                        try positionalOf.parseNextType(allocator, cursor);
+                    switch (self.parseVerb(arg, cursor)) {
+                        .Ok => |hasVerb| {
+                            if (!hasVerb) {
+                                cursor.stackItem(arg);
+                                positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+                            }
+                        },
+                        .Err => |err| return err,
                     }
                 } else if (arg.len == 0) {
                     continue;
                 } else {
                     var offset: usize = 1;
                     if (arg[1] == '-') offset += 1;
-                    try self.namedToken(offset, arg, cursor);
+                    self.namedToken(offset, arg, cursor) catch |e| return .ErrOf(e);
                 };
 
-            while (cursor.peek()) |_| try positionalOf.parseNextType(allocator, cursor);
-            self.positionals = try positionalOf.collect(allocator);
+            while (cursor.peek()) |_| positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+            self.positionals = positionalOf.collect(allocator) catch |e| return .ErrOf(e);
 
-            if (comptime SpecTracker != void) try self.tracker.validate();
+            if (comptime SpecTracker != void) self.tracker.validate() catch |e| return .ErrOf(e);
+
+            return null;
         }
 
         fn parseVerb(
             self: *@This(),
             arg: []const u8,
             cursor: *CursorT,
-        ) Error!bool {
-            if (comptime VerbT == void) return false;
+        ) Result(bool, ParseError) {
+            if (comptime VerbT == void) return .{ .Ok = false };
 
             inline for (@typeInfo(Spec.Verb).@"union".fields) |f| {
                 if (std.mem.eql(u8, f.name, arg)) {
                     var verbR = SpecResponse(f.type).init(self.arena.child_allocator);
-                    try verbR.parseInner(cursor, false);
-                    self.verb = @unionInit(VerbT, f.name, verbR);
-                    if (comptime SpecTracker != void) self.tracker.parsedVerb();
-                    return true;
+                    if (verbR.parseInner(cursor, false)) |e| {
+                        return .{
+                            .Err = .{
+                                .err = e.err,
+                                .message = e.message,
+                            },
+                        };
+                    } else {
+                        self.verb = @unionInit(VerbT, f.name, verbR);
+                        if (comptime SpecTracker != void) self.tracker.parsedVerb();
+                        return .{ .Ok = true };
+                    }
                 }
             }
-            return false;
+            return .{ .Ok = false };
         }
 
         fn namedToken(self: *@This(), offset: usize, arg: []const u8, cursor: *CursorT) Error!void {
@@ -188,7 +227,7 @@ pub fn SpecResponse(comptime Spec: type) type {
                 else => Error.InvalidArgumentToken,
             };
 
-            // if split not consumed, it's not sane to progress
+            // if split is not consumed, it's not sane to progress
             if (splitValue) |v| {
                 const peekR: [*]const u8 = @ptrCast(cursor.peek() orelse return);
                 if (peekR == @as([*]const u8, @ptrCast(v))) return Error.ArgEqualSplitNotConsumed;
@@ -259,6 +298,13 @@ pub fn SpecResponse(comptime Spec: type) type {
                 inline else => |v| v.deinit(),
             };
             self.arena.deinit();
+        }
+
+        // TODO: trickle down config
+        pub fn help(e: Error) ?[]const u8 {
+            if (!@hasDecl(Spec, "HelpFmt")) return null;
+
+            return Spec.HelpFmt.helpForErr(Error, e, "Failed with reason: ");
         }
     };
 }
