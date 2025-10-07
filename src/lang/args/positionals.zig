@@ -92,6 +92,16 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
             MissingPositionalField,
         } || std.mem.Allocator.Error;
 
+        // TODO: test this
+        pub fn hasNext(self: *const @This()) bool {
+            if (comptime TupleT == void and ReminderT == void) return false;
+            if (comptime TupleT != void) {
+                return self.tupleCursor < self.tuple.len;
+            } else {
+                return true;
+            }
+        }
+
         pub fn parseNextType(
             self: *@This(),
             allocator: *const Allocator,

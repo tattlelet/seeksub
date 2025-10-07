@@ -25,70 +25,6 @@ pub fn ensureType(
     ));
 }
 
-// TODO: This is not that useful considering a lot of the methods are
-// monoformized and I cant run checks on, while the compiler will definitely complain
-// based on the spec.
-pub fn ensureCodec(comptime PtrT: type) void {
-    const T = std.meta.Child(PtrT);
-    comptime ensureTypeTag(T, .@"struct");
-    comptime if (!std.meta.hasMethod(T, "supports")) @compileError(std.fmt.comptimePrint(
-        "Type {s} is not a codec - it's missing supports method",
-        .{@typeName(T)},
-    ));
-
-    // Check supports fn
-    const supportsFn = @typeInfo(@TypeOf(@field(T, "supports")));
-    const supportsParams = supportsFn.@"fn".params;
-    comptime if (supportsParams.len != 2) @compileError(std.fmt.comptimePrint(
-        "Signature mismatch for Codec.supports on type {s}",
-        .{@typeName(T)},
-    ));
-    comptime if (@typeInfo(supportsParams[0].type.?) != .type) @compileError(std.fmt.comptimePrint(
-        "Codec - {s}: supports param [0] is not type",
-        .{@typeName(T)},
-    ));
-    comptime if (@typeInfo(supportsParams[1].type.?) != .@"enum") @compileError(std.fmt.comptimePrint(
-        "Codec - {s}: supports param [1] is not an enum",
-        .{@typeName(T)},
-    ));
-    comptime if (@typeInfo(supportsFn.@"fn".return_type.?) != .bool) @compileError(std.fmt.comptimePrint(
-        "Codec - {s}: supports return is not bool",
-        .{@typeName(T)},
-    ));
-
-    // Check parseByType
-    comptime if (!std.meta.hasMethod(T, "parseByType")) @compileError(std.fmt.comptimePrint(
-        "Type {s} is not a codec. It's missing parseBytype method",
-        .{@typeName(T)},
-    ));
-    const parseByTypeFn = @typeInfo(@TypeOf(@field(T, "parseByType")));
-    const parseByTypeParams = parseByTypeFn.@"fn".params;
-    comptime if (parseByTypeParams.len != 5) @compileError(std.fmt.comptimePrint(
-        "Signature mismatch for Codec.parseByType on type {s}",
-        .{@typeName(T)},
-    ));
-    comptime if (!(parseByTypeParams[0].is_generic and parseByTypeParams[0].type == null) and !(parseByTypeParams[0].type.? == *T)) @compileError(std.fmt.comptimePrint(
-        "Codec - {s}: parseByType param [0] is not generic (anytype) or of *Codec",
-        .{@typeName(T)},
-    ));
-    comptime if (@typeInfo(parseByTypeParams[1].type.?) != .type) @compileError(std.fmt.comptimePrint(
-        "Codec - {s}: parseByType param [1] is not type",
-        .{@typeName(T)},
-    ));
-    comptime if (@typeInfo(parseByTypeParams[2].type.?) != .@"enum") @compileError(std.fmt.comptimePrint(
-        "Codec - {s}: parseByType param [2] is not an enum",
-        .{@typeName(T)},
-    ));
-    comptime if (parseByTypeParams[3].type.? != *const Allocator) @compileError(std.fmt.comptimePrint(
-        "Codec - {s}: parseByType param [3] is not *const Allocator",
-        .{@typeName(T)},
-    ));
-    comptime if (parseByTypeParams[4].type.? != *coll.Cursor([]const u8)) @compileError(std.fmt.comptimePrint(
-        "Codec - {s}: parseByType param [4] is not *coll.Cursor([]const u8)",
-        .{@typeName(T)},
-    ));
-}
-
 // Tag is passed around but never used by this codec
 pub const PrimitiveCodec = struct {
     pub const Error = error{
@@ -124,7 +60,6 @@ pub const PrimitiveCodec = struct {
         );
 
         if (comptime @TypeOf(codec) != *PrimitiveCodec and @TypeOf(codec) != *const PrimitiveCodec) {
-            comptime ensureCodec(@TypeOf(codec));
             if (comptime std.meta.Child(@TypeOf(codec)).supports(T, tag)) {
                 return try codec.parseByType(T, tag, allocator, cursor);
             }
@@ -386,7 +321,6 @@ pub fn ArgCodec(Spec: type) type {
             allocator: *const Allocator,
             cursor: *CursorT,
         ) (Error || std.meta.Child(@TypeOf(codec)).Error)!T {
-            comptime ensureCodec(@TypeOf(codec));
             if (comptime !supports(T, tag)) {
                 return try PrimitiveCodec.parseByType(codec, T, tag, allocator, cursor);
             }

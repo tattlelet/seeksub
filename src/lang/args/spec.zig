@@ -67,9 +67,9 @@ pub fn SpecResponse(comptime Spec: type) type {
             return errors;
         }
 
-        const Options = Spec;
+        pub const Options = Spec;
         const CursorT = coll.Cursor([]const u8);
-        const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
+        pub const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
         const PosOf = if (@hasDecl(Spec, "Positionals")) Spec.Positionals else defaultPositionals();
         const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
         const SpecTracker = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
@@ -154,7 +154,10 @@ pub fn SpecResponse(comptime Spec: type) type {
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
                     cursor.stackItem(arg);
-                    positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+                    // TODO: test break case
+                    if (positionalOf.hasNext()) {
+                        positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+                    } else break;
                 } else if (arg.len == 2 and std.mem.eql(u8, "--", arg)) {
                     break;
                 } else if (arg.len >= 1 and arg[0] != '-') {
@@ -162,7 +165,10 @@ pub fn SpecResponse(comptime Spec: type) type {
                         .Ok => |hasVerb| {
                             if (!hasVerb) {
                                 cursor.stackItem(arg);
-                                positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+                                // TODO: test break case
+                                if (positionalOf.hasNext()) {
+                                    positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+                                } else break;
                             }
                         },
                         .Err => |err| return err,
@@ -175,10 +181,16 @@ pub fn SpecResponse(comptime Spec: type) type {
                     self.namedToken(offset, arg, cursor) catch |e| return .ErrOf(e);
                 };
 
-            while (cursor.peek()) |_| positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+            // TODO: test buffer spill-over to next level
+            while (cursor.peek() != null and positionalOf.hasNext()) {
+                positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+            }
+
             self.positionals = positionalOf.collect(allocator) catch |e| return .ErrOf(e);
 
             if (comptime SpecTracker != void) self.tracker.validate() catch |e| return .ErrOf(e);
+
+            // TODO: ensure add ensure cursor consumed before leaving (configurable)
 
             return null;
         }
