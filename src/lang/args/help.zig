@@ -381,7 +381,6 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
 
         pub fn options() ?[]const u8 {
             return comptime rt: {
-                @setEvalBranchQuota(100000);
                 const fields = std.meta.fields(Spec);
                 if (fields.len == 0) break :rt null;
                 const OptShortFields: ?[]const btType.StructField = if (@hasDecl(Spec, "Short")) std.meta.fields(@TypeOf(Spec.Short)) else null;
@@ -521,12 +520,19 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        // TODO: expand enum helper
-
         pub fn baseHelp() []const u8 {
+            @setEvalBranchQuota(10000000);
             return comptime rt: {
                 var b = coll.ComptSb.init("");
-                const pieces: []const ?[]const u8 = &.{ usage(), description(), examples(), positionals(), commands(), options(), Help.footer };
+                const pieces: []const ?[]const u8 = &.{
+                    usage(),
+                    description(),
+                    examples(),
+                    positionals(),
+                    commands(),
+                    options(),
+                    Help.footer,
+                };
                 var addLines = 0;
                 for (pieces) |pieceOpt| {
                     const piece = pieceOpt orelse continue;
@@ -582,6 +588,20 @@ pub fn HelpData(T: type) type {
             typeHint: bool = true,
             groupMatchHint: bool = true,
         };
+    };
+}
+
+// TODO: add test
+pub fn enumValueHint(target: type) []const u8 {
+    return comptime rv: {
+        var b = coll.ComptSb.init("{ ");
+        const fields = @typeInfo(target).@"enum".fields;
+        for (fields, 0..) |field, i| {
+            b.append(field.name);
+            if (i + 1 < fields.len) b.append(", ");
+        }
+        b.append(" }");
+        break :rv b.s;
     };
 }
 

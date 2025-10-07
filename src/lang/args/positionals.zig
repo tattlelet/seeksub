@@ -7,6 +7,11 @@ const Allocator = std.mem.Allocator;
 const PrimitiveCodec = argCodec.PrimitiveCodec;
 const TstArgCursor = argIter.TstArgCursor;
 
+pub const EmptyPositionalsOf = PositionalOf(.{
+    .TupleType = void,
+    .ReminderType = void,
+});
+
 pub const PositionalConfig = struct {
     TupleType: type = void,
     // NOTE: the default allocates
