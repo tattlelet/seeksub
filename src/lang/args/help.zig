@@ -7,6 +7,7 @@ const DefaultPosT = @import("spec.zig").defaultPositionals();
 const btType = std.builtin.Type;
 
 pub const HelpConf = struct {
+    backwardsBranchesQuote: comptime_int = 1000000,
     indent: u4 = 2,
     headerDelimiter: []const u8 = "\n",
     columnSpace: u4 = 4,
@@ -157,9 +158,9 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     }
 
                     b.appendAll(.{
-                        if (conf.simpleTypes) "'" else ".",
+                        if (conf.simpleTypes) "\"" else ".",
                         field.name,
-                        if (conf.simpleTypes) "'" else "",
+                        if (conf.simpleTypes) "\"" else "",
                         if (conf.simpleTypes) ": " else " = ",
                         formatDefaultValue(field.type, @field(defaultValue, field.name)),
                     });
@@ -167,6 +168,24 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     if (i < fields.len - 1) addComma = true;
                 }
                 b.append(" }");
+                break :rv b.s;
+            };
+        }
+
+        pub fn formatDefaultArray(comptime T: type, comptime arr: anytype, comptime defaultValue: T) []const u8 {
+            return comptime rv: {
+                if (arr.child == u8) {
+                    break :rv std.fmt.comptimePrint("\"{s}\"", .{defaultValue});
+                }
+
+                var b = coll.ComptSb.init(if (conf.simpleTypes) "[" else "{");
+                for (defaultValue, 0..) |value, i| {
+                    b.append(formatDefaultValue(arr.child, value));
+                    if (i < defaultValue.len - 1) {
+                        b.append(", ");
+                    }
+                }
+                b.append(if (conf.simpleTypes) "]" else "}");
                 break :rv b.s;
             };
         }
@@ -183,20 +202,10 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         "Unsupported ptr type {s}",
                         .{@typeName(T)},
                     ));
-                    if (ptr.child == u8) {
-                        break :rv std.fmt.comptimePrint("'{s}'", .{defaultValue});
-                    }
 
-                    var b = coll.ComptSb.init(if (conf.simpleTypes) "[" else "{");
-                    for (defaultValue, 0..) |value, i| {
-                        b.append(formatDefaultValue(ptr.child, value));
-                        if (i < defaultValue.len - 1) {
-                            b.append(", ");
-                        }
-                    }
-                    b.append(if (conf.simpleTypes) "]" else "}");
-                    break :rv b.s;
+                    break :rv formatDefaultArray(T, ptr, defaultValue);
                 },
+                .array => |arr| formatDefaultArray(T, arr, defaultValue),
                 .optional => |opt| if (defaultValue == null) "null" else formatDefaultValue(
                     opt.child,
                     defaultValue.?,
@@ -208,9 +217,9 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                         if (conf.simpleTypes) "" else formatType(T),
                         "{ ",
                         if (conf.simpleTypes) "" else ".",
-                        if (conf.simpleTypes) "'" else "",
+                        if (conf.simpleTypes) "\"" else "",
                         @tagName(defaultValue),
-                        if (conf.simpleTypes) "'" else "",
+                        if (conf.simpleTypes) "\"" else "",
                         if (conf.simpleTypes) ": " else " = ",
                         formatStruct(@TypeOf(e), e),
                         " }",
@@ -283,7 +292,6 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                 var b = coll.ComptSb.init("");
                 var Tt = T;
                 rfd: switch (@typeInfo(Tt)) {
-                    // TODO: handle array
                     .pointer => |ptr| {
                         Tt = ptr.child;
                         b.append("[]");
@@ -380,6 +388,7 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
         }
 
         pub fn options() ?[]const u8 {
+            @setEvalBranchQuota(conf.backwardsBranchesQuote);
             return comptime rt: {
                 const fields = std.meta.fields(Spec);
                 if (fields.len == 0) break :rt null;
@@ -520,8 +529,8 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
             };
         }
 
-        pub fn baseHelp() []const u8 {
-            @setEvalBranchQuota(10000000);
+        pub fn help() []const u8 {
+            @setEvalBranchQuota(conf.backwardsBranchesQuote);
             return comptime rt: {
                 var b = coll.ComptSb.init("");
                 const pieces: []const ?[]const u8 = &.{
@@ -542,12 +551,9 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     b.appendAll(.{ breakline.s, piece });
                     addLines += 1;
                 }
+                if (addLines > 0) b.append("\n");
                 break :rt b.s;
             };
-        }
-
-        pub fn help() []const u8 {
-            return comptime baseHelp() ++ "\n";
         }
 
         pub fn helpForErr(ErrOf: type, E: ErrOf, comptime reason: []const u8) []const u8 {
@@ -591,7 +597,6 @@ pub fn HelpData(T: type) type {
     };
 }
 
-// TODO: add test
 pub fn enumValueHint(target: type) []const u8 {
     return comptime rv: {
         var b = coll.ComptSb.init("{ ");
@@ -603,6 +608,14 @@ pub fn enumValueHint(target: type) []const u8 {
         b.append(" }");
         break :rv b.s;
     };
+}
+
+test "enumValueHint" {
+    const Enu = enum {
+        cat,
+        dog,
+    };
+    try std.testing.expectEqualStrings("{ cat, dog }", enumValueHint(Enu));
 }
 
 test "format usage" {
@@ -1009,8 +1022,8 @@ test "options string" {
     try t.expectEqualStrings(
         \\Options:
         \\  --nameA ([]u8)
-        \\  --nameB ([]u8 = 'name')
-        \\  --nameC (?[]u8 = 'name2')
+        \\  --nameB ([]u8 = "name")
+        \\  --nameC (?[]u8 = "name2")
         \\  --nameD (?[]u8 = null)
     , HelpFmt(struct {
         nameA: []const u8 = undefined,
@@ -1030,8 +1043,8 @@ test "options string" {
     try t.expectEqualStrings(
         \\Options:
         \\  --nameA (string)
-        \\  --nameB (string = 'name')
-        \\  --nameC (?string = 'name2')
+        \\  --nameB (string = "name")
+        \\  --nameC (?string = "name2")
         \\  --nameD (?string = null)
     , HelpFmt(struct {
         nameA: []const u8 = undefined,
@@ -1053,19 +1066,21 @@ test "options arrays" {
     const t = std.testing;
     try t.expectEqualStrings(
         \\Options:
-        \\  --names ([][]u8 = {'name1', 'name2'})
+        \\  --names ([][]u8 = {"name1", "name2"})
         \\  --nbers ([]usize = {1, 2, 3})
         \\  --floats ([]f32 = {1.1, 2.2, 3.3})
         \\  --ranges ([][]usize = {{1, 2}, {3, 4}})
-        \\  --optNames (?[][]u8 = {'name1', 'name2'})
+        \\  --optNames (?[][]u8 = {"name1", "name2"})
         \\  --optNbers (?[]usize = {1, 2, 3})
         \\  --optFloats (?[]f32 = {1.1, 2.2, 3.3})
         \\  --optRanges (?[][]usize = {{1, 2}, {3, 4}})
-        \\  --namesOpt ([]?[]u8 = {'name1', null})
+        \\  --namesOpt ([]?[]u8 = {"name1", null})
         \\  --nbersOpt ([]?usize = {1, 2, null})
         \\  --floatsOpt ([]?f32 = {1.1, 2.2, null})
         \\  --rangesOpt ([]?[]usize = {{1, 2}, null})
         \\  --rangesNOpt ([][]?usize = {{1, 2}, {3, null}})
+        \\  --arr ([2]u32 = {1, 2})
+        \\  --arrStr ([5]u8 = "Hello")
     , HelpFmt(struct {
         names: []const []const u8 = &.{ "name1", "name2" },
         nbers: []const usize = &.{ 1, 2, 3 },
@@ -1080,6 +1095,8 @@ test "options arrays" {
         floatsOpt: []const ?f32 = &.{ 1.1, 2.2, null },
         rangesOpt: []const ?[]const usize = &.{ &.{ 1, 2 }, null },
         rangesNOpt: []const []const ?usize = &.{ &.{ 1, 2 }, &.{ 3, null } },
+        arr: [2]u32 = .{ 1, 2 },
+        arrStr: [5]u8 = "Hello".*,
         pub const Help: HelpData(@This()) = .{
             .optionsDescription = &.{
                 .{ .field = .names },
@@ -1095,25 +1112,29 @@ test "options arrays" {
                 .{ .field = .floatsOpt },
                 .{ .field = .rangesOpt },
                 .{ .field = .rangesNOpt },
+                .{ .field = .arr },
+                .{ .field = .arrStr },
             },
         };
     }, .{ .headerDelimiter = "" }).options().?);
 
     try t.expectEqualStrings(
         \\Options:
-        \\  --names ([]string = ['name1', 'name2'])
+        \\  --names ([]string = ["name1", "name2"])
         \\  --nbers ([]int = [1, 2, 3])
         \\  --floats ([]float = [1.1, 2.2, 3.3])
         \\  --ranges ([][]int = [[1, 2], [3, 4]])
-        \\  --optNames (?[]string = ['name1', 'name2'])
+        \\  --optNames (?[]string = ["name1", "name2"])
         \\  --optNbers (?[]int = [1, 2, 3])
         \\  --optFloats (?[]float = [1.1, 2.2, 3.3])
         \\  --optRanges (?[][]int = [[1, 2], [3, 4]])
-        \\  --namesOpt ([]?string = ['name1', null])
+        \\  --namesOpt ([]?string = ["name1", null])
         \\  --nbersOpt ([]?int = [1, 2, null])
         \\  --floatsOpt ([]?float = [1.1, 2.2, null])
         \\  --rangesOpt ([]?[]int = [[1, 2], null])
         \\  --rangesNOpt ([][]?int = [[1, 2], [3, null]])
+        \\  --arr ([2]int = [1, 2])
+        \\  --arrStr (string = "Hello")
     , HelpFmt(struct {
         names: []const []const u8 = &.{ "name1", "name2" },
         nbers: []const usize = &.{ 1, 2, 3 },
@@ -1128,6 +1149,8 @@ test "options arrays" {
         floatsOpt: []const ?f32 = &.{ 1.1, 2.2, null },
         rangesOpt: []const ?[]const usize = &.{ &.{ 1, 2 }, null },
         rangesNOpt: []const []const ?usize = &.{ &.{ 1, 2 }, &.{ 3, null } },
+        arr: [2]u32 = .{ 1, 2 },
+        arrStr: [5]u8 = "Hello".*,
         pub const Help: HelpData(@This()) = .{
             .optionsDescription = &.{
                 .{ .field = .names },
@@ -1143,6 +1166,8 @@ test "options arrays" {
                 .{ .field = .floatsOpt },
                 .{ .field = .rangesOpt },
                 .{ .field = .rangesNOpt },
+                .{ .field = .arr },
+                .{ .field = .arrStr },
             },
         };
     }, .{ .headerDelimiter = "", .simpleTypes = true }).options().?);
@@ -1189,7 +1214,7 @@ test "options union" {
 
     try t.expectEqualStrings(
         \\Options:
-        \\  --unionA (U = U{ .a = A{ .x = -1, .name = 'name', .z = null, .arr = {'asdas', null} } })
+        \\  --unionA (U = U{ .a = A{ .x = -1, .name = "name", .z = null, .arr = {"asdas", null} } })
         \\  --unionB (U = U{ .b = B{ .y = 2 } })
     , HelpFmt(struct {
         unionA: U = .{ .a = .{ .x = -1 } },
@@ -1220,8 +1245,8 @@ test "options union" {
 
     try t.expectEqualStrings(
         \\Options:
-        \\  --unionA (U = { 'a': { 'x': -1, 'name': 'name', 'z': null, 'arr': ['asdas', null] } })
-        \\  --unionB (U = { 'b': { 'y': 2 } })
+        \\  --unionA (U = { "a": { "x": -1, "name": "name", "z": null, "arr": ["asdas", null] } })
+        \\  --unionB (U = { "b": { "y": 2 } })
     , HelpFmt(struct {
         unionA: U = .{ .a = .{ .x = -1 } },
         unionB: U = .{ .b = .{ .y = 2 } },
@@ -1255,8 +1280,8 @@ test "options struct" {
 
     try t.expectEqualStrings(
         \\Options:
-        \\  --struct1 (A = A{ .x = 1, .y = 'name', .z = null, .w = {'asdas', null}, .a = U{ .aa = Opt1{  } } })
-        \\  --struct2 (A = A{ .x = -1, .y = 'name', .z = null, .w = {'asdas', null}, .a = U{ .bb = Opt2{  } } })
+        \\  --struct1 (A = A{ .x = 1, .y = "name", .z = null, .w = {"asdas", null}, .a = U{ .aa = Opt1{  } } })
+        \\  --struct2 (A = A{ .x = -1, .y = "name", .z = null, .w = {"asdas", null}, .a = U{ .bb = Opt2{  } } })
     , HelpFmt(struct {
         struct1: A = .{ .x = 1, .a = .{ .aa = .{} } },
         struct2: A = .{ .x = -1, .a = .{ .bb = .{} } },
@@ -1286,8 +1311,8 @@ test "options struct" {
 
     try t.expectEqualStrings(
         \\Options:
-        \\  --struct1 (A = { 'x': 1, 'y': 'name', 'z': null, 'w': ['asdas', null], 'a': { 'aa': {  } } })
-        \\  --struct2 (A = { 'x': -1, 'y': 'name', 'z': null, 'w': ['asdas', null], 'a': { 'bb': {  } } })
+        \\  --struct1 (A = { "x": 1, "y": "name", "z": null, "w": ["asdas", null], "a": { "aa": {  } } })
+        \\  --struct2 (A = { "x": -1, "y": "name", "z": null, "w": ["asdas", null], "a": { "bb": {  } } })
     , HelpFmt(struct {
         struct1: A = .{ .x = 1, .a = .{ .aa = .{} } },
         struct2: A = .{ .x = -1, .a = .{ .bb = .{} } },
@@ -1458,34 +1483,37 @@ test "help" {
     try t.expectEqualStrings("", HelpFmt(
         struct {},
         .{ .headerDelimiter = "" },
-    ).baseHelp());
+    ).help());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
+        \\
     , HelpFmt(struct {
         pub const Help: HelpData(@This()) = .{
             .usage = &.{"test [options] [commands] ..."},
         };
-    }, .{ .headerDelimiter = "" }).baseHelp());
+    }, .{ .headerDelimiter = "" }).help());
 
     try t.expectEqualStrings(
         \\  Some description about test
+        \\
     , HelpFmt(struct {
         pub const Help: HelpData(@This()) = .{
             .description = "Some description about test",
         };
-    }, .{ .headerDelimiter = "" }).baseHelp());
+    }, .{ .headerDelimiter = "" }).help());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
         \\
         \\  Some description about test
+        \\
     , HelpFmt(struct {
         pub const Help: HelpData(@This()) = .{
             .usage = &.{"test [options] [commands] ..."},
             .description = "Some description about test",
         };
-    }, .{ .headerDelimiter = "" }).baseHelp());
+    }, .{ .headerDelimiter = "" }).help());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1496,6 +1524,7 @@ test "help" {
         \\
         \\  test --verbose match 1 1
         \\  test --verbose match 2 1
+        \\
     , HelpFmt(struct {
         pub const Help: HelpData(@This()) = .{
             .usage = &.{"test [options] [commands] ..."},
@@ -1505,11 +1534,12 @@ test "help" {
                 "test --verbose match 2 1",
             },
         };
-    }, .{}).baseHelp());
+    }, .{}).help());
 
     try t.expectEqualStrings(
         \\Options:
         \\  --i1 (i32 = 0)      i1 desc
+        \\
     , HelpFmt(struct {
         i1: i32 = 0,
         pub const Help: HelpData(@This()) = .{
@@ -1517,7 +1547,7 @@ test "help" {
                 .{ .field = .i1, .description = "i1 desc" },
             },
         };
-    }, .{ .headerDelimiter = "" }).baseHelp());
+    }, .{ .headerDelimiter = "" }).help());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1532,6 +1562,7 @@ test "help" {
         \\Options:
         \\
         \\  -i, --i1 (i32 = 0)      [Required] i1 desc
+        \\
     , HelpFmt(struct {
         i1: i32 = 0,
         pub const Short = .{ .i = .i1 };
@@ -1549,12 +1580,13 @@ test "help" {
                 .{ .field = .i1, .description = "i1 desc" },
             },
         };
-    }, .{}).baseHelp());
+    }, .{}).help());
 
     try t.expectEqualStrings(
         \\Commands:
         \\  match       matches args
         \\  trace       trace-matches args
+        \\
     , HelpFmt(struct {
         pub const Match = struct {
             pub const Help: HelpData(@This()) = .{
@@ -1570,7 +1602,7 @@ test "help" {
             match: Match,
             trace: Trace,
         };
-    }, .{ .headerDelimiter = "" }).baseHelp());
+    }, .{ .headerDelimiter = "" }).help());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1586,6 +1618,7 @@ test "help" {
         \\
         \\  match       matches args
         \\  trace       trace-matches args
+        \\
     , HelpFmt(struct {
         pub const Match = struct {
             pub const Help: HelpData(@This()) = .{
@@ -1613,7 +1646,7 @@ test "help" {
                 "test --verbose match 2 1",
             },
         };
-    }, .{}).baseHelp());
+    }, .{}).help());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1633,6 +1666,7 @@ test "help" {
         \\Options:
         \\
         \\  -i, --i1 (i32 = 0)      [Required] i1 desc
+        \\
     , HelpFmt(struct {
         i1: i32 = 0,
         pub const Match = struct {
@@ -1665,15 +1699,16 @@ test "help" {
                 .{ .field = .i1, .description = "i1 desc" },
             },
         };
-    }, .{}).baseHelp());
+    }, .{}).help());
 
     try t.expectEqualStrings(
         \\This is a footer, it gets added as typed
+        \\
     , HelpFmt(struct {
         pub const Help: HelpData(@This()) = .{
             .footer = "This is a footer, it gets added as typed",
         };
-    }, .{ .headerDelimiter = "" }).baseHelp());
+    }, .{ .headerDelimiter = "" }).help());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1695,6 +1730,7 @@ test "help" {
         \\  -i, --i1 (int = 0)      [Required] i1 desc
         \\
         \\This is a footer, it gets added as typed
+        \\
     , HelpFmt(struct {
         i1: i32 = 0,
         pub const Match = struct {
@@ -1728,7 +1764,7 @@ test "help" {
             },
             .footer = "This is a footer, it gets added as typed",
         };
-    }, .{ .simpleTypes = true }).baseHelp());
+    }, .{ .simpleTypes = true }).help());
 
     try t.expectEqualStrings(
         \\Usage: test [options] [commands] ...
@@ -1756,6 +1792,7 @@ test "help" {
         \\  -i, --i1 (int = 0)      [Required] i1 desc
         \\
         \\This is a footer, it gets added as typed
+        \\
     , HelpFmt(struct {
         i1: i32 = 0,
         pub const Positionals = PositionalOf(.{
@@ -1799,7 +1836,7 @@ test "help" {
             },
             .footer = "This is a footer, it gets added as typed",
         };
-    }, .{ .simpleTypes = true }).baseHelp());
+    }, .{ .simpleTypes = true }).help());
 }
 
 test "helpForErr" {
