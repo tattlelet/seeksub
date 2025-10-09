@@ -9,7 +9,7 @@ const Cursor = coll.Cursor;
 const ComptSb = coll.ComptSb;
 const HelpData = help.HelpData;
 const GroupMatchConfig = validate.GroupMatchConfig;
-const SpecResponse = spec.SpecResponse;
+const SpecResponseWithConfig = spec.SpecResponseWithConfig;
 const PositionalOf = args.positionals.PositionalOf;
 
 const Args = struct {
@@ -48,7 +48,6 @@ const Args = struct {
             .{ .field = .verbose, .description = "Verbose mode." },
         },
     };
-    pub const HelpFmt = help.HelpFmt(@This(), .{ .simpleTypes = true, .optionsBreakline = true });
 
     pub const Match = struct {
         @"match-n": ?usize = null,
@@ -67,7 +66,6 @@ const Args = struct {
                 .{ .field = .@"match-n", .description = "N-match stop for each file if set." },
             },
         };
-        pub const HelpFmt = help.HelpFmt(@This(), .{ .simpleTypes = true, .optionsBreakline = true });
     };
 
     pub const Diff = struct {
@@ -87,7 +85,6 @@ const Args = struct {
                 .{ .field = .replace, .description = "Replace match on all files using this PCRE2 regex." },
             },
         };
-        pub const HelpFmt = help.HelpFmt(@This(), .{ .simpleTypes = true, .optionsBreakline = true });
 
         pub const GroupMatch: GroupMatchConfig(@This()) = .{
             .required = &.{.replace},
@@ -114,7 +111,6 @@ const Args = struct {
                 .{ .field = .trace, .description = "Trace mutations" },
             },
         };
-        pub const HelpFmt = help.HelpFmt(@This(), .{ .simpleTypes = true, .optionsBreakline = true });
 
         pub const GroupMatch: GroupMatchConfig(@This()) = .{
             .required = &.{.replace},
@@ -122,12 +118,14 @@ const Args = struct {
     };
 };
 
+pub const HelpConf: help.HelpConf = .{ .simpleTypes = true, .optionsBreakline = true };
+
 pub fn main() !void {
     var sfba = std.heap.stackFallback(4098, std.heap.page_allocator);
     const allocator = sfba.get();
 
     var timer = try std.time.Timer.start();
-    var result = SpecResponse(Args).init(allocator);
+    var result = SpecResponseWithConfig(Args, HelpConf).init(allocator);
     defer result.deinit();
     if (result.parseArgs()) |err| {
         if (err.message) |message| {

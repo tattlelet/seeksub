@@ -36,7 +36,6 @@ pub fn Cursor(T: type) type {
     };
 }
 
-// NOTE: this is for debugging purposes, it adds an extra layer of indirection
 pub fn AsCursor(comptime T: type) type {
     return struct {
         pub fn next(erased: *anyopaque) ?[]const u8 {

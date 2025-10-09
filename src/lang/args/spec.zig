@@ -4,6 +4,9 @@ const coll = @import("../collections.zig");
 const argIter = @import("iterator.zig");
 const argCodec = @import("codec.zig");
 const validate = @import("validate.zig");
+const HelpFmt = @import("./help.zig").HelpFmt;
+const HelpData = @import("./help.zig").HelpData;
+const _HelpConf = @import("./help.zig").HelpConf;
 const PositionalOf = @import("positionals.zig").PositionalOf;
 const GroupTracker = validate.GroupTracker;
 const GroupMatchConfig = validate.GroupMatchConfig;
@@ -13,7 +16,7 @@ const TstArgCursor = argIter.TstArgCursor;
 const PrimitiveCodec = argCodec.PrimitiveCodec;
 const ArgCodec = argCodec.ArgCodec;
 
-// This ties spec positionals default and helper's
+// NOTE: This ties spec positionals default and helper's
 pub fn defaultPositionals() type {
     return PositionalOf(.{});
 }
@@ -26,13 +29,16 @@ pub fn Result(Ok: type, Err: type) type {
 }
 
 pub fn SpecResponse(comptime Spec: type) type {
+    return SpecResponseWithConfig(Spec, {});
+}
+
+pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) type {
     // TODO: validate spec
     return struct {
         arena: std.heap.ArenaAllocator,
         codec: SpecCodec,
         options: Options,
         program: ?[]const u8,
-        // Grab default if available
         positionals: PosOf.Positionals,
         verb: if (VerbT != void) ?VerbT else void,
         tracker: if (SpecTracker != void) SpecTracker else void,
@@ -41,7 +47,7 @@ pub fn SpecResponse(comptime Spec: type) type {
             const VerbUnion = @typeInfo(Spec.Verb).@"union";
             comptime var newUnionFields: [VerbUnion.fields.len]std.builtin.Type.UnionField = undefined;
             for (VerbUnion.fields, 0..) |f, i| {
-                const newSpecR = SpecResponse(f.type);
+                const newSpecR = SpecResponseWithConfig(f.type, HelpConf);
                 newUnionFields[i] = .{
                     .name = f.name,
                     .type = newSpecR,
@@ -135,11 +141,8 @@ pub fn SpecResponse(comptime Spec: type) type {
         }
 
         // TODO: test all error returns
-        // TODO: update tests
-        pub fn parse(self: *@This(), cursor: *CursorT) Error!void {
-            if (self.parseInner(cursor, true)) |err| {
-                return @as(Error!void, err.err);
-            }
+        pub fn parse(self: *@This(), cursor: *CursorT) ?ParseError {
+            return self.parseInner(cursor, true);
         }
 
         fn parseInner(self: *@This(), cursor: *CursorT, comptime parseProgram: bool) ?ParseError {
@@ -204,7 +207,7 @@ pub fn SpecResponse(comptime Spec: type) type {
 
             inline for (@typeInfo(Spec.Verb).@"union".fields) |f| {
                 if (std.mem.eql(u8, f.name, arg)) {
-                    var verbR = SpecResponse(f.type).init(self.arena.child_allocator);
+                    var verbR = SpecResponseWithConfig(f.type, HelpConf).init(self.arena.child_allocator);
                     if (verbR.parseInner(cursor, false)) |e| {
                         return .{
                             .Err = .{
@@ -312,18 +315,19 @@ pub fn SpecResponse(comptime Spec: type) type {
             self.arena.deinit();
         }
 
-        // TODO: trickle down config
         pub fn help(e: Error) ?[]const u8 {
-            if (!@hasDecl(Spec, "HelpFmt")) return null;
+            if (comptime @TypeOf(HelpConf) == void) return null;
 
-            return Spec.HelpFmt.helpForErr(Error, e, "Failed with reason: ");
+            return HelpFmt(Spec, HelpConf).helpForErr(Error, e, "Failed with reason: ");
         }
     };
 }
 
 pub fn tstParseSpec(allocator: Allocator, cursor: *coll.Cursor([]const u8), Spec: type) !SpecResponse(Spec) {
     var response = SpecResponse(Spec).init(allocator);
-    try response.parse(cursor);
+    if (response.parse(cursor)) |err| {
+        return @as(@TypeOf(response).Error!@TypeOf(response), err.err);
+    }
     return response;
 }
 
@@ -755,7 +759,7 @@ test "parse with custom codec" {
         \\--i 31
         \\--i2 31
         \\--arf "[1,2,3,4,5]"
-        \\--b"
+        \\--b
     ,
         Spec,
     );
@@ -937,4 +941,76 @@ test "parsed spec cleanup with verb" {
 
     const r1 = try tstParseSpec(allocator, &cursor, Spec);
     defer r1.deinit();
+}
+
+test "help and inner help" {
+    const Spec = struct {
+        pub const Copy = struct {
+            path: []const u8 = undefined,
+            pub const Help: HelpData(@This()) = .{
+                .description = "copy test",
+                .shortDescription = "copy test",
+            };
+            pub const GroupMatch: GroupMatchConfig(@This()) = .{
+                .required = &.{.path},
+            };
+        };
+        pub const Verb = union(enum) {
+            copy: Copy,
+        };
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .mandatoryVerb = true,
+        };
+        pub const Help: HelpData(@This()) = .{
+            .description = "test",
+        };
+    };
+
+    var dcur: coll.DebugCursor = .{
+        .data = &.{
+            "program",
+        },
+    };
+    var c = dcur.asCursor();
+
+    const Res = SpecResponseWithConfig(Spec, _HelpConf{});
+    var r = Res.init(std.testing.allocator);
+    if (r.parse(&c)) |err| {
+        try std.testing.expectEqualStrings(
+            \\Failed with reason: MissingVerb
+            \\
+            \\  test
+            \\
+            \\Commands: [Required]
+            \\
+            \\  copy        copy test
+            \\
+        , err.message.?);
+    } else {
+        unreachable;
+    }
+
+    dcur = .{
+        .data = &.{
+            "program",
+            "copy",
+        },
+    };
+    c = dcur.asCursor();
+
+    r = Res.init(std.testing.allocator);
+    if (r.parse(&c)) |err| {
+        try std.testing.expectEqualStrings(
+            \\Failed with reason: MissingRequiredField
+            \\
+            \\  copy test
+            \\
+            \\Options:
+            \\
+            \\  --path
+            \\
+        , err.message.?);
+    } else {
+        unreachable;
+    }
 }
