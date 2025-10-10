@@ -75,22 +75,29 @@ pub fn GroupMatchConfig(Spec: type) type {
         mutuallyExclusive: []const []const SpecEnumFields = &.{},
         required: []const SpecEnumFields = &.{},
         mandatoryVerb: bool = false,
+        ensureCursorDone: bool = true,
     };
 }
 
 pub fn GroupTracker(Spec: type) type {
-    const SpecEnumFields = std.meta.FieldEnum(Spec);
     std.debug.assert(@TypeOf(Spec.GroupMatch) == GroupMatchConfig(Spec));
+    return GroupTrackerWithConfig(Spec, Spec.GroupMatch);
+}
+
+pub fn GroupTrackerWithConfig(Spec: type, comptime config: GroupMatchConfig(Spec)) type {
+    const SpecEnumFields = std.meta.FieldEnum(Spec);
 
     return struct {
         fbset: FieldBitSet(Spec) = .{},
         verb: bool = false,
+        cursorDoneFlag: bool = false,
 
         pub const Error = error{
             MissingRequiredField,
             MutuallyInclusiveConstraintNotMet,
             MutuallyExclusiveConstraintNotMet,
             MissingVerb,
+            CursorNotDone,
         };
 
         pub fn parsed(self: *@This(), comptime tag: SpecEnumFields) void {
@@ -101,25 +108,35 @@ pub fn GroupTracker(Spec: type) type {
             self.verb = true;
         }
 
+        pub fn cursorDone(self: *@This()) void {
+            self.cursorDoneFlag = true;
+        }
+
         pub fn checkRequired(self: *const @This()) Error!void {
-            if (!self.fbset.allOf(Spec.GroupMatch.required)) return Error.MissingRequiredField;
+            if (!self.fbset.allOf(config.required)) return Error.MissingRequiredField;
         }
 
         pub fn checkMutuallyInclusive(self: *const @This()) Error!void {
-            inline for (Spec.GroupMatch.mutuallyInclusive) |group| {
+            inline for (config.mutuallyInclusive) |group| {
                 if (!self.fbset.allOf(group)) return Error.MutuallyInclusiveConstraintNotMet;
             }
         }
 
         pub fn checkMutuallyExclusive(self: *const @This()) Error!void {
-            inline for (Spec.GroupMatch.mutuallyExclusive) |group| {
+            inline for (config.mutuallyExclusive) |group| {
                 if (!self.fbset.oneOf(group)) return Error.MutuallyExclusiveConstraintNotMet;
             }
         }
 
         pub fn checkVerb(self: *const @This()) Error!void {
-            if (comptime Spec.GroupMatch.mandatoryVerb) {
+            if (comptime config.mandatoryVerb) {
                 if (!self.verb) return Error.MissingVerb;
+            }
+        }
+
+        pub fn checkCursorDone(self: *const @This()) Error!void {
+            if (comptime config.ensureCursorDone) {
+                if (!self.cursorDoneFlag) return Error.CursorNotDone;
             }
         }
 
@@ -128,6 +145,7 @@ pub fn GroupTracker(Spec: type) type {
             try self.checkMutuallyInclusive();
             try self.checkRequired();
             try self.checkVerb();
+            try self.checkCursorDone();
         }
     };
 }
@@ -186,5 +204,10 @@ test "check required fields" {
     try t.expectError(@TypeOf(tracker).Error.MissingVerb, tracker.checkVerb());
     tracker.parsedVerb();
     try t.expectEqual({}, try tracker.checkVerb());
+
+    try t.expectError(@TypeOf(tracker).Error.CursorNotDone, tracker.validate());
+    try t.expectError(@TypeOf(tracker).Error.CursorNotDone, tracker.checkCursorDone());
+    tracker.cursorDone();
     try t.expectEqual({}, try tracker.validate());
+    try t.expectEqual({}, try tracker.checkCursorDone());
 }

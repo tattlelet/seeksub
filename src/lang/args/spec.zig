@@ -8,7 +8,9 @@ const HelpFmt = @import("./help.zig").HelpFmt;
 const HelpData = @import("./help.zig").HelpData;
 const _HelpConf = @import("./help.zig").HelpConf;
 const PositionalOf = @import("positionals.zig").PositionalOf;
+const EmptyPositionalsOf = @import("positionals.zig").EmptyPositionalsOf;
 const GroupTracker = validate.GroupTracker;
+const GroupTrackerWithConfig = validate.GroupTrackerWithConfig;
 const GroupMatchConfig = validate.GroupMatchConfig;
 const Allocator = std.mem.Allocator;
 const FieldEnum = std.meta.FieldEnum;
@@ -41,7 +43,7 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
         program: ?[]const u8,
         positionals: PosOf.Positionals,
         verb: if (VerbT != void) ?VerbT else void,
-        tracker: if (SpecTracker != void) SpecTracker else void,
+        tracker: SpecTracker,
 
         fn SpecUnionVerbs() type {
             const VerbUnion = @typeInfo(Spec.Verb).@"union";
@@ -78,7 +80,12 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
         pub const VerbT = if (@hasDecl(Spec, "Verb")) SpecUnionVerbs() else void;
         const PosOf = if (@hasDecl(Spec, "Positionals")) Spec.Positionals else defaultPositionals();
         const SpecCodec = if (@hasDecl(Spec, "Codec")) Spec.Codec else ArgCodec(Spec);
-        const SpecTracker = if (@hasDecl(Spec, "GroupMatch")) GroupTracker(Spec) else void;
+        const SpecTracker = T: {
+            if (@hasDecl(Spec, "GroupMatch")) break :T GroupTracker(Spec);
+            break :T GroupTrackerWithConfig(Spec, .{
+                .ensureCursorDone = true,
+            });
+        };
         const SpecEnumFields = std.meta.FieldEnum(Spec);
 
         pub const Error = E: {
@@ -157,7 +164,6 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
             while (cursor.next()) |arg|
                 if (arg.len == 1 and arg[0] == '-') {
                     cursor.stackItem(arg);
-                    // TODO: test break case
                     if (positionalOf.hasNext()) {
                         positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
                     } else break;
@@ -168,11 +174,11 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
                         .Ok => |hasVerb| {
                             if (!hasVerb) {
                                 cursor.stackItem(arg);
-                                // TODO: test break case
                                 if (positionalOf.hasNext()) {
                                     positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
                                 } else break;
                             }
+                            // NOTE: already parsed otherwise
                         },
                         .Err => |err| return err,
                     }
@@ -184,16 +190,16 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
                     self.namedToken(offset, arg, cursor) catch |e| return .ErrOf(e);
                 };
 
-            // TODO: test buffer spill-over to next level
             while (cursor.peek() != null and positionalOf.hasNext()) {
                 positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
             }
 
             self.positionals = positionalOf.collect(allocator) catch |e| return .ErrOf(e);
 
-            if (comptime SpecTracker != void) self.tracker.validate() catch |e| return .ErrOf(e);
-
-            // TODO: ensure add ensure cursor consumed before leaving (configurable)
+            if (comptime SpecTracker != void) {
+                if (cursor.peek() == null) self.tracker.cursorDone();
+                self.tracker.validate() catch |e| return .ErrOf(e);
+            }
 
             return null;
         }
@@ -600,14 +606,69 @@ test "parse custom positionals" {
     const Spec = struct {
         pub const Positionals = PositionalOf(.{
             .TupleType = struct { i32, [2]u8 },
+            .ReminderType = void,
         });
     };
 
     const r1 = try tstParse(allocator, "program 2 ab", Spec);
     try t.expectEqual(2, r1.positionals.tuple.@"0");
     try t.expectEqualStrings("ab", &r1.positionals.tuple.@"1");
+    try t.expectEqual({}, r1.positionals.reminder);
 
     try t.expectError(Spec.Positionals.CollectError.MissingPositionalField, tstParse(allocator, "program 2", Spec));
+    try t.expectError(@TypeOf(r1).Error.CursorNotDone, tstParse(allocator, "program 2 ab 3", Spec));
+
+    const Spec2 = struct {
+        pub const Positionals = PositionalOf(.{
+            .TupleType = struct { i32 },
+            .ReminderType = void,
+        });
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .ensureCursorDone = false,
+        };
+    };
+    const r2 = try tstParse(allocator, "program 2 ab 3", Spec2);
+    try t.expectEqual(2, r2.positionals.tuple.@"0");
+    try t.expectEqual({}, r2.positionals.reminder);
+}
+
+test "parse custom positionals with verb" {
+    const t = std.testing;
+    const base = &t.allocator;
+    var arena = std.heap.ArenaAllocator.init(base.*);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Spec = struct {
+        pub const Positionals = PositionalOf(.{
+            .TupleType = struct { [1]u8 },
+            .ReminderType = void,
+        });
+        pub const Copy = struct {
+            pub const Positionals = EmptyPositionalsOf;
+            pub const GroupMatch: GroupMatchConfig(@This()) = .{
+                .ensureCursorDone = false,
+            };
+        };
+        pub const Verb = union(enum) {
+            copy: Copy,
+        };
+        pub const GroupMatch: GroupMatchConfig(@This()) = .{
+            .ensureCursorDone = false,
+        };
+    };
+
+    const r1 = try tstParse(allocator, "program copy 2", Spec);
+    try t.expectEqualStrings("2", &r1.positionals.tuple.@"0");
+    try t.expectEqualStrings(@tagName(Spec.Verb.copy), @tagName(r1.verb.?));
+
+    const r2 = try tstParse(allocator, "program 2 5", Spec);
+    try t.expectEqualStrings("2", &r2.positionals.tuple.@"0");
+    try t.expectEqual(null, r2.verb);
+
+    const r3 = try tstParse(allocator, "program - 3", Spec);
+    try t.expectEqualStrings("-", &r3.positionals.tuple.@"0");
+    try t.expectEqual(null, r3.verb);
 }
 
 test "parse verb" {
