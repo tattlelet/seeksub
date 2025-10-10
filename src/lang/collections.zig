@@ -67,6 +67,33 @@ pub const DebugCursor = struct {
     }
 };
 
+pub const DiagnosticsCursor = struct {
+    lastOpt: ?[]const u8 = null,
+    lastToken: ?[]const u8 = null,
+    cursor: *Cursor([]const u8),
+
+    pub fn next(cursor: *anyopaque) ?[]const u8 {
+        var self: *@This() = @ptrCast(@alignCast(cursor));
+        self.lastToken = self.cursor.next();
+        return self.lastToken;
+    }
+
+    pub fn registerOpt(cursor: *@This(), opt: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(cursor));
+        self.lastOpt = opt;
+    }
+
+    pub fn asCursor(self: *@This()) Cursor([]const u8) {
+        return .{
+            .curr = null,
+            .ptr = @ptrCast(self),
+            .vtable = &.{
+                .next = &@This().next,
+            },
+        };
+    }
+};
+
 pub fn UnitCursor(T: type) type {
     return struct {
         pub fn asCursor(item: ?T) Cursor(T) {

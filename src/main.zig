@@ -124,12 +124,20 @@ pub fn main() !void {
     var sfba = std.heap.stackFallback(4098, std.heap.page_allocator);
     const allocator = sfba.get();
 
+    var buff: [1048]u8 = undefined;
+    var stderrW = rv: {
+        var writer = std.fs.File.stderr().writer(&buff);
+        break :rv &writer.interface;
+    };
+
     var timer = try std.time.Timer.start();
-    var result = SpecResponseWithConfig(Args, HelpConf).init(allocator);
+    var result = SpecResponseWithConfig(Args, HelpConf, true).init(allocator);
     defer result.deinit();
     if (result.parseArgs()) |err| {
         if (err.message) |message| {
-            try std.fs.File.stderr().writeAll(message);
+            try stderrW.print("Last opt <{?s}>, Last token <{?s}>. ", .{ err.lastOpt, err.lastToken });
+            try stderrW.writeAll(message);
+            try stderrW.flush();
         }
     }
 

@@ -31,10 +31,10 @@ pub fn Result(Ok: type, Err: type) type {
 }
 
 pub fn SpecResponse(comptime Spec: type) type {
-    return SpecResponseWithConfig(Spec, {});
+    return SpecResponseWithConfig(Spec, {}, false);
 }
 
-pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) type {
+pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype, comptime withDiag: bool) type {
     // TODO: validate spec
     return struct {
         arena: std.heap.ArenaAllocator,
@@ -49,7 +49,7 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
             const VerbUnion = @typeInfo(Spec.Verb).@"union";
             comptime var newUnionFields: [VerbUnion.fields.len]std.builtin.Type.UnionField = undefined;
             for (VerbUnion.fields, 0..) |f, i| {
-                const newSpecR = SpecResponseWithConfig(f.type, HelpConf);
+                const newSpecR = SpecResponseWithConfig(f.type, HelpConf, withDiag);
                 newUnionFields[i] = .{
                     .name = f.name,
                     .type = newSpecR,
@@ -108,16 +108,26 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
 
         pub const ParseError = struct {
             err: Error,
-            message: ?[]const u8,
+            message: ?[]const u8 = null,
+            // TODO: bitrot this?
+            // TODO: test diag
+            lastToken: ?[]const u8 = null,
+            lastOpt: ?[]const u8 = null,
 
-            pub fn ErrOf(err: Error) @This() {
-                return .{
+            pub fn ErrOf(err: Error, cursor: *CursorT) @This() {
+                var self: @This() = .{
                     .err = err,
                     .message = help(err),
                 };
-            }
 
-            // TODO: add diagnostics
+                if (comptime withDiag) {
+                    const diag: *coll.DiagnosticsCursor = @ptrCast(@alignCast(cursor.ptr));
+                    self.lastOpt = diag.lastOpt;
+                    self.lastToken = diag.lastToken;
+                }
+
+                return self;
+            }
         };
 
         pub fn init(baseAllc: Allocator) @This() {
@@ -144,12 +154,23 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
                 };
                 break :rv &c;
             };
-            return self.parseInner(cursor, true);
+            return self.parseWithDiag(cursor, true);
         }
 
         // TODO: test all error returns
         pub fn parse(self: *@This(), cursor: *CursorT) ?ParseError {
-            return self.parseInner(cursor, true);
+            return self.parseWithDiag(cursor, true);
+        }
+
+        pub fn parseWithDiag(self: *@This(), cursor: *CursorT, comptime parseProgram: bool) ?ParseError {
+            if (comptime withDiag) {
+                var diag: coll.DiagnosticsCursor = .{
+                    .cursor = cursor,
+                };
+                var c = diag.asCursor();
+                return self.parseInner(&c, parseProgram);
+            }
+            return self.parseInner(cursor, parseProgram);
         }
 
         fn parseInner(self: *@This(), cursor: *CursorT, comptime parseProgram: bool) ?ParseError {
@@ -161,11 +182,15 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
             const allocator = &self.arena.allocator();
             var positionalOf: PosOf = .{};
 
-            while (cursor.next()) |arg|
+            while (cursor.next()) |arg| {
+                if (comptime withDiag) {
+                    const diag: *coll.DiagnosticsCursor = @ptrCast(@alignCast(cursor.ptr));
+                    diag.lastOpt = null;
+                }
                 if (arg.len == 1 and arg[0] == '-') {
                     cursor.stackItem(arg);
                     if (positionalOf.hasNext()) {
-                        positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+                        positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e, cursor);
                     } else break;
                 } else if (arg.len == 2 and std.mem.eql(u8, "--", arg)) {
                     break;
@@ -175,7 +200,7 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
                             if (!hasVerb) {
                                 cursor.stackItem(arg);
                                 if (positionalOf.hasNext()) {
-                                    positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+                                    positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e, cursor);
                                 } else break;
                             }
                             // NOTE: already parsed otherwise
@@ -187,18 +212,19 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
                 } else {
                     var offset: usize = 1;
                     if (arg[1] == '-') offset += 1;
-                    self.namedToken(offset, arg, cursor) catch |e| return .ErrOf(e);
-                };
-
-            while (cursor.peek() != null and positionalOf.hasNext()) {
-                positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e);
+                    self.namedToken(offset, arg, cursor) catch |e| return .ErrOf(e, cursor);
+                }
             }
 
-            self.positionals = positionalOf.collect(allocator) catch |e| return .ErrOf(e);
+            while (cursor.peek() != null and positionalOf.hasNext()) {
+                positionalOf.parseNextType(allocator, cursor) catch |e| return .ErrOf(e, cursor);
+            }
+
+            self.positionals = positionalOf.collect(allocator) catch |e| return .ErrOf(e, cursor);
 
             if (comptime SpecTracker != void) {
                 if (cursor.peek() == null) self.tracker.cursorDone();
-                self.tracker.validate() catch |e| return .ErrOf(e);
+                self.tracker.validate() catch |e| return .ErrOf(e, cursor);
             }
 
             return null;
@@ -213,12 +239,18 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
 
             inline for (@typeInfo(Spec.Verb).@"union".fields) |f| {
                 if (std.mem.eql(u8, f.name, arg)) {
-                    var verbR = SpecResponseWithConfig(f.type, HelpConf).init(self.arena.child_allocator);
+                    var verbR = SpecResponseWithConfig(
+                        f.type,
+                        HelpConf,
+                        withDiag,
+                    ).init(self.arena.child_allocator);
                     if (verbR.parseInner(cursor, false)) |e| {
                         return .{
                             .Err = .{
                                 .err = e.err,
                                 .message = e.message,
+                                .lastOpt = e.lastOpt,
+                                .lastToken = e.lastToken,
                             },
                         };
                     } else {
@@ -240,10 +272,20 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
                 splitValue = slice[i + 1 ..];
                 cursor.stackItem(splitValue.?);
                 slice = slice[0..i];
+                if (comptime withDiag) {
+                    var c: *coll.DiagnosticsCursor = @ptrCast(@alignCast(cursor.ptr));
+                    c.lastToken = splitValue.?;
+                }
             }
 
             try switch (offset) {
-                2 => self.namedArg(slice, cursor),
+                2 => rv: {
+                    if (comptime withDiag) {
+                        var c: *coll.DiagnosticsCursor = @ptrCast(@alignCast(cursor.ptr));
+                        c.lastOpt = slice;
+                    }
+                    break :rv self.namedArg(slice, cursor);
+                },
                 1 => self.shortArg(slice, cursor),
                 else => Error.InvalidArgumentToken,
             };
@@ -268,8 +310,13 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype) t
             var noneCursor = coll.UnitCursor([]const u8).asNoneCursor();
             while (end <= arg.len) {
                 ret: inline for (ShortFields) |s| {
-                    if (std.mem.eql(u8, s.name, arg[start..end])) {
+                    const short = arg[start..end];
+                    if (std.mem.eql(u8, s.name, short)) {
                         const tag = @tagName(s.defaultValue() orelse return Error.MissingShorthandLink);
+                        if (comptime withDiag) {
+                            var c: *coll.DiagnosticsCursor = @ptrCast(@alignCast(cursor.ptr));
+                            c.lastOpt = short;
+                        }
                         try self.namedArg(
                             tag,
                             if (end == arg.len) cursor else &noneCursor,
@@ -1034,7 +1081,7 @@ test "help and inner help" {
     };
     var c = dcur.asCursor();
 
-    const Res = SpecResponseWithConfig(Spec, _HelpConf{});
+    const Res = SpecResponseWithConfig(Spec, _HelpConf{}, true);
     var r = Res.init(std.testing.allocator);
     if (r.parse(&c)) |err| {
         try std.testing.expectEqualStrings(
