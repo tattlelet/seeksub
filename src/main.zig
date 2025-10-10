@@ -11,6 +11,10 @@ const HelpData = help.HelpData;
 const GroupMatchConfig = validate.GroupMatchConfig;
 const SpecResponseWithConfig = spec.SpecResponseWithConfig;
 const PositionalOf = args.positionals.PositionalOf;
+const c = @cImport({
+    @cDefine("PCRE2_CODE_UNIT_WIDTH", "8");
+    @cInclude("pcre2.h");
+});
 
 const Args = struct {
     match: []const u8 = undefined,
@@ -119,6 +123,7 @@ const Args = struct {
 };
 
 pub const HelpConf: help.HelpConf = .{ .simpleTypes = true, .optionsBreakline = true };
+pub const ArgsRes = SpecResponseWithConfig(Args, HelpConf, true);
 
 pub fn main() !void {
     var sfba = std.heap.stackFallback(4098, std.heap.page_allocator);
@@ -130,8 +135,7 @@ pub fn main() !void {
         break :rv &writer.interface;
     };
 
-    var timer = try std.time.Timer.start();
-    var result = SpecResponseWithConfig(Args, HelpConf, true).init(allocator);
+    var result: ArgsRes = .init(allocator);
     defer result.deinit();
     if (result.parseArgs()) |err| {
         if (err.message) |message| {
@@ -141,5 +145,17 @@ pub fn main() !void {
         }
     }
 
-    std.log.err("parse: {d}ns", .{timer.read()});
+    try run(&result);
+}
+
+pub fn run(argsRes: *const ArgsRes) !void {
+    var err: c_int = undefined;
+    var errOff: usize = undefined;
+    const re = c.pcre2_compile_8(argsRes.options.match.ptr, argsRes.options.match.len, c.PCRE2_UTF | c.PCRE2_UCP, &err, &errOff, null);
+    if (re == null) {
+        var buff: [256]u8 = undefined;
+        const end = c.pcre2_get_error_message_8(err, &buff, buff.len);
+        std.debug.print("Compile failed {d}: {s}\n", .{ errOff, buff[0..@intCast(end)] });
+        return error{BadRegex}.BadRegex;
+    }
 }

@@ -16,6 +16,8 @@ pub fn build(b: *std.Build) void {
     });
 
     exe_mod.addImport("zpec", zpec);
+    exe_mod.link_libc = true;
+    exe_mod.linkSystemLibrary("pcre2-8", .{});
 
     const lib = b.addLibrary(.{
         .linkage = .static,
