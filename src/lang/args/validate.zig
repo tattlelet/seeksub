@@ -140,6 +140,7 @@ pub fn GroupTrackerWithConfig(Spec: type, comptime config: GroupMatchConfig(Spec
             }
         }
 
+        // TODO: add validation chains (if a, then b, but only if a)
         pub fn validate(self: *const @This()) Error!void {
             try self.checkMutuallyExclusive();
             try self.checkMutuallyInclusive();
