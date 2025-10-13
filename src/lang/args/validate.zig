@@ -72,6 +72,7 @@ pub fn GroupMatchConfig(Spec: type) type {
     const SpecEnumFields = std.meta.FieldEnum(Spec);
     return struct {
         mutuallyInclusive: []const []const SpecEnumFields = &.{},
+        // TODO: rename this, oneOf demands one, mutually exclusive is optional in nature
         mutuallyExclusive: []const []const SpecEnumFields = &.{},
         required: []const SpecEnumFields = &.{},
         mandatoryVerb: bool = false,

@@ -383,6 +383,8 @@ pub fn HelpFmt(comptime Spec: type, comptime conf: HelpConf) type {
                     "]",
                 });
 
+                if (std.mem.eql(u8, b.s, "")) break :rt null;
+
                 break :rt b.s;
             };
         }

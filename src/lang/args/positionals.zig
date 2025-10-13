@@ -180,7 +180,13 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
         pub fn collect(self: *@This(), allocator: *const Allocator) CollectError!Positionals {
             if ((comptime TupleT != void) and self.tupleCursor < self.tuple.len) return CollectError.MissingPositionalField;
             const reminder = if (comptime InnerList == void) self.reminder else rv: {
-                break :rv if (self.reminderCursor == 0) &.{} else try self.list.toOwnedSlice(allocator.*);
+                if (self.reminderCursor == 0) {
+                    break :rv switch (@typeInfo(ReminderT)) {
+                        .optional => null,
+                        else => &.{},
+                    };
+                }
+                break :rv try self.list.toOwnedSlice(allocator.*);
             };
             return .{
                 .tuple = self.tuple,
@@ -188,6 +194,22 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
             };
         }
     };
+}
+
+test "empty reminder" {
+    const t = std.testing;
+
+    var pos: PositionalOf(.{
+        .ReminderType = []const []const u8,
+    }) = .{};
+
+    const p = try pos.collect(&std.testing.allocator);
+    try t.expectEqualDeep(&.{}, p.reminder);
+
+    var pos2: PositionalOf(.{}) = .{};
+
+    const p2 = try pos2.collect(&std.testing.allocator);
+    try t.expectEqual(null, p2.reminder);
 }
 
 test "parse positionals tuple" {
@@ -219,7 +241,7 @@ test "parse positionals tuple" {
     try t.expectEqualDeep(expect, &p.reminder);
 }
 
-test "parse buffered reminder" {
+test "parse only buffered reminder" {
     const t = std.testing;
     const allocator = &std.testing.allocator;
 
