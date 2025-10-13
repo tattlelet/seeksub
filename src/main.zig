@@ -12,27 +12,23 @@ const HelpData = help.HelpData;
 const GroupMatchConfig = validate.GroupMatchConfig;
 const SpecResponseWithConfig = spec.SpecResponseWithConfig;
 const positionals = args.positionals;
-const c = @cImport({
-    @cDefine("PCRE2_CODE_UNIT_WIDTH", "8");
-    @cInclude("pcre2.h");
-});
+const regex = zpec.regex;
 
 const Args = struct {
     match: []const u8 = undefined,
     // TODO: rethink this, filename and byterange are detached and can be a problem
     byteRanges: ?[]const []const usize = null,
+    @"line-by-line": bool = false,
+    multiline: bool = false,
     recursive: bool = false,
     @"follow-links": bool = false,
     verbose: bool = false,
 
-    pub const Positionals = positionals.PositionalOf(.{
-        .TupleType = struct { []const u8 },
-        .ReminderType = ?[]const []const u8,
-    });
-
     pub const Short = .{
         .m = .match,
         .bR = .byteRanges,
+        .lB = .@"line-by-line",
+        .mL = .multiline,
         .r = .recursive,
         .fL = .@"follow-links",
         .v = .verbose,
@@ -46,6 +42,9 @@ const Args = struct {
 
     pub const GroupMatch: GroupMatchConfig(@This()) = .{
         .required = &.{.match},
+        .mutuallyExclusive = &.{
+            &.{ .byteRanges, .@"line-by-line", .multiline },
+        },
         .mandatoryVerb = true,
     };
 
@@ -55,15 +54,14 @@ const Args = struct {
         .optionsDescription = &.{
             .{ .field = .match, .description = "PCRE2 Regex to match on all files" },
             .{ .field = .byteRanges, .description = "Range of bytes for n files, top-level array length has to be of (len <= files.len) and will be applied sequentially over files" },
+            .{ .field = .@"line-by-line", .description = "Line by line matching" },
+            .{ .field = .multiline, .description = "Multiline matching" },
             .{ .field = .recursive, .description = "Recursively matches all files in paths" },
             .{ .field = .@"follow-links", .description = "Follow symlinks, using a weakref visitor" },
             .{ .field = .verbose, .description = "Verbose mode" },
         },
         .positionalsDescription = .{
-            .tuple = &.{
-                "File or path to be operated on. Use -r for recusive",
-            },
-            .reminder = "More files or paths",
+            .reminder = "Files or paths to be operated on",
         },
     };
 
@@ -147,15 +145,10 @@ pub const HelpConf: help.HelpConf = .{
 };
 pub const ArgsRes = SpecResponseWithConfig(Args, HelpConf, true);
 
-const Reporter = struct {
-    stdoutW: *std.Io.Writer = undefined,
-    stderrW: *std.Io.Writer = undefined,
-};
-
-var reporter: *const Reporter = undefined;
+var reporter: *const zpec.reporter.Reporter = undefined;
 pub fn main() !u8 {
     reporter = rv: {
-        var r: Reporter = .{};
+        var r: zpec.reporter.Reporter = .{};
         var buffOut: [units.ByteUnit.kb * 2]u8 = undefined;
         var buffErr: [units.ByteUnit.kb * 2]u8 = undefined;
 
@@ -176,8 +169,8 @@ pub fn main() !u8 {
 
     var result: ArgsRes = .init(allocator);
     defer result.deinit();
-    defer reporter.stderrW.flush() catch unreachable;
     defer reporter.stdoutW.flush() catch unreachable;
+    defer reporter.stderrW.flush() catch unreachable;
 
     if (result.parseArgs()) |err| {
         if (err.message) |message| {
@@ -190,96 +183,171 @@ pub fn main() !u8 {
         }
     }
 
+    // TODO: validate STDIN has anything
     try run(&result);
     return 0;
 }
 
-pub const RunError = error{
-    BadRegex,
-    FailedMatchCreation,
-    NoMatch,
-    UnknownError,
-} || std.posix.RealPathError ||
+pub const MmapOpenError = std.posix.RealPathError ||
     std.posix.OpenError ||
-    std.posix.MMapError ||
-    std.Io.Writer.Error;
+    std.posix.MMapError;
 
-pub fn run(argsRes: *const ArgsRes) RunError!void {
-    const fileArg = argsRes.positionals.tuple.@"0";
-    var buff: [4098]u8 = undefined;
-    const filePath = try std.fs.cwd().realpath(fileArg, &buff);
-    const fd = try std.fs.openFileAbsolute(filePath, .{ .mode = .read_only });
-    const stats = try fd.stat();
+pub fn mmapOpen(file: std.fs.File) MmapOpenError!std.Io.Reader {
+    const stats = try file.stat();
     const fSize = stats.size;
 
     // TODO: test heap allocated mmap
-    const data = try std.posix.mmap(
+    const mmapBuff = try std.posix.mmap(
         null,
         fSize,
         std.posix.PROT.READ,
         .{
-            .TYPE = .PRIVATE,
+            .TYPE = .SHARED,
             .NONBLOCK = true,
         },
-        fd.handle,
+        file.handle,
         0,
     );
 
-    var err: c_int = undefined;
-    var errOff: usize = undefined;
-    const re = c.pcre2_compile_8(
-        argsRes.options.match.ptr,
-        argsRes.options.match.len,
-        // TODO: abstract flags support
-        // NOTE: /g is actually an abstraction outside of the regex engine
-        c.PCRE2_UTF | c.PCRE2_UCP,
-        &err,
-        &errOff,
+    // NOTE: fixed can be copied because there's no @fieldParentPtr access
+    return .fixed(mmapBuff);
+}
+
+pub const AnonyMmapPipeBuffError = std.posix.MMapError;
+
+pub fn anonyMmapPipeBuff() AnonyMmapPipeBuffError![]u8 {
+    return try std.posix.mmap(
         null,
-    );
-    if (re == null) {
-        const end = c.pcre2_get_error_message_8(err, &buff, buff.len);
-        try reporter.stderrW.print("Compile failed {d}: {s}\n", .{ errOff, buff[0..@intCast(end)] });
-
-        return RunError.BadRegex;
-    }
-    defer c.pcre2_code_free_8(re);
-
-    const match = c.pcre2_match_data_create_from_pattern_8(re, null);
-    if (match == null) {
-        return RunError.FailedMatchCreation;
-    }
-    defer c.pcre2_match_data_free_8(match);
-
-    const rc = c.pcre2_match_8(
-        re,
-        data.ptr,
-        data.len,
+        // NOTE: default pipe size
+        units.ByteUnit.kb * 64,
+        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{
+            .TYPE = .SHARED,
+            .ANONYMOUS = true,
+        },
+        -1,
         0,
-        // TODO: see if flags need to be abstracted
-        // consider PCRE2_NO_UTF_CHECK
-        0,
-        match,
-        null,
     );
-    if (rc < 0) {
-        switch (rc) {
-            c.PCRE2_ERROR_NOMATCH => {
-                try reporter.stderrW.writeAll("Pattern did not match\n");
-                return RunError.NoMatch;
-            },
-            // NOTE: most error are data related or group related or utf related
-            // check the ERROR definition in the lib
-            else => {
-                try reporter.stderrW.print("Unknown match return: {d}\n", .{rc});
-                return RunError.UnknownError;
-            },
+}
+
+pub const FileType = union(enum) {
+    stdin,
+    file: []const u8,
+
+    pub fn name(self: *const @This()) []const u8 {
+        return switch (self.*) {
+            .stdin => "stdin",
+            .file => |fileArg| fileArg,
+        };
+    }
+};
+
+pub const OpenError = std.fs.File.OpenError || std.posix.RealPathError;
+
+pub fn open(fileArg: []const u8) OpenError!std.fs.File {
+    var buff: [4098]u8 = undefined;
+    const filePath = try std.fs.cwd().realpath(fileArg, &buff);
+    return try std.fs.openFileAbsolute(filePath, .{ .mode = .read_only });
+}
+
+pub const FileCursor = struct {
+    files: [1]FileType = undefined,
+    current: ?std.fs.File = null,
+    idx: usize = 0,
+
+    pub fn init(argsRes: *const ArgsRes) @This() {
+        var self: @This() = .{};
+
+        if (argsRes.positionals.reminder) |reminder| {
+            const target = reminder[0];
+            if (target.len == 1 and target[0] == '-') {
+                self.files[0] = .stdin;
+            } else {
+                self.files[0] = .{ .file = reminder[0] };
+            }
+        } else {
+            self.files[0] = .stdin;
         }
+
+        return self;
     }
 
-    try reporter.stderrW.print("RC {d}\n", .{rc});
-    const ovec = c.pcre2_get_ovector_pointer_8(match);
-    try reporter.stdoutW.print("Match: {s}\n", .{data[@intCast(ovec[0])..@intCast(ovec[1])]});
+    pub fn currentType(self: *const @This()) FileType {
+        return self.files[self.idx];
+    }
+
+    pub fn next(self: *@This()) OpenError!?std.fs.File {
+        std.debug.assert(self.current == null);
+        if (self.idx >= self.files.len) return null;
+        const fType = self.files[self.idx];
+
+        self.current = switch (fType) {
+            .file => |fileArg| try open(fileArg),
+            .stdin => std.fs.File.stdin(),
+        };
+
+        return self.current;
+    }
+
+    pub fn close(self: *@This()) void {
+        std.debug.assert(self.current != null);
+        self.current.?.close();
+        self.current = null;
+        self.idx += 1;
+    }
+};
+
+pub const RunError = error{} ||
+    regex.CompileError ||
+    regex.Regex.MatchError ||
+    MmapOpenError ||
+    AnonyMmapPipeBuffError ||
+    std.Io.Reader.DelimiterError ||
+    std.Io.Writer.Error;
+
+pub fn run(argsRes: *const ArgsRes) RunError!void {
+    const matchPattern = argsRes.options.match;
+    var rgx = try regex.compile(matchPattern, reporter);
+    defer rgx.deinit();
+
+    var fileCursor = FileCursor.init(argsRes);
+    // TODO: iterate over folders and more files
+    const file = try fileCursor.next() orelse return;
+    defer fileCursor.close();
+
+    var reader = switch (fileCursor.currentType()) {
+        .file => rv: {
+            var reader = try mmapOpen(file);
+            break :rv &reader;
+        },
+        .stdin => rv: {
+            const buff = try anonyMmapPipeBuff();
+            var reader = file.reader(buff);
+            break :rv &reader.interface;
+        },
+    };
+    defer std.posix.munmap(
+        @as([]align(std.heap.page_size_min) const u8, @ptrCast(@alignCast(reader.buffer))),
+    );
+
+    if (argsRes.options.@"line-by-line") {
+        while (true) {
+            const line = reader.peekDelimiterInclusive('\n') catch |e| switch (e) {
+                std.Io.Reader.DelimiterError.EndOfStream => break,
+                std.Io.Reader.DelimiterError.ReadFailed => return e,
+                std.Io.Reader.DelimiterError.StreamTooLong => return e,
+            };
+
+            var optMachData = try rgx.match(line);
+            if (optMachData) |*matchData| {
+                defer matchData.deinit();
+                try reporter.stdoutW.print("Match <{s}>\n", .{matchData.group(0, line)});
+            }
+
+            reader.toss(line.len);
+        }
+        return;
+    }
 
     return;
 }
