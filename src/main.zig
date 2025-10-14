@@ -15,23 +15,28 @@ const positionals = args.positionals;
 const regex = zpec.regex;
 
 const Args = struct {
-    match: []const u8 = undefined,
-    // TODO: rethink this, filename and byterange are detached and can be a problem
-    byteRanges: ?[]const []const usize = null,
     @"line-by-line": bool = false,
+    @"group-only": bool = false,
     multiline: bool = false,
     recursive: bool = false,
     @"follow-links": bool = false,
+    colored: bool = false,
     verbose: bool = false,
+    byteRanges: ?[]const []const usize = null,
+
+    pub const Positionals = positionals.PositionalOf(.{
+        .TupleType = struct { []const u8 },
+        .ReminderType = ?[]const []const u8,
+    });
 
     pub const Short = .{
-        .m = .match,
-        .bR = .byteRanges,
         .lB = .@"line-by-line",
+        .O = .@"group-only",
         .mL = .multiline,
-        .r = .recursive,
+        .R = .recursive,
         .fL = .@"follow-links",
         .v = .verbose,
+        .bR = .byteRanges,
     };
 
     pub const Verb = union(enum) {
@@ -41,7 +46,6 @@ const Args = struct {
     };
 
     pub const GroupMatch: GroupMatchConfig(@This()) = .{
-        .required = &.{.match},
         .mutuallyExclusive = &.{
             &.{ .byteRanges, .@"line-by-line", .multiline },
         },
@@ -49,18 +53,22 @@ const Args = struct {
     };
 
     pub const Help: HelpData(@This()) = .{
-        .usage = &.{"seeksub <options> <command> ... <files> <optionalFiles>"},
+        .usage = &.{"seeksub <options> <command> ... <pattern> <files>"},
         .description = "CLI tool to match, diff and apply regex in bulk using PCRE2. One of the main features of this CLI is the ability to seek byte ranges before matching or replacing",
         .optionsDescription = &.{
-            .{ .field = .match, .description = "PCRE2 Regex to match on all files" },
             .{ .field = .byteRanges, .description = "Range of bytes for n files, top-level array length has to be of (len <= files.len) and will be applied sequentially over files" },
             .{ .field = .@"line-by-line", .description = "Line by line matching" },
+            .{ .field = .@"group-only", .description = "Only outputs group match 0 instead of whole line" },
             .{ .field = .multiline, .description = "Multiline matching" },
             .{ .field = .recursive, .description = "Recursively matches all files in paths" },
             .{ .field = .@"follow-links", .description = "Follow symlinks, using a weakref visitor" },
+            .{ .field = .colored, .description = "Colors matches" },
             .{ .field = .verbose, .description = "Verbose mode" },
         },
         .positionalsDescription = .{
+            .tuple = &.{
+                "PCRE2 regex pattern to use on all files",
+            },
             .reminder = "Files or paths to be operated on",
         },
     };
@@ -143,14 +151,16 @@ const Args = struct {
 pub const HelpConf: help.HelpConf = .{
     .simpleTypes = true,
 };
+
 pub const ArgsRes = SpecResponseWithConfig(Args, HelpConf, true);
 
 var reporter: *const zpec.reporter.Reporter = undefined;
+
 pub fn main() !u8 {
     reporter = rv: {
         var r: zpec.reporter.Reporter = .{};
-        var buffOut: [units.ByteUnit.kb * 2]u8 = undefined;
-        var buffErr: [units.ByteUnit.kb * 2]u8 = undefined;
+        var buffOut: [units.ByteUnit.mb * 2]u8 = undefined;
+        var buffErr: [units.ByteUnit.mb * 2]u8 = undefined;
 
         r.stdoutW = rOut: {
             var writer = std.fs.File.stdout().writer(&buffOut);
@@ -183,13 +193,14 @@ pub fn main() !u8 {
         }
     }
 
-    // TODO: validate STDIN has anything
+    // TODO: make sink system
+    // STDOUT pipe and file should have fast output, tty should be slower
+    // STDIN pipe and file should have fast input, tty should be slower
     try run(&result);
     return 0;
 }
 
 pub const MmapOpenError = std.posix.RealPathError ||
-    std.posix.OpenError ||
     std.posix.MMapError;
 
 pub fn mmapOpen(file: std.fs.File) MmapOpenError!std.Io.Reader {
@@ -300,13 +311,14 @@ pub const FileCursor = struct {
 pub const RunError = error{} ||
     regex.CompileError ||
     regex.Regex.MatchError ||
+    OpenError ||
     MmapOpenError ||
     AnonyMmapPipeBuffError ||
     std.Io.Reader.DelimiterError ||
     std.Io.Writer.Error;
 
 pub fn run(argsRes: *const ArgsRes) RunError!void {
-    const matchPattern = argsRes.options.match;
+    const matchPattern = argsRes.positionals.tuple.@"0";
     var rgx = try regex.compile(matchPattern, reporter);
     defer rgx.deinit();
 
@@ -332,18 +344,55 @@ pub fn run(argsRes: *const ArgsRes) RunError!void {
 
     if (argsRes.options.@"line-by-line") {
         while (true) {
+            var start: usize = 0;
+            var matching: bool = false;
             const line = reader.peekDelimiterInclusive('\n') catch |e| switch (e) {
                 std.Io.Reader.DelimiterError.EndOfStream => break,
                 std.Io.Reader.DelimiterError.ReadFailed => return e,
                 std.Io.Reader.DelimiterError.StreamTooLong => return e,
             };
 
-            var optMachData = try rgx.match(line);
-            if (optMachData) |*matchData| {
-                defer matchData.deinit();
-                try reporter.stdoutW.print("Match <{s}>\n", .{matchData.group(0, line)});
-            }
+            // TODO: split sinking for TTY and add coloring
+            while (start < line.len - 1) {
+                var optMachData = try rgx.offsetMatch(line, start);
+                if (optMachData) |*matchData| {
+                    const group0 = matchData.group(0);
 
+                    if (start != group0.start) {
+                        if (matching) try reporter.stdoutW.writeAll(&.{ 0x1B, 0x5B, 0x30, 0x6D });
+                        try reporter.stdoutW.writeAll(line[start..group0.start]);
+                        if (matching) try reporter.stdoutW.writeAll(&.{ 0x1B, 0x5B, 0x33, 0x31, 0x6D });
+                    }
+
+                    if (!matching) {
+                        try reporter.stdoutW.writeAll(&.{ 0x1B, 0x5B, 0x33, 0x31, 0x6D });
+                        matching = true;
+                    }
+
+                    try reporter.stdoutW.writeAll(group0.slice(line));
+
+                    // try reporter.stdoutW.print("[{d}] Match {d}:{d} - <{s}>{s}", .{
+                    //     matchData.groupCount(),
+                    //     group0.start,
+                    //     group0.end,
+                    //     group0.slice(line),
+                    //     line,
+                    // });
+
+                    start = group0.end;
+
+                    if (start + 1 == line.len and line[start] == '\n') {
+                        try reporter.stdoutW.writeAll(@as([]const u8, &.{ 0x1B, 0x5B, 0x30, 0x6D }) ++ "\n");
+                        break;
+                    }
+                } else {
+                    if (start != 0) {
+                        try reporter.stdoutW.writeAll(&.{ 0x1B, 0x5B, 0x30, 0x6D });
+                        try reporter.stdoutW.writeAll(line[start..line.len]);
+                    }
+                    break;
+                }
+            }
             reader.toss(line.len);
         }
         return;

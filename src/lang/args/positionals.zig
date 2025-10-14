@@ -100,7 +100,7 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
         // TODO: test this
         pub fn hasNext(self: *const @This()) bool {
             if (comptime TupleT == void and ReminderT == void) return false;
-            if (comptime TupleT != void) {
+            if (comptime TupleT != void and ReminderT == void) {
                 return self.tupleCursor < self.tuple.len;
             } else {
                 return true;

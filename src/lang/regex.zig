@@ -10,6 +10,7 @@ pub const reporter = @import("reporter.zig");
 pub const CompileError = error{
     RegexInitFailed,
     BadRegex,
+    MatchDataInitFailed,
 } || std.Io.Writer.Error;
 
 // TODO: extract flags from pattern
@@ -34,6 +35,7 @@ pub fn compile(pattern: []const u8, rpt: *const reporter.Reporter) CompileError!
         // TODO: abstract flags support
         // NOTE: /g is actually an abstraction outside of the regex engine
         0,
+        // pcre2.PCRE2_NEVER_UCP | pcre2.PCRE2_NEVER_UTF | pcre2.PCRE2_NEVER_BACKSLASH_C | pcre2.PCRE2_EXTRA_NEVER_CALLOUT,
         &err,
         &errOff,
         compContext,
@@ -45,18 +47,28 @@ pub fn compile(pattern: []const u8, rpt: *const reporter.Reporter) CompileError!
 
         return CompileError.BadRegex;
     };
+    _ = pcre2.pcre2_jit_compile_8(re, pcre2.PCRE2_JIT_COMPLETE);
+
+    const matchData = pcre2.pcre2_match_data_create_from_pattern_8(re, null) orelse {
+        return CompileError.MatchDataInitFailed;
+    };
 
     return .{
         .re = re,
         .compContext = compContext,
+        .matchData = matchData,
     };
 }
 
 pub const Regex = struct {
     re: *pcre2.pcre2_code_8,
     compContext: *pcre2.pcre2_compile_context_8,
+    matchData: *pcre2.pcre2_match_data_8,
 
     pub fn deinit(self: *@This()) void {
+        pcre2.pcre2_match_data_free_8(self.matchData);
+        self.matchData = undefined;
+        // pcre2.pcre2_jit_free_unused_memory_8(null);
         pcre2.pcre2_code_free_8(self.re);
         self.re = undefined;
         pcre2.pcre2_compile_context_free_8(self.compContext);
@@ -64,27 +76,25 @@ pub const Regex = struct {
     }
 
     pub const MatchError = error{
-        MatchInitFailed,
         NoMatch,
         MatchDataNotAvailable,
         UnknownError,
     };
 
     pub fn match(self: *const @This(), data: []const u8) MatchError!?RegexMatch {
-        const matchData = pcre2.pcre2_match_data_create_from_pattern_8(self.re, null) orelse {
-            return MatchError.MatchInitFailed;
-        };
-        errdefer pcre2.pcre2_match_data_free_8(matchData);
+        return try self.offsetMatch(data, 0);
+    }
 
+    pub fn offsetMatch(self: *const @This(), data: []const u8, offset: usize) MatchError!?RegexMatch {
         const rc = pcre2.pcre2_match_8(
             self.re,
             data.ptr,
             data.len,
-            0,
+            offset,
             // TODO: see if flags need to be abstracted
             // NOTE: consider (?i) etc works here
             0,
-            matchData,
+            self.matchData,
             null,
         );
         if (rc <= 0) {
@@ -92,30 +102,56 @@ pub const Regex = struct {
                 // NOTE: this implies ovector is not big enough for all substr
                 // matches
                 0 => return MatchError.MatchDataNotAvailable,
-                pcre2.PCRE2_ERROR_NOMATCH => return null,
+                pcre2.PCRE2_ERROR_NOMATCH => {
+                    return null;
+                },
                 // NOTE: most error are data related or group related or utf related
                 // check the ERROR definition in the lib
                 else => return MatchError.UnknownError,
             }
         }
 
+        const ovect = pcre2.pcre2_get_ovector_pointer_8(self.matchData);
+
+        std.debug.assert(rc >= 0);
+        return .init(ovect, @intCast(rc));
+    }
+};
+
+pub const RegexMatchGroup = struct {
+    n: usize,
+    start: usize,
+    end: usize,
+
+    pub fn init(n: usize, start: usize, end: usize) @This() {
         return .{
-            .matchData = matchData,
+            .n = n,
+            .start = start,
+            .end = end,
         };
+    }
+
+    pub fn slice(self: *const @This(), data: []const u8) []const u8 {
+        return data[self.start..self.end];
     }
 };
 
 pub const RegexMatch = struct {
-    matchData: *pcre2.pcre2_match_data_8,
+    ovector: []const usize,
 
-    pub fn group(self: *const @This(), n: usize, data: []const u8) []const u8 {
-        const ovector = pcre2.pcre2_get_ovector_pointer_8(self.matchData);
-        const start = n * 2;
-        const end = start + 1;
-        return data[ovector[start]..ovector[end]];
+    pub fn init(ovector: [*c]usize, length: usize) @This() {
+        return .{
+            .ovector = ovector[0 .. length * 2],
+        };
     }
 
-    pub fn deinit(self: *@This()) void {
-        pcre2.pcre2_match_data_free_8(self.matchData);
+    pub fn groupCount(self: *const @This()) usize {
+        return self.ovector.len / 2;
+    }
+
+    pub fn group(self: *const @This(), n: usize) RegexMatchGroup {
+        const start = n * 2;
+        const end = n * 2 + 1;
+        return .init(n, self.ovector[start], self.ovector[end]);
     }
 };
