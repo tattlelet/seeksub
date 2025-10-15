@@ -15,7 +15,7 @@ const positionals = args.positionals;
 const regex = zpec.regex;
 
 const Args = struct {
-    @"line-by-line": bool = false,
+    @"line-by-line": bool = true,
     @"group-only": bool = false,
     multiline: bool = false,
     recursive: bool = false,
@@ -46,10 +46,10 @@ const Args = struct {
     };
 
     pub const GroupMatch: GroupMatchConfig(@This()) = .{
-        .mutuallyExclusive = &.{
-            &.{ .byteRanges, .@"line-by-line", .multiline },
-        },
-        .mandatoryVerb = true,
+        // TODO: rethink groupmatching to allow defaults and checks to play together
+        // .mutuallyExclusive = &.{
+        //     &.{ .byteRanges, .@"line-by-line", .multiline },
+        // },
     };
 
     pub const Help: HelpData(@This()) = .{
@@ -157,10 +157,13 @@ pub const ArgsRes = SpecResponseWithConfig(Args, HelpConf, true);
 var reporter: *const zpec.reporter.Reporter = undefined;
 
 pub fn main() !u8 {
+    // const out = std.fs.File.stdout();
+    // std.debug.print("out mode: {s}\n", .{@tagName(try zpec.reporter.outputBuffType(&out))});
+
     reporter = rv: {
         var r: zpec.reporter.Reporter = .{};
-        var buffOut: [units.ByteUnit.mb * 2]u8 = undefined;
-        var buffErr: [units.ByteUnit.mb * 2]u8 = undefined;
+        var buffOut: [units.ByteUnit.mb * 1]u8 = undefined;
+        var buffErr: [units.ByteUnit.mb * 1]u8 = undefined;
 
         r.stdoutW = rOut: {
             var writer = std.fs.File.stdout().writer(&buffOut);
@@ -192,6 +195,8 @@ pub fn main() !u8 {
             return 1;
         }
     }
+
+    if (result.verb == null) result.verb = .{ .match = .initEmpty(allocator) };
 
     // TODO: make sink system
     // STDOUT pipe and file should have fast output, tty should be slower
@@ -314,6 +319,7 @@ pub const RunError = error{} ||
     OpenError ||
     MmapOpenError ||
     AnonyMmapPipeBuffError ||
+    std.Io.tty.Config.SetColorError ||
     std.Io.Reader.DelimiterError ||
     std.Io.Writer.Error;
 
@@ -343,6 +349,14 @@ pub fn run(argsRes: *const ArgsRes) RunError!void {
     );
 
     if (argsRes.options.@"line-by-line") {
+        // TODO: checks for ovect[0] > ovect[1]
+        // TODO: checks for empty
+        // TODO: check for \K
+
+        // TODO: troubleshoot why detect is not working
+        // const config = std.Io.tty.Config.detect(file);
+        const config: std.Io.tty.Config = .escape_codes;
+
         while (true) {
             var start: usize = 0;
             var matching: bool = false;
@@ -352,44 +366,34 @@ pub fn run(argsRes: *const ArgsRes) RunError!void {
                 std.Io.Reader.DelimiterError.StreamTooLong => return e,
             };
 
-            // TODO: split sinking for TTY and add coloring
             while (start < line.len - 1) {
                 var optMachData = try rgx.offsetMatch(line, start);
                 if (optMachData) |*matchData| {
                     const group0 = matchData.group(0);
 
                     if (start != group0.start) {
-                        if (matching) try reporter.stdoutW.writeAll(&.{ 0x1B, 0x5B, 0x30, 0x6D });
+                        if (matching) try config.setColor(reporter.stdoutW, .reset);
                         try reporter.stdoutW.writeAll(line[start..group0.start]);
-                        if (matching) try reporter.stdoutW.writeAll(&.{ 0x1B, 0x5B, 0x33, 0x31, 0x6D });
+                        if (matching) try config.setColor(reporter.stdoutW, .bright_red);
                     }
 
                     if (!matching) {
-                        try reporter.stdoutW.writeAll(&.{ 0x1B, 0x5B, 0x33, 0x31, 0x6D });
+                        try config.setColor(reporter.stdoutW, .bright_red);
                         matching = true;
                     }
 
                     try reporter.stdoutW.writeAll(group0.slice(line));
 
-                    // try reporter.stdoutW.print("[{d}] Match {d}:{d} - <{s}>{s}", .{
-                    //     matchData.groupCount(),
-                    //     group0.start,
-                    //     group0.end,
-                    //     group0.slice(line),
-                    //     line,
-                    // });
-
                     start = group0.end;
 
                     if (start + 1 == line.len and line[start] == '\n') {
-                        try reporter.stdoutW.writeAll(@as([]const u8, &.{ 0x1B, 0x5B, 0x30, 0x6D }) ++ "\n");
+                        try config.setColor(reporter.stdoutW, .reset);
+                        try reporter.stdoutW.writeAll("\n");
                         break;
                     }
                 } else {
-                    if (start != 0) {
-                        try reporter.stdoutW.writeAll(&.{ 0x1B, 0x5B, 0x30, 0x6D });
-                        try reporter.stdoutW.writeAll(line[start..line.len]);
-                    }
+                    if (matching) try config.setColor(reporter.stdoutW, .reset);
+                    if (start != 0) try reporter.stdoutW.writeAll(line[start..line.len]);
                     break;
                 }
             }
