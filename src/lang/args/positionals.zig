@@ -193,6 +193,14 @@ pub fn PositionalOfWithDefault(comptime Config: PositionalConfig, reminderDefaul
                 .reminder = reminder,
             };
         }
+
+        // TODO: test this and funky types
+        pub fn collectEmpty(self: *const @This()) Positionals {
+            return .{
+                .tuple = self.tuple,
+                .reminder = self.reminder,
+            };
+        }
     };
 }
 

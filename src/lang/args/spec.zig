@@ -42,6 +42,7 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype, c
         options: Options,
         program: ?[]const u8,
         positionals: PosOf.Positionals,
+        // TODO: support default verb
         verb: if (VerbT != void) ?VerbT else void,
         tracker: SpecTracker,
 
@@ -137,6 +138,19 @@ pub fn SpecResponseWithConfig(comptime Spec: type, comptime HelpConf: anytype, c
                 .options = .{},
                 .program = null,
                 .positionals = undefined,
+                .verb = if (comptime VerbT != void) null else {},
+                .tracker = if (comptime SpecTracker != void) .{} else {},
+            };
+        }
+
+        pub fn initEmpty(baseAllc: Allocator) @This() {
+            var positionalOf: PosOf = .{};
+            return .{
+                .arena = std.heap.ArenaAllocator.init(baseAllc),
+                .codec = .{},
+                .options = .{},
+                .program = null,
+                .positionals = positionalOf.collectEmpty(),
                 .verb = if (comptime VerbT != void) null else {},
                 .tracker = if (comptime SpecTracker != void) .{} else {},
             };
