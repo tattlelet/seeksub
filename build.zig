@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // TODO: try musl again
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const zpec = b.addModule("zpec", .{
@@ -13,10 +14,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zpec", .module = zpec },
+        },
     });
 
-    exe_mod.addImport("zpec", zpec);
-    exe_mod.link_libc = true;
     exe_mod.linkSystemLibrary("pcre2-8", .{});
 
     const lib = b.addLibrary(.{

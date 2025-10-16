@@ -8,3 +8,10 @@ pub const ByteUnit = struct {
     pub const mb = 1 << 20;
     pub const gb = 1 << 30;
 };
+
+pub const CacheSize = struct {
+    // TODO: dynamically grab this?
+    pub const L1 = ByteUnit.kb * 128;
+    pub const L2 = ByteUnit.mb * 1;
+    pub const L3 = ByteUnit.mb * 8;
+};

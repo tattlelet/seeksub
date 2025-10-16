@@ -1,11 +1,7 @@
 const std = @import("std");
+const pcre2 = @import("c.zig").pcre2;
 
-pub const pcre2 = @cImport({
-    @cDefine("PCRE2_CODE_UNIT_WIDTH", "8");
-    @cInclude("pcre2.h");
-});
-
-pub const reporter = @import("reporter.zig");
+pub const sink = @import("./sink.zig");
 
 pub const CompileError = error{
     RegexInitFailed,
@@ -14,7 +10,7 @@ pub const CompileError = error{
 } || std.Io.Writer.Error;
 
 // TODO: extract flags from pattern
-pub fn compile(pattern: []const u8, rpt: *const reporter.Reporter) CompileError!Regex {
+pub fn compile(pattern: []const u8, rpt: *const sink.Reporter) CompileError!Regex {
     const compContext = pcre2.pcre2_compile_context_create_8(null) orelse {
         return CompileError.RegexInitFailed;
     };
@@ -66,13 +62,14 @@ pub const Regex = struct {
     matchData: *pcre2.pcre2_match_data_8,
 
     pub fn deinit(self: *@This()) void {
+        // std.debug.print("Add {*}\n", .{self.compContext});
+        // pcre2.pcre2_compile_context_free_8(self.compContext);
+        // self.compContext = undefined;
         pcre2.pcre2_match_data_free_8(self.matchData);
         self.matchData = undefined;
         // pcre2.pcre2_jit_free_unused_memory_8(null);
         pcre2.pcre2_code_free_8(self.re);
         self.re = undefined;
-        pcre2.pcre2_compile_context_free_8(self.compContext);
-        self.compContext = undefined;
     }
 
     pub const MatchError = error{

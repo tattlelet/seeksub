@@ -12,7 +12,8 @@ const HelpData = help.HelpData;
 const GroupMatchConfig = validate.GroupMatchConfig;
 const SpecResponseWithConfig = spec.SpecResponseWithConfig;
 const positionals = args.positionals;
-const regex = zpec.regex;
+const regex = @import("core/regex.zig");
+const sink = @import("core/sink.zig");
 
 const Args = struct {
     @"line-by-line": bool = true,
@@ -154,19 +155,16 @@ pub const HelpConf: help.HelpConf = .{
 
 pub const ArgsRes = SpecResponseWithConfig(Args, HelpConf, true);
 
-var reporter: *const zpec.reporter.Reporter = undefined;
+var reporter: *const sink.Reporter = undefined;
 
 pub fn main() !u8 {
-    // const out = std.fs.File.stdout();
-    // std.debug.print("out mode: {s}\n", .{@tagName(try zpec.reporter.outputBuffType(&out))});
-
     reporter = rv: {
-        var r: zpec.reporter.Reporter = .{};
+        var r: sink.Reporter = .{};
         var buffOut: [units.ByteUnit.mb * 1]u8 = undefined;
         var buffErr: [units.ByteUnit.mb * 1]u8 = undefined;
 
         r.stdoutW = rOut: {
-            var writer = std.fs.File.stdout().writer(&buffOut);
+            var writer = std.fs.File.stderr().writer(&buffOut);
             break :rOut &writer.interface;
         };
         r.stderrW = rErr: {
@@ -182,7 +180,7 @@ pub fn main() !u8 {
 
     var result: ArgsRes = .init(allocator);
     defer result.deinit();
-    defer reporter.stdoutW.flush() catch unreachable;
+    defer std.fs.File.stdout().writeAll(reporter.stdoutW.buffered()) catch unreachable;
     defer reporter.stderrW.flush() catch unreachable;
 
     if (result.parseArgs()) |err| {
@@ -234,8 +232,7 @@ pub const AnonyMmapPipeBuffError = std.posix.MMapError;
 pub fn anonyMmapPipeBuff() AnonyMmapPipeBuffError![]u8 {
     return try std.posix.mmap(
         null,
-        // NOTE: default pipe size
-        units.ByteUnit.kb * 64,
+        units.ByteUnit.gb * 1,
         std.posix.PROT.READ | std.posix.PROT.WRITE,
         .{
             .TYPE = .SHARED,
@@ -317,6 +314,8 @@ pub const RunError = error{} ||
     regex.CompileError ||
     regex.Regex.MatchError ||
     OpenError ||
+    sink.DetectSinkError ||
+    sink.Sink.ConsumeError ||
     MmapOpenError ||
     AnonyMmapPipeBuffError ||
     std.Io.tty.Config.SetColorError ||
@@ -348,6 +347,36 @@ pub fn run(argsRes: *const ArgsRes) RunError!void {
         @as([]align(std.heap.page_size_min) const u8, @ptrCast(@alignCast(reader.buffer))),
     );
 
+    var stdout = std.fs.File.stdout();
+    const sinkType = try sink.detectSink(stdout);
+    const eventHandler = sink.pickEventHandler(sinkType, stdout, true);
+    const sinkBuffer = sink.pickSinkBuffer(sinkType, eventHandler);
+
+    var fSink: sink.Sink = .{
+        .sinkType = sinkType,
+        .eventHandler = eventHandler,
+        .sinkWriter = rv: {
+            switch (sinkBuffer) {
+                .heapGrowing => |size| {
+                    var allocating = try std.Io.Writer.Allocating.initCapacity(std.heap.page_allocator, size);
+                    var fdWriter = stdout.writer(&.{});
+                    var heapGrowing: sink.AllocToFileWriter = .{
+                        .allocating = &allocating,
+                        .fdWriter = &fdWriter,
+                    };
+                    break :rv .{ .heapGrowing = &heapGrowing };
+                },
+                .directWrite => {
+                    var fdWriter = stdout.writer(&.{});
+                    break :rv .{
+                        .directWrite = &fdWriter,
+                    };
+                },
+            }
+        },
+    };
+    defer fSink.deinit();
+
     if (argsRes.options.@"line-by-line") {
         // TODO: checks for ovect[0] > ovect[1]
         // TODO: checks for empty
@@ -355,50 +384,54 @@ pub fn run(argsRes: *const ArgsRes) RunError!void {
 
         // TODO: troubleshoot why detect is not working
         // const config = std.Io.tty.Config.detect(file);
-        const config: std.Io.tty.Config = .escape_codes;
+        // const config: std.Io.tty.Config = .escape_codes;
 
         while (true) {
             var start: usize = 0;
-            var matching: bool = false;
+            // var matching: bool = false;
             const line = reader.peekDelimiterInclusive('\n') catch |e| switch (e) {
                 std.Io.Reader.DelimiterError.EndOfStream => break,
                 std.Io.Reader.DelimiterError.ReadFailed => return e,
                 std.Io.Reader.DelimiterError.StreamTooLong => return e,
             };
 
+            // TODO: only do this in tty mode
+            // pipe or file can simply spit the entire line
             while (start < line.len - 1) {
-                var optMachData = try rgx.offsetMatch(line, start);
-                if (optMachData) |*matchData| {
-                    const group0 = matchData.group(0);
-
-                    if (start != group0.start) {
-                        if (matching) try config.setColor(reporter.stdoutW, .reset);
-                        try reporter.stdoutW.writeAll(line[start..group0.start]);
-                        if (matching) try config.setColor(reporter.stdoutW, .bright_red);
+                const matchData = try rgx.offsetMatch(line, start) orelse {
+                    if (start != 0) {
+                        _ = try fSink.consume(.{ .endOfLineEvent = line[start..line.len] });
+                    } else {
+                        try fSink.ttyReset();
                     }
-
-                    if (!matching) {
-                        try config.setColor(reporter.stdoutW, .bright_red);
-                        matching = true;
-                    }
-
-                    try reporter.stdoutW.writeAll(group0.slice(line));
-
-                    start = group0.end;
-
-                    if (start + 1 == line.len and line[start] == '\n') {
-                        try config.setColor(reporter.stdoutW, .reset);
-                        try reporter.stdoutW.writeAll("\n");
-                        break;
-                    }
-                } else {
-                    if (matching) try config.setColor(reporter.stdoutW, .reset);
-                    if (start != 0) try reporter.stdoutW.writeAll(line[start..line.len]);
                     break;
+                };
+
+                const group0 = matchData.group(0);
+                if (start != group0.start) {
+                    _ = try fSink.consume(.{ .nonMatchEvent = line[start..group0.start] });
+                }
+
+                const res = try fSink.consume(.{
+                    .matchEvent = .{
+                        .data = group0.slice(line),
+                        .line = line,
+                    },
+                });
+                switch (res) {
+                    .lineConsumed => break,
+                    .eventSkipped, .eventConsumed => {},
+                }
+
+                start = group0.end;
+                if (start + 1 == line.len and line[start] == '\n') {
+                    _ = try fSink.consume(.{ .endOfLineEvent = "\n" });
                 }
             }
             reader.toss(line.len);
+            try fSink.sinkLine();
         }
+        try fSink.sink();
         return;
     }
 
