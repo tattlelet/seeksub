@@ -14,6 +14,8 @@ const SpecResponseWithConfig = spec.SpecResponseWithConfig;
 const positionals = args.positionals;
 const regex = @import("core/regex.zig");
 const sink = @import("core/sink.zig");
+const fs = @import("core/fs.zig");
+const source = @import("core/source.zig");
 
 const Args = struct {
     @"line-by-line": bool = true,
@@ -203,46 +205,6 @@ pub fn main() !u8 {
     return 0;
 }
 
-pub const MmapOpenError = std.posix.RealPathError ||
-    std.posix.MMapError;
-
-pub fn mmapOpen(file: std.fs.File) MmapOpenError!std.Io.Reader {
-    const stats = try file.stat();
-    const fSize = stats.size;
-
-    // TODO: test heap allocated mmap
-    const mmapBuff = try std.posix.mmap(
-        null,
-        fSize,
-        std.posix.PROT.READ,
-        .{
-            .TYPE = .SHARED,
-            .NONBLOCK = true,
-        },
-        file.handle,
-        0,
-    );
-
-    // NOTE: fixed can be copied because there's no @fieldParentPtr access
-    return .fixed(mmapBuff);
-}
-
-pub const AnonyMmapPipeBuffError = std.posix.MMapError;
-
-pub fn anonyMmapPipeBuff() AnonyMmapPipeBuffError![]u8 {
-    return try std.posix.mmap(
-        null,
-        units.ByteUnit.gb * 1,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
-        .{
-            .TYPE = .SHARED,
-            .ANONYMOUS = true,
-        },
-        -1,
-        0,
-    );
-}
-
 pub const FileType = union(enum) {
     stdin,
     file: []const u8,
@@ -314,10 +276,10 @@ pub const RunError = error{} ||
     regex.CompileError ||
     regex.Regex.MatchError ||
     OpenError ||
-    sink.DetectSinkError ||
+    fs.DetectTypeError ||
+    source.MmapBufferError ||
+    source.ReadEvent.Error ||
     sink.Sink.ConsumeError ||
-    MmapOpenError ||
-    AnonyMmapPipeBuffError ||
     std.Io.tty.Config.SetColorError ||
     std.Io.Reader.DelimiterError ||
     std.Io.Writer.Error;
@@ -332,28 +294,47 @@ pub fn run(argsRes: *const ArgsRes) RunError!void {
     const file = try fileCursor.next() orelse return;
     defer fileCursor.close();
 
-    var reader = switch (fileCursor.currentType()) {
-        .file => rv: {
-            var reader = try mmapOpen(file);
-            break :rv &reader;
-        },
-        .stdin => rv: {
-            const buff = try anonyMmapPipeBuff();
-            var reader = file.reader(buff);
-            break :rv &reader.interface;
+    const inputFileType = try fs.detectType(file);
+    const sourceBuffer = source.pickSourceBuffer(inputFileType);
+    var fSource: source.Source = .{
+        .sourceReader = rv: {
+            switch (sourceBuffer) {
+                .growingDoubleBuffer => |config| {
+                    // var buff: [config.readBuffer]u8 = undefined;
+                    var buff: [units.PipeSize]u8 = undefined;
+                    var fsReader = std.fs.File.stdin().reader(&buff);
+                    var writer = try std.Io.Writer.Allocating.initCapacity(
+                        std.heap.page_allocator,
+                        config.targetInitialSize,
+                    );
+
+                    var growing: source.GrowingDoubleBufferSource = .{
+                        .growingWriter = &writer,
+                        .reader = &fsReader.interface,
+                    };
+                    break :rv .{ .growingDoubleBuffer = &growing };
+                },
+                .mmap => {
+                    const buff: []align(std.heap.page_size_min) u8 = try source.mmapBuffer(file);
+                    var reader = std.Io.Reader.fixed(buff);
+                    var mmapSource: source.MmapSource = .{
+                        .buffer = buff,
+                        .reader = &reader,
+                    };
+                    break :rv .{ .mmap = &mmapSource };
+                },
+            }
         },
     };
-    defer std.posix.munmap(
-        @as([]align(std.heap.page_size_min) const u8, @ptrCast(@alignCast(reader.buffer))),
-    );
+    defer fSource.deinit();
 
     var stdout = std.fs.File.stdout();
-    const sinkType = try sink.detectSink(stdout);
-    const eventHandler = sink.pickEventHandler(sinkType, stdout, true);
-    const sinkBuffer = sink.pickSinkBuffer(sinkType, eventHandler);
+    const fileType = try fs.detectType(stdout);
+    const eventHandler = sink.pickEventHandler(fileType, stdout, true);
+    const sinkBuffer = sink.pickSinkBuffer(fileType, eventHandler);
 
     var fSink: sink.Sink = .{
-        .sinkType = sinkType,
+        .fileType = fileType,
         .eventHandler = eventHandler,
         .sinkWriter = rv: {
             switch (sinkBuffer) {
@@ -368,9 +349,7 @@ pub fn run(argsRes: *const ArgsRes) RunError!void {
                 },
                 .directWrite => {
                     var fdWriter = stdout.writer(&.{});
-                    break :rv .{
-                        .directWrite = &fdWriter,
-                    };
+                    break :rv .{ .directWrite = &fdWriter };
                 },
             }
         },
@@ -382,57 +361,60 @@ pub fn run(argsRes: *const ArgsRes) RunError!void {
         // TODO: checks for empty
         // TODO: check for \K
 
-        // TODO: troubleshoot why detect is not working
-        // const config = std.Io.tty.Config.detect(file);
-        // const config: std.Io.tty.Config = .escape_codes;
-
         while (true) {
-            var start: usize = 0;
-            // var matching: bool = false;
-            const line = reader.peekDelimiterInclusive('\n') catch |e| switch (e) {
-                std.Io.Reader.DelimiterError.EndOfStream => break,
-                std.Io.Reader.DelimiterError.ReadFailed => return e,
-                std.Io.Reader.DelimiterError.StreamTooLong => return e,
-            };
-
-            // TODO: only do this in tty mode
-            // pipe or file can simply spit the entire line
-            while (start < line.len - 1) {
-                const matchData = try rgx.offsetMatch(line, start) orelse {
-                    if (start != 0) {
-                        _ = try fSink.consume(.{ .endOfLineEvent = line[start..line.len] });
-                    } else {
-                        try fSink.ttyReset();
-                    }
+            const readEvent = try fSource.nextLine();
+            switch (readEvent) {
+                .endOfFile => {
+                    try fSink.sink();
                     break;
-                };
+                },
+                .endOfFileChunk,
+                .line,
+                => |line| {
+                    var start: usize = 0;
 
-                const group0 = matchData.group(0);
-                if (start != group0.start) {
-                    _ = try fSink.consume(.{ .nonMatchEvent = line[start..group0.start] });
-                }
+                    while (start < line.len) {
+                        const matchData = try rgx.offsetMatch(line, start) orelse {
+                            if (start != 0) {
+                                _ = try fSink.consume(.{ .endOfLineEvent = line[start..line.len] });
+                            } else {
+                                try fSink.ttyReset();
+                            }
+                            break;
+                        };
 
-                const res = try fSink.consume(.{
-                    .matchEvent = .{
-                        .data = group0.slice(line),
-                        .line = line,
-                    },
-                });
-                switch (res) {
-                    .lineConsumed => break,
-                    .eventSkipped, .eventConsumed => {},
-                }
+                        const group0 = matchData.group(0);
+                        if (start != group0.start) {
+                            _ = try fSink.consume(.{ .nonMatchEvent = line[start..group0.start] });
+                        }
 
-                start = group0.end;
-                if (start + 1 == line.len and line[start] == '\n') {
-                    _ = try fSink.consume(.{ .endOfLineEvent = "\n" });
-                }
+                        const res = try fSink.consume(.{
+                            .matchEvent = .{
+                                .data = group0.slice(line),
+                                .line = line,
+                            },
+                        });
+                        switch (res) {
+                            .lineConsumed => break,
+                            .eventSkipped, .eventConsumed => {},
+                        }
+
+                        start = group0.end;
+                        if (start + 1 == line.len and line[start] == '\n') {
+                            _ = try fSink.consume(.{ .endOfLineEvent = "\n" });
+                            start += 1;
+                        }
+                    }
+
+                    try fSink.sinkLine();
+
+                    if (readEvent == .endOfFileChunk) {
+                        try fSink.sink();
+                        break;
+                    }
+                },
             }
-            reader.toss(line.len);
-            try fSink.sinkLine();
         }
-        try fSink.sink();
-        return;
     }
 
     return;

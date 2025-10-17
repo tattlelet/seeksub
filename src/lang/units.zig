@@ -15,3 +15,5 @@ pub const CacheSize = struct {
     pub const L2 = ByteUnit.mb * 1;
     pub const L3 = ByteUnit.mb * 8;
 };
+
+pub const PipeSize = ByteUnit.kb * 64;

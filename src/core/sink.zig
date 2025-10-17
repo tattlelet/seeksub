@@ -1,41 +1,13 @@
 const std = @import("std");
 const units = @import("zpec").units;
-const C = @import("c.zig").C;
-const regex = @import("regex.zig");
+const fs = @import("fs.zig");
 const File = std.fs.File;
 const Writer = std.Io.Writer;
-const Reader = std.Io.Reader;
 
 pub const Reporter = struct {
     stdoutW: *Writer = undefined,
     stderrW: *Writer = undefined,
 };
-
-pub const DetectSinkError = error{
-    UnableToQueryFd,
-    UnsupportedFileType,
-};
-
-pub const SinkType = enum {
-    tty,
-    characterDevice,
-    file,
-    pipe,
-    generic,
-};
-
-pub fn detectSink(file: File) DetectSinkError!SinkType {
-    const stat = file.stat() catch return DetectSinkError.UnableToQueryFd;
-    switch (stat.kind) {
-        .character_device => {
-            return if (file.isTty()) .tty else .characterDevice;
-        },
-        .file => return .file,
-        .named_pipe => return .pipe,
-        else => return .generic,
-    }
-    unreachable;
-}
 
 pub const SinkBufferType = enum {
     heapGrowing,
@@ -47,8 +19,8 @@ pub const SinkBuffer = union(SinkBufferType) {
     directWrite,
 };
 
-pub fn pickSinkBuffer(sinkType: SinkType, eventHandler: EventHandler) SinkBuffer {
-    switch (sinkType) {
+pub fn pickSinkBuffer(fileType: fs.FileType, eventHandler: EventHandler) SinkBuffer {
+    switch (fileType) {
         .tty => {
             return switch (eventHandler) {
                 .colorMatch => .{ .heapGrowing = units.CacheSize.L3 },
@@ -69,8 +41,8 @@ pub const EventHandler = union(enum) {
     skipLineOnMatch,
 };
 
-pub fn pickEventHandler(sinkType: SinkType, file: File, colored: bool) EventHandler {
-    switch (sinkType) {
+pub fn pickEventHandler(fileType: fs.FileType, file: File, colored: bool) EventHandler {
+    switch (fileType) {
         .tty => {
             if (colored) {
                 return .{ .colorMatch = .detect(file) };
@@ -127,7 +99,7 @@ pub const SinkWriter = union(SinkBufferType) {
 };
 
 pub const Sink = struct {
-    sinkType: SinkType,
+    fileType: fs.FileType,
     eventHandler: EventHandler,
     colorEnabled: bool = false,
     sinkWriter: SinkWriter,
@@ -196,12 +168,10 @@ pub const Sink = struct {
     }
 
     pub fn sinkLine(self: *const @This()) Writer.Error!void {
-        switch (self.sinkType) {
+        switch (self.fileType) {
             .tty => {
                 switch (self.sinkWriter) {
-                    .heapGrowing => |alloc| {
-                        try alloc.flush();
-                    },
+                    .heapGrowing => |alloc| try alloc.flush(),
                     .directWrite => {},
                 }
             },
@@ -211,9 +181,7 @@ pub const Sink = struct {
 
     pub fn sink(self: *const @This()) Writer.Error!void {
         switch (self.sinkWriter) {
-            .heapGrowing => |alloc| {
-                try alloc.flush();
-            },
+            .heapGrowing => |alloc| try alloc.flush(),
             .directWrite => {},
         }
     }
